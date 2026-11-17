@@ -1,0 +1,33 @@
+<resources>
+    <style name="TuneSheetAnimation">
+        <item name="android:windowEnterAnimation">@anim/tune_sheet_enter</item>
+        <item name="android:windowExitAnimation">@anim/tune_sheet_exit</item>
+    </style>
+    <string name="app_name">Tune</string>
+    <string name="shortcut_wave">Моя волна</string>
+    <string name="shortcut_search">Поиск</string>
+    <string name="shortcut_likes">Мне нравится</string>
+    <string name="widget_play">Воспроизвести</string>
+    <string name="widget_pause">Пауза</string>
+    <string name="widget_next">Следующий трек</string>
+    <style name="TuneTheme" parent="android:style/Theme.Material.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:colorAccent">#FACC15</item>
+        <item name="android:windowBackground">#000000</item>
+        <item name="android:colorBackground">#000000</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowActionModeOverlay">true</item>
+    </style>
+    <style name="TuneLightTheme" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:colorAccent">#765B00</item>
+        <item name="android:windowBackground">#F9F9FB</item>
+        <item name="android:colorBackground">#F9F9FB</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowActionModeOverlay">true</item>
+    </style>
+</resources>
