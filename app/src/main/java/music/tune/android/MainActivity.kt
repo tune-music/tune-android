@@ -74,6 +74,7 @@ private enum class TrackOrder(val label: String) {
 }
 
 private enum class SearchPagination { MORE, LOADING, RETRY }
+private const val PODCAST_FILTER = 5
 
 private data class SearchPage(
     val results: SearchResults,
@@ -1079,31 +1080,53 @@ class MainActivity : ComponentActivity(), Player.Listener {
 
     private fun searchRows(keepScroll: Boolean = false, pagination: SearchPagination = SearchPagination.MORE) {
         val searchResult = searchPages[searchFilter]?.results ?: return
+        val all = searchFilter == 0
+        val podcastFilter = searchFilter == PODCAST_FILTER
+        val songs = searchResult.songs
+        val episodes = searchResult.episodes
+        val podcasts = searchResult.podcasts
+        val searchContext = PlayContext("search", searchText, "Поиск")
+        val podcastContext = PlayContext("search", searchText, "Подкасты")
         rows(buildList {
             add(filterBar())
-            if (searchFilter == 0) searchResult.best?.let { best ->
+            if (all) searchResult.best?.let { best ->
                 add(heading("Лучший результат"))
-                add(Row.Layout { bestResult(best, searchResult.tracks) })
+                val podcast = (best as? SearchBest.Song)?.track?.isPodcastEpisode == true
+                add(Row.Layout { bestResult(best, if (podcast) episodes else songs, if (podcast) podcastContext else searchContext) })
             }
-            if (searchResult.tracks.isNotEmpty()) {
-                if (searchFilter == 0) add(if (searchResult.tracks.size > 5) section("Треки", "Все") { searchType(1) } else heading("Треки"))
-                val tracks = trackRows(searchResult.tracks, PlayContext("search", searchText, "Поиск"))
-                addAll(if (searchFilter == 0) tracks.take(5) else tracks)
+            if ((all || searchFilter == 1 || FILTERS[searchFilter].second == "lyrics") && songs.isNotEmpty()) {
+                if (all) add(if (songs.size > 5 || searchResult.hasMore == true) section("Треки", "Все") { searchType(1) } else heading("Треки"))
+                val tracks = trackRows(songs, searchContext)
+                addAll(if (all) tracks.take(5) else tracks)
             }
             listOf(Kind.ARTIST, Kind.ALBUM, Kind.PLAYLIST).forEachIndexed { index, kind ->
-                val group = searchResult.cards.filter { it.kind == kind }
+                if (!all && searchFilter != index + 2) return@forEachIndexed
+                val group = searchResult.cards.filter { it.kind == kind && !it.isPodcast }
                 if (group.isNotEmpty()) {
                     val label = when (kind) {
                         Kind.ARTIST -> "Исполнители"; Kind.ALBUM -> "Альбомы"; Kind.PLAYLIST -> "Плейлисты"
                         else -> kind.label
                     }
-                    if (searchFilter == 0) {
-                        add(if (group.size > 3) section(label, "Все") { searchType(index + 2) } else heading(label))
+                    if (all) {
+                        add(if (group.size > 3 || searchResult.hasMore == true) section(label, "Все") { searchType(index + 2) } else heading(label))
                         add(shelfRow(group))
                     } else addAll(gridRows(group))
                 }
             }
-            if (searchResult.tracks.isEmpty() && searchResult.cards.isEmpty()) add(Row.Layout {
+            if (all || podcastFilter) {
+                if (podcasts.isNotEmpty()) {
+                    if (all) {
+                        add(section("Подкасты", "Все") { searchType(PODCAST_FILTER) })
+                        add(shelfRow(podcasts))
+                    } else addAll(gridRows(podcasts))
+                }
+                if (episodes.isNotEmpty()) {
+                    add(if (all) section("Выпуски", "Все") { searchType(PODCAST_FILTER) } else heading("Выпуски"))
+                    val tracks = trackRows(episodes, podcastContext)
+                    addAll(if (all) tracks.take(5) else tracks)
+                }
+            }
+            if (size == 1) add(Row.Layout {
                 ui.pagePlaceholder(Symbol.SEARCH, "Ничего не найдено",
                     if (FILTERS[searchFilter].second == "lyrics") "Попробуйте другую строку из песни." else "")
             })
@@ -1123,16 +1146,17 @@ class MainActivity : ComponentActivity(), Player.Listener {
         }, keepScroll)
     }
 
-    private fun bestResult(best: SearchBest, tracks: List<Track>): View {
+    private fun bestResult(best: SearchBest, tracks: List<Track>, context: PlayContext): View {
         val card = (best as? SearchBest.Entry)?.card
         val track = (best as? SearchBest.Song)?.track
         val title = card?.title ?: track?.title.orEmpty()
-        val subtitle = if (card == null) listOfNotNull("Трек", track?.artistText?.takeIf(String::isNotBlank)).joinToString(" · ")
-            else listOf(card.kind.label, card.subtitle).filter(String::isNotBlank).distinct().joinToString(" · ")
+        val subtitle = if (card == null) listOfNotNull(
+            if (track?.isPodcastEpisode == true) "Выпуск" else "Трек", track?.artistText?.takeIf(String::isNotBlank)
+        ).joinToString(" · ") else listOf(if (card.isPodcast) "Подкаст" else card.kind.label, card.subtitle)
+            .filter(String::isNotBlank).distinct().joinToString(" · ")
         val open = {
             if (card != null) openCard(card)
-            else if (track != null) playTracks(tracks, tracks.indexOfFirst { it.id == track.id },
-                PlayContext("search", searchText, "Поиск"))
+            else if (track != null) playTracks(tracks, tracks.indexOfFirst { it.id == track.id }, context)
         }
         return ui.column().apply {
             setPadding(ui.dp(16), ui.dp(4), ui.dp(16), ui.dp(8))
@@ -1701,6 +1725,9 @@ class MainActivity : ComponentActivity(), Player.Listener {
                 if (page.card.kind == Kind.ARTIST) {
                     add(section("Популярные треки", "Все") { push(Screen.ARTIST_TRACKS, page.card) })
                     addAll(trackRows(page.tracks, context).take(5))
+                } else if (page.card.isPodcast) {
+                    add(heading("Выпуски"))
+                    addAll(trackRows(displayed, context))
                 } else if (page.card.kind == Kind.ALBUM && trackFilter.isBlank() && !onlyDownloaded && trackOrder == TrackOrder.ORIGINAL) {
                     val disks = page.disks.takeIf { it.sum() == page.tracks.size } ?: listOf(page.tracks.size)
                     var start = 0
@@ -1793,7 +1820,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
             val minutes = page.tracks.sumOf { it.duration } / 60_000L
             val parts = buildList {
                 if (card.kind == Kind.PLAYLIST && card.owner != userId && card.subtitle.isNotBlank() && card.subtitle != "Плейлист") add(card.subtitle)
-                add(trackCount(page.tracks.size))
+                add(trackCount(page.tracks.size, episodes = card.isPodcast))
                 if (card.kind != Kind.ALBUM) add(if (minutes >= 60) "${minutes / 60} ч ${minutes % 60} мин" else "$minutes мин")
             }
             addView(ui.space(6))
@@ -2261,11 +2288,12 @@ class MainActivity : ComponentActivity(), Player.Listener {
         }
     }
 
-    private fun trackCount(count: Int): String {
-        val noun = if (count % 100 in 11..14) "треков" else when (count % 10) {
-            1 -> "трек"; in 2..4 -> "трека"; else -> "треков"
+    private fun trackCount(count: Int, episodes: Boolean = false): String {
+        val noun = if (count % 100 in 11..14) 2 else when (count % 10) {
+            1 -> 0; in 2..4 -> 1; else -> 2
         }
-        return "$count $noun"
+        val forms = if (episodes) listOf("выпуск", "выпуска", "выпусков") else listOf("трек", "трека", "треков")
+        return "$count ${forms[noun]}"
     }
 
     private fun shortcut(symbol: Symbol, label: String, sub: String? = null, subtitleTag: String? = null, action: () -> Unit) = Row.Layout {

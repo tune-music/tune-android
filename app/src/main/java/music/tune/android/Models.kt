@@ -38,6 +38,7 @@ internal data class Track(
     val uploaded: Boolean = false,
 ) {
     val artistText get() = artists.joinToString(", ") { it.title }
+    val isPodcastEpisode get() = mediaType == "podcast_episode" || album?.isPodcast == true
     val fullId get() = album?.let { "$id:${it.id}" } ?: id
     val url get() = album?.let { "https://music.yandex.ru/album/${it.id}/track/$id" }
         ?: "https://music.yandex.ru/track/$id"
@@ -109,6 +110,7 @@ internal data class Card(
     val releaseType: String? = null,
 ) {
     val key get() = "${kind.name}:${owner.orEmpty()}:$id"
+    val isPodcast get() = kind == Kind.ALBUM && releaseType == "podcast"
     val url: String? get() = when (kind) {
         Kind.ALBUM -> "https://music.yandex.ru/album/$id"
         Kind.ARTIST -> "https://music.yandex.ru/artist/$id"
@@ -190,7 +192,11 @@ internal data class SearchResults(
     val cards: List<Card>,
     val best: SearchBest? = null,
     val hasMore: Boolean? = null,
-)
+) {
+    val episodes get() = tracks.filter(Track::isPodcastEpisode)
+    val songs get() = tracks.filterNot(Track::isPodcastEpisode)
+    val podcasts get() = cards.filter(Card::isPodcast)
+}
 internal data class Profile(val uid: String, val name: String, val plus: Boolean, val login: String = "")
 internal data class Wave(val session: String, val tracks: List<Track>)
 internal data class WaveRoom(val id: String, val name: String, val status: String, val people: List<String>, val seeds: List<String>) {

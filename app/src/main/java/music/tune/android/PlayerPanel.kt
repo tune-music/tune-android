@@ -222,7 +222,7 @@ internal class PlayerPanel(private val activity: MainActivity) {
         val context = QueueItems.context(player.currentMediaItem)
         sourceKind.text = when (context.kind) {
             "radio" -> "ИГРАЕТ ВОЛНА"
-            "album" -> "ИГРАЕТ АЛЬБОМ"
+            "album" -> if (track.isPodcastEpisode) "ИГРАЕТ ПОДКАСТ" else "ИГРАЕТ АЛЬБОМ"
             "playlist" -> "ИГРАЕТ ПЛЕЙЛИСТ"
             "artist" -> "ИГРАЕТ ИСПОЛНИТЕЛЬ"
             else -> "ИГРАЕТ"

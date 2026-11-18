@@ -23,4 +23,19 @@ class SearchCacheTest {
             assertEquals(result, SearchCache.decode(SearchCache.encode(result)))
         }
     }
+
+    @Test
+    fun restoresPodcastAndEpisodeSeparatelyFromMusicResults() {
+        val podcast = Card(Kind.ALBUM, "101", "Подкаст", releaseType = "podcast")
+        val single = Card(Kind.ALBUM, "102", "Сингл", releaseType = "single")
+        val episode = Track("201", "Выпуск", album = podcast, mediaType = "podcast_episode")
+        val song = Track("202", "Трек", album = single)
+        val page = SearchResults(listOf(song, episode), listOf(podcast, single), SearchBest.Song(episode))
+        val restored = SearchCache.decode(SearchCache.encode(page))
+
+        assertEquals(listOf(podcast), restored.podcasts)
+        assertEquals(listOf(episode), restored.episodes)
+        assertEquals(listOf(song), restored.songs)
+        assertEquals(SearchBest.Song(episode), restored.best)
+    }
 }

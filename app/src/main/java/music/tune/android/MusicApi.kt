@@ -324,9 +324,17 @@ internal class MusicApi(
             if (error.status in setOf(401, 429)) throw error
             versions.catalogAlbum(card.id) ?: throw error
         }
-        val parsed = album(value) ?: throw MusicError("Альбом не найден")
+        val parsed = (album(value) ?: throw MusicError("Альбом не найден")).let {
+            if (card.isPodcast) it.copy(releaseType = "podcast") else it
+        }
         val disks = value.arr("volumes").items().filterIsInstance<JSONArray>().map { disk ->
-            disk.objects().mapNotNull { track(it) }.map { if (it.album == null) it.copy(album = parsed) else it }
+            disk.objects().mapNotNull { track(it) }.map {
+                when {
+                    parsed.isPodcast -> it.copy(album = parsed, mediaType = "podcast_episode")
+                    it.album == null -> it.copy(album = parsed)
+                    else -> it
+                }
+            }
         }
         val available = disks.flatten()
         val custom = metadata("album", parsed.id).tracks
@@ -338,7 +346,8 @@ internal class MusicApi(
                 .mapNotNull(::album).filterNot { it.id == card.id }.take(12)
         } }.orEmpty()
         val shelves = listOf(Shelf("Другие версии", versions), Shelf("Ещё от исполнителя", more))
-        val label = value.arr("labels").opt(0).let { item -> (item as? JSONObject)?.text("name") ?: item.asId() }
+        val label = if (parsed.isPodcast) value.text("shortDescription") ?: value.text("description")
+            else value.arr("labels").opt(0).let { item -> (item as? JSONObject)?.text("name") ?: item.asId() }
         if (order.isEmpty()) return MusicPage(parsed, available, shelves, label, disks = disks.map(List<Track>::size))
         val known = available.associateBy { it.id }
         val missing = order.filterNot(known::containsKey)
@@ -431,7 +440,8 @@ internal class MusicApi(
         for (item in value.arr("results").objects()) {
             val kind = item.text("type")
             if (kind == "track" || kind == "podcast_episode") {
-                val track = track(item.obj(kind)) ?: continue
+                val parsed = track(item.obj(kind)) ?: continue
+                val track = if (kind == "podcast_episode" || type == "podcast") parsed.copy(mediaType = "podcast_episode") else parsed
                 tracks += track
                 if (best == null) best = SearchBest.Song(track)
             } else {
