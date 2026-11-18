@@ -94,8 +94,10 @@ internal class PlayerPanel(private val activity: MainActivity) {
     private var lyricMotion: AnimatorSet? = null
     private var lyrics: List<LyricsLine> = emptyList()
     private var lyricRows: List<TextView> = emptyList()
+    private var timedLyrics = false
     private var activeLine = -1
     private var lastAnchor = -1
+    private var recenterLyrics = false
     private var queueAdapter: BaseAdapter? = null
     private var currentId: String? = null
 
@@ -283,7 +285,7 @@ internal class PlayerPanel(private val activity: MainActivity) {
             seek.progress = if (length > 0) (player.currentPosition * 1000 / length).toInt().coerceIn(0, 1000) else 0
             seek.secondaryProgress = if (length > 0) (player.bufferedPosition * 1000 / length).toInt().coerceIn(0, 1000) else 0
         }
-        if (!showingLyrics || lyricRows.isEmpty()) return
+        if (!showingLyrics || !timedLyrics) return
         val now = player.currentPosition + 250
         val index = lyrics.indexOfLast { it.position?.let { position -> position <= now } == true }
         if (index != activeLine) {
@@ -292,17 +294,19 @@ internal class PlayerPanel(private val activity: MainActivity) {
             lyricRows.getOrNull(index)?.let { highlight(it, 1f) }
         }
         val anchor = index.coerceAtLeast(0)
-        if (anchor != lastAnchor && !lyricScroll.isManuallyScrolling && lyricScroll.height > 0) {
+        if ((anchor != lastAnchor || recenterLyrics) && !lyricScroll.isManuallyScrolling && lyricScroll.height > 0) {
             val row = lyricRows[anchor]
             if (row.height == 0) return
             val y = (row.top - (lyricScroll.height - row.height) / 2).coerceAtLeast(0)
             if (lastAnchor < 0 || !ValueAnimator.areAnimatorsEnabled()) lyricScroll.scrollTo(0, y)
             else lyricScroll.smoothScrollTo(0, y)
             lastAnchor = anchor
+            recenterLyrics = false
         }
     }
 
     private fun highlight(row: View, alpha: Float) {
+        row.isSelected = alpha == 1f
         if (ValueAnimator.areAnimatorsEnabled()) row.animate().alpha(alpha).setDuration(220).start()
         else row.alpha = alpha
     }
@@ -342,8 +346,10 @@ internal class PlayerPanel(private val activity: MainActivity) {
         lyricJob?.cancel()
         lyrics = emptyList()
         lyricRows = emptyList()
+        timedLyrics = false
         activeLine = -1
         lastAnchor = -1
+        recenterLyrics = false
         lyricBody.removeAllViews()
         lyricStatus.removeAllViews()
         lyricBody.setPadding(0, 0, 0, 0)
@@ -365,17 +371,20 @@ internal class PlayerPanel(private val activity: MainActivity) {
                 return@action
             }
             lyricStatus.removeAllViews()
-            val timed = lines.any { it.position != null }
+            timedLyrics = lines.any { it.position != null }
             lyrics = lines
             lyricRows = lines.map { line ->
                 ui.text(line.text.ifEmpty { "♪" }, 24, Color.WHITE, bold = true).apply {
                     gravity = Gravity.CENTER
-                    alpha = if (timed) .32f else 1f
+                    alpha = if (timedLyrics) .32f else 1f
                     typeface = android.graphics.Typeface.create("sans-serif", android.graphics.Typeface.BOLD)
                     setPadding(ui.dp(8), 0, ui.dp(8), 0)
                     line.position?.let { time ->
                         background = ui.touch()
-                        setOnClickListener { player?.seekTo(time) }
+                        setOnClickListener {
+                            lyricScroll.resetManualScroll()
+                            player?.seekTo(time)
+                        }
                     }
                     lyricBody.addView(this, ui.full().apply { bottomMargin = ui.dp(18) })
                 }
@@ -397,7 +406,8 @@ internal class PlayerPanel(private val activity: MainActivity) {
     }
 
     private fun padLyrics() {
-        val padding = (lyricScroll.height / 2 - ui.dp(16)).coerceAtLeast(0)
+        val padding = if (timedLyrics) (lyricScroll.height / 2 - ui.dp(16)).coerceAtLeast(0) else ui.dp(16)
+        lyricScroll.setFadingEdgeLength((lyricScroll.height * .14f).toInt())
         lyricBody.setPadding(0, padding, 0, padding)
     }
 
@@ -431,7 +441,10 @@ internal class PlayerPanel(private val activity: MainActivity) {
                 MotionEvent.ACTION_DOWN -> startY = event.y
                 MotionEvent.ACTION_MOVE -> if (kotlin.math.abs(event.y - startY) > ViewConfiguration.get(activity).scaledTouchSlop) moving = true
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                    if (moving) lastTouch = android.os.SystemClock.uptimeMillis()
+                    if (moving) {
+                        lastTouch = android.os.SystemClock.uptimeMillis()
+                        recenterLyrics = true
+                    }
                     moving = false
                 }
             }

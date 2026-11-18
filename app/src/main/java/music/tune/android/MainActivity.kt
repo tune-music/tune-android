@@ -98,6 +98,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
         else -> resources.configuration.uiMode and android.content.res.Configuration.UI_MODE_NIGHT_MASK == android.content.res.Configuration.UI_MODE_NIGHT_NO
     }
     internal val ui by lazy { TuneUi(this, TuneColors(lightMode)) }
+    internal val playbackMotion by lazy { PlaybackMotion(this) }
     internal var controller: MediaController? = null
         private set
     private var controllerFuture: com.google.common.util.concurrent.ListenableFuture<MediaController>? = null
@@ -3527,12 +3528,14 @@ class MainActivity : ComponentActivity(), Player.Listener {
     }
 
     override fun onStop() {
+        playbackMotion.stop()
         videoPanel?.pause()
         super.onStop()
     }
 
     override fun onStart() {
         super.onStart()
+        playbackMotion.start()
         checkForUpdates()
     }
 
@@ -3564,7 +3567,15 @@ class MainActivity : ComponentActivity(), Player.Listener {
         updatePlaying()
         if (events.containsAny(Player.EVENT_MEDIA_ITEM_TRANSITION, Player.EVENT_IS_PLAYING_CHANGED)) {
             if (route.screen == Screen.HOME) waveHead?.bindHero()
-            else if (events.contains(Player.EVENT_MEDIA_ITEM_TRANSITION)) refreshRows()
+            if (events.contains(Player.EVENT_MEDIA_ITEM_TRANSITION)) {
+                if (route.screen != Screen.HOME) refreshRows()
+            } else {
+                val visible = list
+                val currentId = currentTrack()?.id
+                if (visible != null) for (index in 0 until visible.childCount) {
+                    (visible.getChildAt(index).tag as? ItemRow)?.updatePlayback(currentId, player.isPlaying)
+                }
+            }
             playbackBindings.toList().forEach { it() }
         }
         if (events.containsAny(Player.EVENT_MEDIA_ITEM_TRANSITION, Player.EVENT_TIMELINE_CHANGED)) updateWaveContent()
@@ -3771,6 +3782,10 @@ class MainActivity : ComponentActivity(), Player.Listener {
                 view.isClickable = false
                 view.isLongClickable = false
             }
+        }
+
+        fun updatePlayback(currentId: String?, isPlaying: Boolean) {
+            playback.running = boundId != null && boundId == currentId && isPlaying
         }
         fun bind(row: Row.Entry) {
             art.bind(row.card.cover, 100)

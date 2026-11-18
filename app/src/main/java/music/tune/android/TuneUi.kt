@@ -406,9 +406,10 @@ internal class IconView(context: Context, var symbol: Symbol, var tint: Int) : V
     }
 }
 
-internal class WaveBackdrop(context: Context, private val backgroundColor: Int) : View(context) {
+internal class WaveBackdrop(context: MainActivity, private val backgroundColor: Int) : View(context) {
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
-    private val power = context.getSystemService(android.os.PowerManager::class.java)
+    private val motion = context.playbackMotion
+    private val visibleBounds = android.graphics.Rect()
     private val density = resources.displayMetrics.density
     private val speeds = doubleArrayOf(0.69, 0.42, 0.53)
     private val matrix = Matrix()
@@ -419,6 +420,8 @@ internal class WaveBackdrop(context: Context, private val backgroundColor: Int) 
     private var fade: LinearGradient? = null
     private var lastFrame: Long? = null
     private var phase = 0.0
+    init { motion.observe(this) }
+
     var playing = false
         set(value) {
             if (field != value) {
@@ -442,8 +445,7 @@ internal class WaveBackdrop(context: Context, private val backgroundColor: Int) 
     }
 
     override fun onDraw(canvas: Canvas) {
-        val animated = playing && isShown && windowVisibility == VISIBLE && !power.isPowerSaveMode &&
-            android.animation.ValueAnimator.areAnimatorsEnabled()
+        val animated = playing && motion.enabled && isShown && windowVisibility == VISIBLE && getLocalVisibleRect(visibleBounds)
         if (animated) {
             val now = android.os.SystemClock.uptimeMillis()
             lastFrame?.let { phase += (now - it) / 1000.0 }
@@ -471,9 +473,12 @@ internal class WaveBackdrop(context: Context, private val backgroundColor: Int) 
     }
 }
 
-internal class PlayingBars(context: Context, color: Int) : View(context) {
+internal class PlayingBars(context: MainActivity, color: Int) : View(context) {
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { this.color = color }
-    private val power = context.getSystemService(android.os.PowerManager::class.java)
+    private val motion = context.playbackMotion
+    private val visibleBounds = android.graphics.Rect()
+    init { motion.observe(this) }
+
     var running = false
         set(value) {
             if (field != value) {
@@ -483,7 +488,7 @@ internal class PlayingBars(context: Context, color: Int) : View(context) {
         }
 
     override fun onDraw(canvas: Canvas) {
-        val animate = running && isShown && windowVisibility == VISIBLE && !power.isPowerSaveMode && ValueAnimator.areAnimatorsEnabled()
+        val animate = running && motion.enabled && isShown && windowVisibility == VISIBLE && getLocalVisibleRect(visibleBounds)
         val time = android.os.SystemClock.uptimeMillis() / 1000.0
         for (index in REST.indices) {
             val relative = if (animate) .3 + .7 * kotlin.math.abs(kotlin.math.sin(time * SPEEDS[index] + PHASES[index])) else REST[index]
