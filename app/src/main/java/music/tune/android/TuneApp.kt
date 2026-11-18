@@ -344,7 +344,7 @@ internal class MusicStore(val context: Context) {
         return confirmed
     }
 
-    suspend fun likedTracks(onCached: ((List<Track>) -> Unit)? = null): List<Track> {
+    suspend fun likedTracks(onPreview: ((List<Track>) -> Unit)? = null): List<Track> {
         val uid = requireUser().uid
         fun includePending(tracks: List<Track>): List<Track> {
             val pending = pendingRestoredLikes(uid)
@@ -355,12 +355,32 @@ internal class MusicStore(val context: Context) {
             }
             return added + tracks.filterNot { it.id in pending }
         }
+        var cacheHasTracks = false
+        var firstPage: List<Track>? = null
+        val onCached = onPreview?.let { display ->
+            { tracks: List<Track> ->
+                val merged = includePending(tracks)
+                cacheHasTracks = merged.isNotEmpty()
+                display(merged)
+            }
+        }
         return try {
-            includePending(cachedTracks("likes", onCached?.let { display -> { display(includePending(it)) } }) {
-                online { likedTrackList(uid) }
-            })
+            val tracks = cachedTracks("likes", onCached) {
+                val entries = online { likedEntries(uid) }
+                val firstPreview = onPreview?.takeUnless { cacheHasTracks }?.let { display ->
+                    { page: List<Track> ->
+                        firstPage = page
+                        display(includePending(page))
+                    }
+                }
+                loadLikedTrackPages(entries, firstPreview) { ids ->
+                    if (profile.value?.uid != uid) throw CancellationException("Аккаунт сменился")
+                    online { tracks(ids) }
+                }
+            }
+            includePending(tracks.ifEmpty { firstPage.orEmpty() })
         } catch (error: IOException) {
-            includePending(emptyList()).ifEmpty { throw error }
+            includePending(firstPage.orEmpty()).ifEmpty { throw error }
         }
     }
 

@@ -151,10 +151,7 @@ internal class MusicApi(
 
     fun libraryIds(uid: String, dislike: Boolean = false): List<String> = libraryEntries(uid, dislike).map { it.first }
 
-    fun likedTrackList(uid: String): List<Track> {
-        val entries = libraryEntries(uid, false).toMap()
-        return tracks(entries.keys.toList()).map { it.copy(addedAt = entries[it.id]) }
-    }
+    fun likedEntries(uid: String): List<Pair<String, Long?>> = libraryEntries(uid, false)
 
     private fun entryDate(value: String?): Long? = value?.let { optional { Instant.parse(it).toEpochMilli() } }
 

@@ -1436,10 +1436,12 @@ class MainActivity : ComponentActivity(), Player.Listener {
         val art = if (symbol == null) ui.art(cover, 120, corner = 0) else ui.symbolCover(symbol, 56, 0)
         addView(art, LinearLayout.LayoutParams(ui.dp(56), ui.dp(56)))
         addView(ui.text(title, 14, bold = true).apply {
-            maxLines = 2
+            maxLines = if (title.any(Char::isWhitespace)) 2 else 1
+            setAutoSizeTextTypeUniformWithConfiguration(12, 14, 1, android.util.TypedValue.COMPLEX_UNIT_SP)
             ellipsize = android.text.TextUtils.TruncateAt.END
-            setPadding(ui.dp(10), 0, ui.dp(6), 0)
+            setPaddingRelative(ui.dp(10), 0, ui.dp(4), 0)
         }, ui.weight())
+        pressFeedback()
         setOnClickListener { click() }
         isFocusable = true
     }
@@ -2233,10 +2235,12 @@ class MainActivity : ComponentActivity(), Player.Listener {
     }
 
     private fun shelfRow(cards: List<Card>) = Row.Layout {
-        horizontal(cards.take(20).map { card ->
+        val shelf = cards.take(20)
+        val covers = shelf.map { card -> ui.art(null, 300, card.kind == Kind.ARTIST) }
+        val tiles = shelf.mapIndexed { index, card ->
             ui.column().apply {
                 background = ui.touch()
-                addView(ui.art(card.cover, 300, card.kind == Kind.ARTIST), LinearLayout.LayoutParams(ui.dp(132), ui.dp(132)))
+                addView(covers[index], LinearLayout.LayoutParams(ui.dp(132), ui.dp(132)))
                 addView(ui.space(8))
                 addView(ui.line(card.title, 14, bold = true))
                 if (card.subtitle.isNotBlank()) {
@@ -2248,7 +2252,25 @@ class MainActivity : ComponentActivity(), Player.Listener {
                 setOnLongClickListener { cardMenu(card, it); true }
                 isFocusable = true
             }
-        })
+        }
+        horizontal(tiles).apply {
+            val requested = BooleanArray(shelf.size)
+            fun loadVisibleCovers() {
+                if (width == 0 || !isAttachedToWindow) return
+                val end = scrollX + width
+                val firstVisible = tiles.indexOfFirst { it.right > scrollX && it.left < end }
+                if (firstVisible < 0) return
+                val lastVisible = tiles.indexOfLast { it.right > scrollX && it.left < end }
+                val lastPrefetched = minOf(lastVisible + 4, shelf.lastIndex)
+                for (index in firstVisible..lastPrefetched) {
+                    if (requested[index]) continue
+                    requested[index] = true
+                    covers[index].bind(shelf[index].cover, 300)
+                }
+            }
+            addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> loadVisibleCovers() }
+            setOnScrollChangeListener { _, _, _, _, _ -> loadVisibleCovers() }
+        }
     }
 
     private fun gridRows(cards: List<Card>) = cards.chunked(2).map { pair ->
@@ -2294,8 +2316,14 @@ class MainActivity : ComponentActivity(), Player.Listener {
         val list = list ?: return
         val offset = list.getChildAt(0)?.top ?: 0
         val position = list.firstVisiblePosition
-        adapter?.replace(newRows)
-        if (keepScroll && position in newRows.indices) list.setSelectionFromTop(position, offset)
+        val currentAdapter = adapter ?: return
+        val visibleId = if (keepScroll && route.screen == Screen.LIKES && position < currentAdapter.count)
+            (currentAdapter.getItem(position) as? Row.Music)?.track?.id else null
+        val anchor = visibleId?.let { id ->
+            newRows.indexOfFirst { it is Row.Music && it.track.id == id }.takeIf { it >= 0 }
+        } ?: position
+        currentAdapter.replace(newRows)
+        if (keepScroll && anchor in newRows.indices) list.setSelectionFromTop(anchor, offset)
         else list.setSelection(0)
         if (selecting) updateSelectionBar()
     }
