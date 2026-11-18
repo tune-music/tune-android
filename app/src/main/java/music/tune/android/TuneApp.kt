@@ -75,7 +75,7 @@ internal class MusicStore(val context: Context) {
         if (token != null) {
             _profile.value = preferences.getString("profile", null)?.let { raw -> optional { decodeProfile(JSONObject(raw)) } }
             _profile.value?.let { user ->
-                _likes.value = preferences.getStringSet("likes:${user.uid}", emptySet()).orEmpty().toSet()
+                _likes.value = applyRestoredLikes(preferences.getStringSet("likes:${user.uid}", emptySet()).orEmpty(), pendingRestoredLikes(user.uid))
                 _dislikes.value = preferences.getStringSet("dislikes:${user.uid}", emptySet()).orEmpty().toSet()
                 _savedCards.value = preferences.getStringSet("cards:${user.uid}", emptySet()).orEmpty().toSet()
                 loadSavedPlaylists(user.uid)
@@ -227,7 +227,7 @@ internal class MusicStore(val context: Context) {
 
     private fun setProfile(account: Profile) {
         if (_profile.value?.uid != account.uid) {
-            _likes.value = preferences.getStringSet("likes:${account.uid}", emptySet()).orEmpty().toSet()
+            _likes.value = applyRestoredLikes(preferences.getStringSet("likes:${account.uid}", emptySet()).orEmpty(), pendingRestoredLikes(account.uid))
             _dislikes.value = preferences.getStringSet("dislikes:${account.uid}", emptySet()).orEmpty().toSet()
             _savedCards.value = preferences.getStringSet("cards:${account.uid}", emptySet()).orEmpty().toSet()
             loadSavedPlaylists(account.uid)
@@ -258,7 +258,9 @@ internal class MusicStore(val context: Context) {
             val cardSets = cards.awaitAll()
             val own = playlists.await()
             if (token != credential) return@coroutineScope
-            likedIds?.let { _likes.value = it }
+            val syncedLikes = syncRestoredLikes(account.uid, credential)
+            if (token != credential) return@coroutineScope
+            (syncedLikes ?: likedIds)?.let { _likes.value = applyRestoredLikes(it, pendingRestoredLikes(account.uid)) }
             dislikedIds?.let { _dislikes.value = it }
             _savedCards.value = cardSets.fold(_savedCards.value) { existing, (kind, entries) ->
                 if (entries == null) existing else existing.filterNot { it.startsWith(kind.name + ":") }.toSet() + entries.map { it.key }
@@ -278,14 +280,33 @@ internal class MusicStore(val context: Context) {
         val account = requireUser()
         val state = if (dislike) _dislikes else _likes
         val add = track.id !in state.value
-        val credential = token
-        online { setTrackRating(account.uid, track, dislike, add) }
+        val credential = token ?: throw MusicError("Войдите через Яндекс", 401)
+        val pending = pendingRestoredLikes(account.uid)
+        if (!dislike && (track.id in pending || track.alternate && track.originalAvailable == false)) {
+            val date = if (add) System.currentTimeMillis() else 0L
+            saveRestoredLikes(account.uid, pending + (track.id to date))
+            _likes.value = applyRestoredLikes(_likes.value, mapOf(track.id to date))
+            saveRatings(account.uid)
+            scope.launch {
+                updates.withLock sync@{
+                    if (token != credential) return@sync
+                    val confirmed = syncRestoredLikes(account.uid, credential)
+                    if (confirmed != null && token == credential) {
+                        _likes.value = applyRestoredLikes(confirmed, pendingRestoredLikes(account.uid))
+                        saveRatings(account.uid)
+                    }
+                }
+                if (add && token == credential) refreshAutomaticDownloads()
+            }
+            return@withLock add
+        }
+        online { setTrackRating(account.uid, track.id, dislike, add) }
         if (token == credential) {
             state.value = if (add) state.value + track.id else state.value - track.id
             if (add) {
                 val other = if (dislike) _likes else _dislikes
                 if (track.id in other.value && optional {
-                    online { setTrackRating(account.uid, track, !dislike, false) }
+                    online { setTrackRating(account.uid, track.id, !dislike, false) }
                     true
                 } == true && token == credential) other.value = other.value - track.id
             }
@@ -293,6 +314,54 @@ internal class MusicStore(val context: Context) {
         }
         if (!dislike && add) refreshAutomaticDownloads()
         add
+    }
+
+    private fun pendingRestoredLikes(uid: String): Map<String, Long> =
+        preferences.getStringSet("restoredLikes:$uid", emptySet()).orEmpty().mapNotNull { entry ->
+            val date = entry.substringAfterLast(':').toLongOrNull() ?: return@mapNotNull null
+            entry.substringBeforeLast(':') to date
+        }.toMap()
+
+    private fun saveRestoredLikes(uid: String, pending: Map<String, Long>) {
+        val entries = pending.mapTo(mutableSetOf()) { (id, date) -> "$id:$date" }
+        preferences.edit().putStringSet("restoredLikes:$uid", entries).apply()
+    }
+
+    /** Called under updates so server verification cannot race another local rating. */
+    private suspend fun syncRestoredLikes(uid: String, credential: String): Set<String>? {
+        val pending = pendingRestoredLikes(uid)
+        if (pending.isEmpty() || offline || token != credential) return null
+        val result = optional {
+            online {
+                reconcileRestoredLikes(pending, read = { fullLikedEntries().map { it.first }.toSet() }) { id, liked ->
+                    if (token == credential) setTrackRating(uid, id, disliked = false, add = liked)
+                }
+            }
+        } ?: return null
+        if (token != credential) return null
+        val (confirmed, remaining) = result
+        saveRestoredLikes(uid, remaining)
+        return confirmed
+    }
+
+    suspend fun likedTracks(onCached: ((List<Track>) -> Unit)? = null): List<Track> {
+        val uid = requireUser().uid
+        fun includePending(tracks: List<Track>): List<Track> {
+            val pending = pendingRestoredLikes(uid)
+            val byId = tracks.associateBy { it.id }
+            val added = pending.entries.filter { it.value > 0 }.sortedByDescending { it.value }.mapNotNull { (id, date) ->
+                val track = byId[id] ?: versions.synthetic(id)?.takeIf { allowsAlternate(uid, id) }
+                track?.copy(addedAt = date)
+            }
+            return added + tracks.filterNot { it.id in pending }
+        }
+        return try {
+            includePending(cachedTracks("likes", onCached?.let { display -> { display(includePending(it)) } }) {
+                online { likedTrackList(uid) }
+            })
+        } catch (error: IOException) {
+            includePending(emptyList()).ifEmpty { throw error }
+        }
     }
 
     suspend fun save(card: Card) = updates.withLock {
@@ -365,7 +434,12 @@ internal class MusicStore(val context: Context) {
         if (targets.isEmpty()) return
         automaticDownloads = scope.launch {
             if ("likes" in targets) {
-                val tracks = optional { online { tracks(libraryIds(user.uid).filterNot(files::hasId)) } }
+                val tracks = optional {
+                    online {
+                        val ids = applyRestoredLikes(libraryIds(user.uid).toSet(), pendingRestoredLikes(user.uid))
+                        tracks(ids.filterNot(files::hasId))
+                    }
+                }
                 if (profile.value?.uid == user.uid && tracks != null && !offline) optional { files.enqueue(tracks) }
             }
             for (card in (ownPlaylists.value + savedPlaylists.value).filter { it.key in targets }) {

@@ -368,7 +368,7 @@ class PlaybackService : MediaLibraryService(), Player.Listener {
     private suspend fun libraryTracks(id: String): Pair<List<Track>, PlayContext> {
         val uid = activeUser ?: throw MusicError("Войдите через Яндекс")
         return when {
-            id == "tune:likes" -> store.cachedTracks("likes") { store.online { tracks(libraryIds(uid)) } } to
+            id == "tune:likes" -> store.likedTracks() to
                 PlayContext("playlist", "$uid:3", "Мне нравится")
             id == "tune:downloads" -> store.files.downloaded() to PlayContext(name = "Скачанные треки")
             id == "tune:search" -> lastLibrarySearch?.takeIf { it.first == uid }?.third.orEmpty() to PlayContext("search", null, "Поиск")

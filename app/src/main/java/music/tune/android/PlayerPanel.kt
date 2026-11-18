@@ -99,30 +99,30 @@ internal class PlayerPanel(private val activity: MainActivity) {
     private var queueAdapter: BaseAdapter? = null
     private var currentId: String? = null
 
+    private val toolbar = ui.row().apply {
+        addView(ui.icon(Symbol.DOWN, "Свернуть плеер") { activity.closePlayer(animate = true) }.apply {
+            background = ui.touch(0x32ffffff, 30)
+            iconSize = 18
+        }, LinearLayout.LayoutParams(ui.dp(44), ui.dp(44)))
+        addView(ui.column().apply {
+            gravity = Gravity.CENTER
+            addView(sourceKind)
+            addView(ui.space(3))
+            addView(source)
+        }, ui.weight())
+        addView(ui.icon(Symbol.MORE, "Ещё") { showTrackActions() }.apply {
+            background = ui.touch(0x32ffffff, 30)
+            iconSize = 18
+        }, LinearLayout.LayoutParams(ui.dp(44), ui.dp(44)))
+    }
+
     private val layout = ScrollView(activity).apply {
         isVerticalScrollBarEnabled = false
         isFillViewport = true
         val body = ui.column().apply {
             gravity = Gravity.CENTER_HORIZONTAL
-            setPadding(ui.dp(24), ui.dp(8), ui.dp(24), ui.dp(12))
+            setPadding(0, 0, 0, ui.dp(12))
         }
-        val toolbar = ui.row().apply {
-            addView(ui.icon(Symbol.DOWN, "Свернуть плеер") { activity.closePlayer(animate = true) }.apply {
-                background = ui.touch(0x32ffffff, 30)
-                iconSize = 18
-            }, LinearLayout.LayoutParams(ui.dp(44), ui.dp(44)))
-            addView(ui.column().apply {
-                gravity = Gravity.CENTER
-                addView(sourceKind)
-                addView(ui.space(3))
-                addView(source)
-            }, ui.weight())
-            addView(ui.icon(Symbol.MORE, "Ещё") { showTrackActions() }.apply {
-                background = ui.touch(0x32ffffff, 30)
-                iconSize = 18
-            }, LinearLayout.LayoutParams(ui.dp(44), ui.dp(44)))
-        }
-        body.addView(toolbar, ui.full(44))
         val config = activity.resources.configuration
         val size = minOf(config.screenWidthDp - 48, (config.screenHeightDp * .44f).toInt(), 540).coerceAtLeast(140)
         body.addView(FrameLayout(activity).apply {
@@ -173,7 +173,11 @@ internal class PlayerPanel(private val activity: MainActivity) {
     val view: FrameLayout = PlayerSurface().apply {
         background = backdrop
         isClickable = true
-        addView(layout, FrameLayout.LayoutParams(-1, -1))
+        addView(ui.column().apply {
+            setPadding(ui.dp(24), ui.dp(8), ui.dp(24), 0)
+            addView(toolbar, ui.full(44))
+            addView(layout, LinearLayout.LayoutParams(-1, 0, 1f))
+        }, FrameLayout.LayoutParams(-1, -1))
     }
 
     init {
@@ -535,7 +539,8 @@ internal class PlayerPanel(private val activity: MainActivity) {
             if (drag == null && action == MotionEvent.ACTION_MOVE && maxOf(kotlin.math.abs(dx), kotlin.math.abs(dy)) > slop) {
                 drag = when {
                     kotlin.math.abs(dx) > kotlin.math.abs(dy) && !showingLyrics -> PlayerDrag.HORIZONTAL
-                    kotlin.math.abs(dx) > kotlin.math.abs(dy) || dy < 0f || layout.canScrollVertically(-1) ||
+                    kotlin.math.abs(dx) > kotlin.math.abs(dy) || dy < 0f ||
+                        (!startedIn(toolbar) && layout.canScrollVertically(-1)) ||
                         startsInLyrics && lyricScroll.canScrollVertically(-1) -> PlayerDrag.CHILD
                     else -> PlayerDrag.VERTICAL
                 }

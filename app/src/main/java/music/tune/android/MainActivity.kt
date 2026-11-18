@@ -1521,7 +1521,6 @@ class MainActivity : ComponentActivity(), Player.Listener {
     }
 
     private fun loadTracks(screen: Screen) {
-        val key = when (screen) { Screen.LIKES -> "likes"; Screen.DISLIKES -> "dislikes"; else -> "history" }
         val uid = userId ?: return
         val context = PlayContext(if (screen == Screen.LIKES) "playlist" else "various",
             if (screen == Screen.LIKES) "$uid:3" else null, screen.label)
@@ -1538,14 +1537,14 @@ class MainActivity : ComponentActivity(), Player.Listener {
         loadRows(loading = {
             listOf(Row.Layout { listHeader(emptyList(), context, symbol, loading = true) }, Row.Layout { ui.loadingRows() })
         }) { showCached ->
-            val tracks = store.cachedTracks(key, onCached = showCached?.let { display ->
-                { cached -> if (cached.isNotEmpty()) display(trackRowsForPage(cached)) }
-            }) {
-                store.online {
-                    when (screen) {
-                        Screen.LIKES -> likedTrackList(uid)
-                        Screen.DISLIKES -> tracks(libraryIds(uid, dislike = true))
-                        else -> history()
+            val onCached = showCached?.let { display -> { cached: List<Track> -> display(trackRowsForPage(cached)) } }
+            val tracks = if (screen == Screen.LIKES) {
+                store.likedTracks(onCached)
+            } else {
+                val key = if (screen == Screen.DISLIKES) "dislikes" else "history"
+                store.cachedTracks(key, onCached) {
+                    store.online {
+                        if (screen == Screen.DISLIKES) tracks(libraryIds(uid, dislike = true)) else history()
                     }
                 }
             }
@@ -2970,6 +2969,9 @@ class MainActivity : ComponentActivity(), Player.Listener {
     private fun changes() {
         rows(listOf(
             heading("Tune ${BuildConfig.VERSION_NAME}"),
+            note("Tune работает в портретной ориентации. Верхняя панель плеера остаётся видимой при прокрутке, и свайп вниз с неё сворачивает плеер."),
+            note("Лайки восстановленных треков сохраняются на устройстве и синхронизируются с Яндекс Музыкой, когда сервер их принимает."),
+            heading("В прошлых версиях"),
             note("Поле поиска перемещено в верхнюю часть экрана. Скачанные обложки и тексты доступны в офлайн-режиме."),
             note("Исправлены загрузка обложек, выравнивание в плеере и на главной и свечение «Моей волны»."),
             note("Настройки, коллекция и главная приведены к порядку Tune для iOS."),

@@ -158,17 +158,17 @@ internal class MusicApi(
 
     private fun entryDate(value: String?): Long? = value?.let { optional { Instant.parse(it).toEpochMilli() } }
 
-    private fun libraryEntries(uid: String, dislike: Boolean): List<Pair<String, Long?>> {
-        if (!dislike) {
-            val all = optional {
-                val body = JSONObject().put("likedTracks", JSONObject().put("revision", 0))
-                json("collection/sync", body).objectValue().obj("values").obj("likedTracks").obj("values").optJSONArray("liked")
-                    ?.objects()?.mapNotNull {
-                        (it.text("trackId") ?: it.text("id"))?.let { id -> id to entryDate(it.text("timestamp")) }
-                    }
-            }
-            if (all != null) return all
+    fun fullLikedEntries(): List<Pair<String, Long?>> {
+        val body = JSONObject().put("likedTracks", JSONObject().put("revision", 0))
+        val entries = json("collection/sync", body).objectValue().obj("values").obj("likedTracks").obj("values")
+            .optJSONArray("liked") ?: throw MusicError("Яндекс не прислал полный список лайков")
+        return entries.objects().mapNotNull {
+            (it.text("trackId") ?: it.text("id"))?.let { id -> id to entryDate(it.text("timestamp")) }
         }
+    }
+
+    private fun libraryEntries(uid: String, dislike: Boolean): List<Pair<String, Long?>> {
+        if (!dislike) optional { fullLikedEntries() }?.let { return it }
         val list = if (dislike) "dislikes" else "likes"
         return get("users/${segment(uid)}/$list/tracks").objectValue()
             .obj("library").arr("tracks").objects().mapNotNull { it.text("id")?.let { id -> id to entryDate(it.text("timestamp")) } }
@@ -183,10 +183,10 @@ internal class MusicApi(
         if (hide) post("$path/add", "artist-id" to id) else post("$path/${segment(id)}/remove")
     }
 
-    fun setTrackRating(uid: String, track: Track, disliked: Boolean, add: Boolean) {
+    fun setTrackRating(uid: String, id: String, disliked: Boolean, add: Boolean) {
         val kind = if (disliked) "dislikes" else "likes"
         val path = "users/${segment(uid)}/$kind/tracks"
-        if (add) post("$path/add", "track-id" to track.id) else post("$path/${segment(track.id)}/remove")
+        if (add) post("$path/add", "track-id" to id) else post("$path/${segment(id)}/remove")
     }
 
     fun playlists(uid: String, liked: Boolean = false): List<Card> {

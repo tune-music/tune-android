@@ -111,7 +111,7 @@ internal class UserUploads(private val store: MusicStore) {
                 for (id in ready) {
                     if (store.profile.value?.uid != uid) return@launch
                     val success = optional {
-                        store.online { setTrackRating(uid, Track(id, ""), disliked = false, add = true) }
+                        store.online { setTrackRating(uid, id, disliked = false, add = true) }
                         true
                     } == true
                     if (success) pendingLock.withLock { write(uid, pending(uid) - id) }
