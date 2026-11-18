@@ -51,6 +51,8 @@ internal class MusicStore(val context: Context) {
     private var automaticDownloads: kotlinx.coroutines.Job? = null
     private val _profile = MutableStateFlow<Profile?>(null)
     val profile = _profile.asStateFlow()
+    private val _offline = MutableStateFlow(preferences.getBoolean("offline", false))
+    val offlineMode = _offline.asStateFlow()
     private val _likes = MutableStateFlow<Set<String>>(emptySet())
     val likes = _likes.asStateFlow()
     private val _dislikes = MutableStateFlow<Set<String>>(emptySet())
@@ -96,8 +98,9 @@ internal class MusicStore(val context: Context) {
     }
 
     var offline: Boolean
-        get() = preferences.getBoolean("offline", false)
+        get() = _offline.value
         set(value) {
+            _offline.value = value
             preferences.edit().putBoolean("offline", value).apply()
             files.updateNetworkPolicy()
             ynison.reconnect()
@@ -110,7 +113,11 @@ internal class MusicStore(val context: Context) {
 
     var wifiOnly: Boolean
         get() = preferences.getBoolean("wifiOnly", false)
-        set(value) { preferences.edit().putBoolean("wifiOnly", value).apply() }
+        set(value) {
+            if (value == wifiOnly) return
+            preferences.edit().putBoolean("wifiOnly", value).apply()
+            files.updateNetworkPolicy(restart = value)
+        }
 
     var streamQuality: String
         get() = preferences.getString("streamQuality", "nq") ?: "nq"

@@ -5,6 +5,7 @@ import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.drawable.BitmapDrawable
 import android.net.ConnectivityManager
+import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.Uri
 import android.util.AtomicFile
@@ -41,6 +42,11 @@ import javax.crypto.spec.SecretKeySpec
 
 internal data class DownloadStatus(val track: Track, val percent: Int? = null, val error: String? = null)
 
+internal enum class DownloadWait(val label: String) {
+    WIFI("Ждём Wi‑Fi"),
+    INTERNET("Ждём интернет"),
+}
+
 internal enum class AudioEdition { ORIGINAL, ALTERNATE, LOCAL }
 
 internal fun matchingDownload(requested: AudioEdition, saved: AudioEdition?, automatic: Boolean, offline: Boolean): Boolean {
@@ -56,12 +62,13 @@ internal class MusicFiles(private val store: MusicStore) {
     val revision = _revision.asStateFlow()
     private val _paused = MutableStateFlow(false)
     val paused = _paused.asStateFlow()
-    private val _waitingForWifi = MutableStateFlow(false)
-    val waitingForWifi = _waitingForWifi.asStateFlow()
+    private val _networkWait = MutableStateFlow<DownloadWait?>(null)
+    val networkWait = _networkWait.asStateFlow()
     private var job: Job? = null
     private var user: String? = null
     private val pending = linkedMapOf<String, Track>()
     private val downloadAssets = Semaphore(2)
+    private val activeAssets = mutableSetOf<Pair<String, String>>()
 
     private fun accountFolder(uid: String) = File(context.filesDir, "music/${digest(uid)}")
     private fun directory(uid: String) = accountFolder(uid).apply { mkdirs() }
@@ -85,24 +92,47 @@ internal class MusicFiles(private val store: MusicStore) {
         if (downloaded(uid, trackId) != null) words(uid, trackId).writeText(data)
     }
 
-    private fun prepareDownloadAssets(uid: String, track: Track) = store.scope.launch {
-        downloadAssets.withPermit {
-            if (store.profile.value?.uid != uid || store.offline || !has(track)) return@withPermit
-            optional { saveDownloadCover(uid, track) }
-            if (store.profile.value?.uid == uid && !store.offline) optional { store.lyrics(track) }
+    private fun pendingAssets(uid: String): Set<String> =
+        store.preferences.getStringSet("downloadAssets:$uid", emptySet()).orEmpty()
+
+    private fun prepareDownloadAssets(uid: String, track: Track) {
+        val key = uid to track.id
+        if (track.id !in pendingAssets(uid) || !activeAssets.add(key)) return
+        store.scope.launch {
+            try {
+                downloadAssets.withPermit {
+                    if (store.profile.value?.uid != uid || store.offline || !has(track) || downloadConnection().wait != null) return@withPermit
+                    val covered = optional { saveDownloadCover(uid, track) } == true
+                    if (store.profile.value?.uid != uid || store.offline || downloadConnection().wait != null) return@withPermit
+                    val lyricsChecked = optional { store.lyrics(track) } != null
+                    if (covered && lyricsChecked) synchronized(this@MusicFiles) {
+                        store.preferences.edit().putStringSet("downloadAssets:$uid", pendingAssets(uid) - track.id).apply()
+                    }
+                }
+            } finally {
+                activeAssets.remove(key)
+            }
         }
     }
 
-    private suspend fun saveDownloadCover(uid: String, track: Track) = withContext(Dispatchers.IO) {
-        val cover = track.cover ?: return@withContext
-        val url = coverUrl(cover, 800) ?: return@withContext
+    private fun resumeDownloadAssets() {
+        val uid = user ?: return
+        if (store.offline) return
+        val remaining = pendingAssets(uid)
+        if (remaining.isEmpty()) return
+        index(uid).filter { it.id in remaining }.forEach { prepareDownloadAssets(uid, it) }
+    }
+
+    private suspend fun saveDownloadCover(uid: String, track: Track): Boolean = withContext(Dispatchers.IO) {
+        val cover = track.cover ?: return@withContext true
+        val url = coverUrl(cover, 800) ?: return@withContext true
         val file = artwork(uid, cover)
-        if (file.isFile) return@withContext
+        if (file.isFile) return@withContext true
         val request = ImageRequest.Builder(context).data(url).size(800).allowHardware(false).build()
-        val result = context.imageLoader.execute(request) as? SuccessResult ?: return@withContext
-        val bitmap = (result.drawable as? BitmapDrawable)?.bitmap ?: return@withContext
+        val result = context.imageLoader.execute(request) as? SuccessResult ?: return@withContext false
+        val bitmap = (result.drawable as? BitmapDrawable)?.bitmap ?: return@withContext false
         val bytes = ByteArrayOutputStream()
-        if (!bitmap.compress(Bitmap.CompressFormat.JPEG, 92, bytes)) return@withContext
+        if (!bitmap.compress(Bitmap.CompressFormat.JPEG, 92, bytes)) return@withContext false
         synchronized(this@MusicFiles) {
             if (file.isFile || downloaded(uid, track.id) == null) return@synchronized
             val output = AtomicFile(file)
@@ -115,6 +145,7 @@ internal class MusicFiles(private val store: MusicStore) {
                 throw error
             }
         }
+        true
     }
 
     fun hasId(id: String): Boolean = store.profile.value?.uid?.let { downloaded(it, id) != null } == true
@@ -178,7 +209,9 @@ internal class MusicFiles(private val store: MusicStore) {
     private fun updateIndex(uid: String, track: Track, edition: AudioEdition?) = synchronized(this) {
         val others = downloadEntries(uid).filterNot { it.text("id") == track.id }
         val tracks = if (edition == null) others else listOf(track.stored().put("audioEdition", edition.name)) + others
-        store.preferences.edit().putString("downloads:$uid", JSONArray(tracks).toString()).apply()
+        val assets = if (edition == null) pendingAssets(uid) - track.id else pendingAssets(uid) + track.id
+        store.preferences.edit().putString("downloads:$uid", JSONArray(tracks).toString())
+            .putStringSet("downloadAssets:$uid", assets).apply()
     }
 
     fun enqueue(tracks: List<Track>) {
@@ -218,26 +251,32 @@ internal class MusicFiles(private val store: MusicStore) {
         if (value) stopQueue() else startQueue()
     }
 
-    fun updateNetworkPolicy() {
-        if (store.offline) stopQueue() else startQueue()
+    fun updateNetworkPolicy(restart: Boolean = false) {
+        if (store.offline || restart) stopQueue()
+        if (!store.offline) {
+            startQueue()
+            resumeDownloadAssets()
+        }
+    }
+
+    fun resumeForegroundQueue() {
+        resumeDownloadAssets()
+        if (pending.isEmpty() || _paused.value || store.offline) return
+        if (job?.isActive == true) startDownloadService() else startQueue()
+    }
+
+    private fun startDownloadService() {
+        optional { ContextCompat.startForegroundService(context, Intent(context, DownloadService::class.java)) }
     }
 
     private fun startQueue() {
         val uid = user ?: return
         if (job?.isActive == true || pending.isEmpty() || _paused.value || store.offline) return
-        optional {
-            ContextCompat.startForegroundService(context, Intent(context, DownloadService::class.java))
-        }
+        startDownloadService()
         val previous = job
         job = store.scope.launch {
             previous?.join()
             while (isActive && user == uid && pending.isNotEmpty()) {
-                if (store.wifiOnly && !hasWifi()) {
-                    _waitingForWifi.value = true
-                    delay(4_000)
-                    continue
-                }
-                _waitingForWifi.value = false
                 val track = pending.values.first()
                 if (downloaded(uid, track.id) != null) {
                     pending.remove(track.id)
@@ -245,6 +284,12 @@ internal class MusicFiles(private val store: MusicStore) {
                     saveQueue()
                     _revision.value++
                     prepareDownloadAssets(uid, track)
+                    continue
+                }
+                val connection = downloadConnection()
+                _networkWait.value = connection.wait
+                if (connection.wait != null) {
+                    delay(2_000)
                     continue
                 }
                 try {
@@ -265,7 +310,7 @@ internal class MusicFiles(private val store: MusicStore) {
                             install(target, id) { out -> replacement.inputStream().use { it.copyTo(out) } }
                         } else {
                             val stream = if (alternatives.isNotEmpty()) Stream(alternatives) else originalSource(uid, track.id, quality)
-                            fetch(stream, target, id) { percent ->
+                            fetch(stream, target, id, connection.wifi) { percent ->
                                 context.ensureActive()
                                 setStatus(track, percent)
                             }
@@ -278,6 +323,12 @@ internal class MusicFiles(private val store: MusicStore) {
                     prepareDownloadAssets(uid, track)
                 } catch (error: Exception) {
                     if (error is CancellationException) throw error
+                    val wait = if (error is IOException) downloadConnection().wait else null
+                    if (wait != null) {
+                        _networkWait.value = wait
+                        setStatus(track, null)
+                        continue
+                    }
                     setStatus(track, null, error.message ?: "Не удалось скачать трек")
                 }
                 pending.remove(track.id)
@@ -288,7 +339,7 @@ internal class MusicFiles(private val store: MusicStore) {
 
     private fun stopQueue() {
         job?.cancel()
-        _waitingForWifi.value = false
+        _networkWait.value = null
         _status.update { old -> old.mapValues { (_, state) -> if (state.percent == null) state else state.copy(percent = null) } }
     }
 
@@ -321,9 +372,19 @@ internal class MusicFiles(private val store: MusicStore) {
         _status.update { it + (track.id to value) }
     }
 
-    private fun hasWifi(): Boolean {
-        val network = context.getSystemService(ConnectivityManager::class.java)
-        return network.getNetworkCapabilities(network.activeNetwork)?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
+    private data class DownloadConnection(val wifi: Network? = null, val wait: DownloadWait? = null)
+
+    private fun downloadConnection(): DownloadConnection {
+        val manager = context.getSystemService(ConnectivityManager::class.java)
+        val active = manager.activeNetwork
+        val capabilities = manager.getNetworkCapabilities(active)
+        val hasInternet = capabilities?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true &&
+            !capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_CAPTIVE_PORTAL)
+        if (store.wifiOnly) {
+            val wifi = hasInternet && capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
+            return if (wifi) DownloadConnection(wifi = active) else DownloadConnection(wait = DownloadWait.WIFI)
+        }
+        return DownloadConnection(wait = if (hasInternet) null else DownloadWait.INTERNET)
     }
 
     suspend fun remove(track: Track) {
@@ -422,11 +483,11 @@ internal class MusicFiles(private val store: MusicStore) {
         }
     }
 
-    private fun fetch(source: Stream, directory: File, id: String, progress: (Int) -> Unit = {}): File {
+    private fun fetch(source: Stream, directory: File, id: String, wifi: Network? = null, progress: (Int) -> Unit = {}): File {
         var last: IOException? = null
         for (address in source.urls) {
             try {
-                val connection = secureConnection(address)
+                val connection = secureConnection(address, wifi)
                 try {
                     connection.readTimeout = 40_000
                     if (connection.responseCode !in 200..299) throw MusicError("Сервер не отдал аудиофайл")

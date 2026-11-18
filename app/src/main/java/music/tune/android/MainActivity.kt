@@ -359,7 +359,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
                     playerPanel?.updateDownload()
                 } }
                 launch { store.files.paused.collect { if (route.screen == Screen.DOWNLOADS && userId != null) downloads() } }
-                launch { store.files.waitingForWifi.collect { if (route.screen == Screen.DOWNLOADS && userId != null) downloads() } }
+                launch { store.files.networkWait.collect { if (route.screen == Screen.DOWNLOADS && userId != null) downloads() } }
                 launch {
                     while (isActive) {
                         updateProgress()
@@ -1791,8 +1791,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
                 val label = when {
                     !active -> "Не удалось скачать"
                     paused -> "На паузе"
-                    store.files.waitingForWifi.value -> "Ждём Wi‑Fi"
-                    else -> "Скачивание"
+                    else -> store.files.networkWait.value?.label ?: "Скачивание"
                 }
                 add(if (active) section(label, if (paused) "Продолжить" else "Пауза") { store.files.setPaused(!paused) }
                     else heading(label))
@@ -3537,6 +3536,11 @@ class MainActivity : ComponentActivity(), Player.Listener {
         super.onStart()
         playbackMotion.start()
         checkForUpdates()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        store.files.resumeForegroundQueue()
     }
 
     private fun updateSystemBars() {

@@ -18,10 +18,10 @@ import javax.crypto.spec.SecretKeySpec
 internal class MusicError(message: String, val status: Int = 0, cause: Throwable? = null, val details: JSONObject? = null) :
     IOException(message, cause)
 
-internal fun secureConnection(address: String): HttpURLConnection {
+internal fun secureConnection(address: String, network: android.net.Network? = null): HttpURLConnection {
     val url = URL(address)
     if (url.protocol != "https" || url.host.isBlank()) throw MusicError("Неверный адрес файла")
-    return (url.openConnection() as HttpURLConnection).apply {
+    return ((network?.openConnection(url) ?: url.openConnection()) as HttpURLConnection).apply {
         connectTimeout = 12_000
         readTimeout = 20_000
     }

@@ -30,6 +30,7 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import coil.dispose
 import coil.load
+import coil.request.CachePolicy
 import androidx.core.graphics.ColorUtils
 
 internal class TuneColors(val light: Boolean) {
@@ -167,6 +168,7 @@ private object ButtonAccessibility : View.AccessibilityDelegate() {
 internal class CoverView(context: Context, private val tone: ((Int) -> Unit)? = null) : FrameLayout(context) {
     private val image = ImageView(context).apply { scaleType = ImageView.ScaleType.CENTER_CROP }
     private val placeholder = IconView(context, Symbol.NOTE, Palette.muted)
+    private var lastOffline = false
 
     init {
         importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
@@ -177,10 +179,13 @@ internal class CoverView(context: Context, private val tone: ((Int) -> Unit)? = 
     private fun dp(value: Int) = (value * resources.displayMetrics.density).toInt()
 
     fun bind(cover: String?, size: Int) {
-        val downloaded = cover?.let { (context.applicationContext as? TuneApp)?.store?.files?.savedCover(it) }
+        val store = (context.applicationContext as? TuneApp)?.store
+        val offline = store?.offline == true
+        val downloaded = cover?.let { store?.files?.savedCover(it) }
         val source = MetadataOverrides.image(context, cover) ?: downloaded ?: coverUrl(cover, size)
-        if (source == image.tag) return
+        if (source == image.tag && lastOffline == offline) return
         image.tag = source
+        lastOffline = offline
         placeholder.visibility = View.VISIBLE
         if (source == null) {
             image.dispose()
@@ -189,6 +194,7 @@ internal class CoverView(context: Context, private val tone: ((Int) -> Unit)? = 
         } else image.load(source) {
             crossfade(130)
             size(size)
+            if (offline) networkCachePolicy(CachePolicy.DISABLED)
             if (tone != null) allowHardware(false)
             listener(onSuccess = { _, result ->
                 if (image.tag == source) {
