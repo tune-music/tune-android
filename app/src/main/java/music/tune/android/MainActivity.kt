@@ -75,6 +75,14 @@ private enum class TrackOrder(val label: String) {
 
 private enum class SearchPagination { MORE, LOADING, RETRY }
 
+private data class SearchPage(
+    val results: SearchResults,
+    val number: Int,
+    var firstVisible: Int = 0,
+    var top: Int = 0,
+    var retry: Boolean = false,
+)
+
 private sealed interface Row {
     class Layout(val make: () -> View) : Row
     class Music(
@@ -157,10 +165,8 @@ class MainActivity : ComponentActivity(), Player.Listener {
     private var searchFilter = 0
     private var searchText = ""
     private var searchDraft = ""
-    private var searchPage = 0
-    private var searchResult = SearchResults(emptyList(), emptyList())
-    private var hasMoreSearch = false
-    private var completedSearch: Pair<String, Int>? = null
+    private val searchPages = mutableMapOf<Int, SearchPage>()
+    private var searchHints: Pair<String, List<String>>? = null
     private var cityName = ""
     private var city: String? = null
     private var documentTrack: Track? = null
@@ -300,6 +306,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
         if (savedInstanceState?.getBoolean("reopenSettings") == true) stack.addLast(Route(Screen.SETTINGS))
         searchDraft = savedInstanceState?.getString("search").orEmpty()
         searchText = searchDraft.trim()
+        searchFilter = savedInstanceState?.getInt("searchFilter")?.takeIf { it in FILTERS.indices } ?: 0
         documentTrack = savedInstanceState?.getString("document")?.let { optional { Track.parse(org.json.JSONObject(it)) } }
         mediaPickerPlaylist = savedInstanceState?.getString("mediaPickerPlaylist")?.let { optional { Card.fromCache(org.json.JSONObject(it)) } }
         city = store.preferences.getString("city", null)
@@ -399,6 +406,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
         outState.putString("tab", tab.name)
         outState.putBoolean("reopenSettings", reopenSettings)
         outState.putString("search", searchField?.text?.toString() ?: searchDraft)
+        outState.putInt("searchFilter", searchFilter)
         outState.putString("document", documentTrack?.stored()?.toString())
         outState.putString("mediaPickerPlaylist", mediaPickerPlaylist?.cached()?.toString())
         outState.putBoolean("player", playerPanel != null)
@@ -441,13 +449,13 @@ class MainActivity : ComponentActivity(), Player.Listener {
             tab = Tab.HOME
             searchText = ""
             searchDraft = ""
-            searchResult = SearchResults(emptyList(), emptyList())
-            completedSearch = null
+            searchPages.clear()
+            searchHints = null
+            searchFilter = 0
             discovery = emptyList()
             reduceAi = null
             settingsStorageJob?.cancel()
             settingsStorage = null
-            searchPage = 0
             homeError = null
             loadingHome = false
         }
@@ -610,6 +618,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
     }
 
     private fun render() {
+        saveSearchPosition()
         val current = route
         pageJob?.cancel()
         listHasContent = false
@@ -876,9 +885,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
             val query = value.trim()
             if (query == searchText) return@doAfterTextChanged
             searchText = query
-            searchPage = 0
-            searchResult = SearchResults(emptyList(), emptyList())
-            completedSearch = null
+            searchPages.clear()
             loadSearch(debounce = true)
             updateSuggestions(query)
         }
@@ -898,6 +905,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
 
     private fun submitSearch(value: String) {
         searchDraft = value
+        val changed = searchText != value.trim()
         searchText = value.trim()
         searchField?.let { field ->
             if (field.text.toString() != value) field.setText(value)
@@ -908,10 +916,8 @@ class MainActivity : ComponentActivity(), Player.Listener {
             val recent = listOf(searchText) + recentSearches().filterNot { it.equals(searchText, ignoreCase = true) }
             store.preferences.edit().putString("recentSearches", JSONArray(recent.take(10)).toString()).apply()
         }
-        searchPage = 0
-        searchResult = SearchResults(emptyList(), emptyList())
-        completedSearch = null
-        loadSearch()
+        if (changed) searchPages.clear()
+        loadSearch(refreshFirstPage = !changed && searchPages[searchFilter]?.number == 0)
         updateSuggestions(searchText)
     }
 
@@ -924,15 +930,31 @@ class MainActivity : ComponentActivity(), Player.Listener {
         val rail = suggestions ?: return
         rail.removeAllViews()
         if (query.length < 2 || store.offline || "://" in query || FILTERS[searchFilter].second == "lyrics") return
+        fun show(hints: List<String>) {
+            if (hints.isNotEmpty()) rail.addView(horizontal(hints.map { hint -> ui.chip(hint) { submitSearch(hint) } }))
+        }
+        searchHints?.takeIf { it.first == query }?.let { (_, hints) ->
+            show(hints)
+            return
+        }
         suggestionJob = lifecycleScope.launch {
             delay(220)
-            val hints = optional { store.online { suggest(query) } }.orEmpty()
-                .filterNot { it.equals(query, ignoreCase = true) }.distinct().take(8)
-            if (hints.isNotEmpty()) rail.addView(horizontal(hints.map { hint -> ui.chip(hint) { submitSearch(hint) } }))
+            val hints = optional { store.online { suggest(query) } }
+                ?.filterNot { it.equals(query, ignoreCase = true) }?.distinct()?.take(8) ?: return@launch
+            searchHints = query to hints
+            show(hints)
         }
     }
 
-    private fun loadSearch(append: Boolean = false, debounce: Boolean = false) {
+    private fun saveSearchPosition() {
+        if (searchField == null) return
+        val state = searchPages[searchFilter] ?: return
+        val page = list ?: return
+        state.firstVisible = page.firstVisiblePosition
+        state.top = page.getChildAt(0)?.top ?: 0
+    }
+
+    private fun loadSearch(append: Boolean = false, debounce: Boolean = false, refreshFirstPage: Boolean = false) {
         pageJob?.cancel()
         val query = searchText
         if (query.isEmpty()) {
@@ -959,61 +981,96 @@ class MainActivity : ComponentActivity(), Player.Listener {
             return
         }
         val type = FILTERS[searchFilter].second
-        val request = query to searchFilter
-        val page = if (append) searchPage + 1 else 0
-        val hasPrevious = completedSearch == request
+        val filter = searchFilter
+        val previous = searchPages[filter]
+        if (append && (previous?.results?.hasMore != true || store.offline)) return
+        val page = if (append) requireNotNull(previous).number + 1 else 0
+        if (!append && previous != null && !refreshFirstPage) {
+            searchRows(pagination = if (previous.retry) SearchPagination.RETRY else SearchPagination.MORE)
+            list?.setSelectionFromTop(previous.firstVisible, previous.top)
+            return
+        }
+        var visibleResults = previous != null
         when {
             append -> searchRows(keepScroll = true, pagination = SearchPagination.LOADING)
-            hasPrevious -> searchRows(keepScroll = true)
-            else -> rows(listOf(filterBar(), Row.Layout { ui.loadingRows(8) }))
+            visibleResults -> searchRows(keepScroll = true)
         }
         pageJob = action(onError = { error ->
             when {
-                append -> { toast(error); searchRows(keepScroll = true, pagination = SearchPagination.RETRY) }
-                hasPrevious -> toast(error)
+                append -> {
+                    previous?.retry = true
+                    toast(error)
+                    searchRows(keepScroll = true, pagination = SearchPagination.RETRY)
+                }
+                visibleResults -> if (!store.offline) toast(error)
                 else -> rows(listOf(filterBar(), Row.Layout {
                     ui.pagePlaceholder(Symbol.WIFI_OFF, "Не удалось выполнить поиск", error) { loadSearch() }
                 }))
             }
         }) {
-            if (debounce) delay(300)
             val uri = Uri.parse(query)
             if (uri.scheme in setOf("https", "tune", "music-application", "yandexmusic") && !append) {
                 rows(listOf(filterBar(), shortcut(Symbol.LINK, query) { openLink(uri) }))
                 return@action
             }
+            if (!append && previous == null) {
+                val cached = if (type == "lyrics") null else store.cachedSearch(query, type)
+                if (cached != null) {
+                    val hasMore = cached.hasMore ?: (cached.tracks.size + cached.cards.size >= 25)
+                    searchPages[filter] = SearchPage(cached.copy(hasMore = hasMore), 0)
+                    searchRows()
+                    visibleResults = true
+                } else rows(listOf(filterBar(), Row.Layout { ui.loadingRows(8) }))
+                if (store.offline && cached != null) return@action
+            }
+            if (debounce) delay(300)
             val found = if (type == "lyrics") {
                 val player = controller
                 val queue = if (player == null) emptyList() else (0 until minOf(player.mediaItemCount, 500)).mapNotNull { QueueItems.track(player.getMediaItemAt(it)) }
                 val local = if (page == 0) store.localLyricsSearch(query, queue) else emptyList()
-                val external = if (page == 0) optional { store.lyricsMatches(query) }.orEmpty() else emptyList()
-                val remote = optional { store.online { search(query, "track", page) } }
-                val combined = (local + external + remote?.tracks.orEmpty()).distinctBy { it.id }
-                SearchResults(combined, emptyList(), hasMore = remote?.hasMore ?: false)
-            } else store.online { search(query, type, page) }
-            searchPage = page
-            completedSearch = request
-            hasMoreSearch = found.hasMore ?: (found.tracks.size + found.cards.size >= 25)
-            searchResult = if (append) SearchResults(
-                (searchResult.tracks + found.tracks).distinctBy { it.id },
-                (searchResult.cards + found.cards).distinctBy { it.key },
-                searchResult.best
-            ) else found
-            searchRows(keepScroll = append || hasPrevious)
+                val external = if (page == 0 && !store.offline) optional { store.lyricsMatches(query) }.orEmpty() else emptyList()
+                val highlights = local + external
+                val remote = if (store.offline) null else try {
+                    store.online { search(query, "track", page) }
+                } catch (error: java.io.IOException) {
+                    if (highlights.isEmpty()) throw error
+                    null
+                }
+                SearchResults((highlights + remote?.tracks.orEmpty()).distinctBy { it.id }, emptyList(),
+                    hasMore = remote?.let { it.hasMore ?: (it.tracks.size >= 25) } ?: false)
+            } else store.searchPage(query, type, page)
+            val more = found.hasMore ?: (found.tracks.size + found.cards.size >= 25)
+            val base = previous?.results
+            val result = if (append && base != null) SearchResults(
+                (base.tracks + found.tracks).distinctBy { it.id },
+                (base.cards + found.cards).distinctBy { it.key },
+                base.best, more
+            ) else found.copy(hasMore = more)
+            searchPages[filter] = SearchPage(result, page)
+            searchRows(keepScroll = visibleResults)
         }
     }
 
     private fun filterBar() = Row.Layout {
-        horizontal(FILTERS.mapIndexed { index, (label, _) ->
+        val selected = searchFilter
+        val filters = FILTERS.mapIndexed { index, (label, _) ->
             ui.chip(label, active = index == searchFilter) { searchType(index) }
-        })
+        }
+        horizontal(filters).apply {
+            addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+                val chip = filters[selected]
+                if (chip.right > scrollX + width || chip.left < scrollX) {
+                    scrollTo(chip.left - ui.dp(16), 0)
+                }
+            }
+        }
     }
 
     private fun searchType(index: Int) {
         if (index == searchFilter) return
+        saveSearchPosition()
         searchFilter = index
         searchField?.hint = searchHint()
-        searchPage = 0
         loadSearch()
         updateSuggestions(searchText)
     }
@@ -1021,11 +1078,12 @@ class MainActivity : ComponentActivity(), Player.Listener {
     private fun emptySearch() = ui.pagePlaceholder(Symbol.SEARCH, "Найдётся всё", "Треки, альбомы, исполнители и плейлисты")
 
     private fun searchRows(keepScroll: Boolean = false, pagination: SearchPagination = SearchPagination.MORE) {
+        val searchResult = searchPages[searchFilter]?.results ?: return
         rows(buildList {
             add(filterBar())
             if (searchFilter == 0) searchResult.best?.let { best ->
                 add(heading("Лучший результат"))
-                add(Row.Layout { bestResult(best) })
+                add(Row.Layout { bestResult(best, searchResult.tracks) })
             }
             if (searchResult.tracks.isNotEmpty()) {
                 if (searchFilter == 0) add(if (searchResult.tracks.size > 5) section("Треки", "Все") { searchType(1) } else heading("Треки"))
@@ -1049,7 +1107,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
                 ui.pagePlaceholder(Symbol.SEARCH, "Ничего не найдено",
                     if (FILTERS[searchFilter].second == "lyrics") "Попробуйте другую строку из песни." else "")
             })
-            if (hasMoreSearch && searchFilter != 0) add(Row.Layout {
+            if (searchResult.hasMore == true && searchFilter != 0 && !store.offline) add(Row.Layout {
                 if (pagination == SearchPagination.LOADING) ui.searchPageProgress()
                 else ui.row().apply {
                     gravity = Gravity.CENTER
@@ -1065,7 +1123,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
         }, keepScroll)
     }
 
-    private fun bestResult(best: SearchBest): View {
+    private fun bestResult(best: SearchBest, tracks: List<Track>): View {
         val card = (best as? SearchBest.Entry)?.card
         val track = (best as? SearchBest.Song)?.track
         val title = card?.title ?: track?.title.orEmpty()
@@ -1073,7 +1131,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
             else listOf(card.kind.label, card.subtitle).filter(String::isNotBlank).distinct().joinToString(" · ")
         val open = {
             if (card != null) openCard(card)
-            else if (track != null) playTracks(searchResult.tracks, searchResult.tracks.indexOfFirst { it.id == track.id },
+            else if (track != null) playTracks(tracks, tracks.indexOfFirst { it.id == track.id },
                 PlayContext("search", searchText, "Поиск"))
         }
         return ui.column().apply {
@@ -2706,10 +2764,13 @@ class MainActivity : ComponentActivity(), Player.Listener {
                 home = home?.let { it.copy(recent = it.recent.map(::update)) }
                 trackList = trackList?.let { it.copy(tracks = it.tracks.map(::update)) }
                 details = details?.let { it.copy(tracks = it.tracks.map(::update)) }
-                searchResult = searchResult.copy(tracks = searchResult.tracks.map(::update),
-                    best = (searchResult.best as? SearchBest.Song)?.let { SearchBest.Song(update(it.track)) } ?: searchResult.best)
+                searchPages.replaceAll { _, page ->
+                    val result = page.results
+                    page.copy(results = result.copy(tracks = result.tracks.map(::update),
+                        best = (result.best as? SearchBest.Song)?.let { SearchBest.Song(update(it.track)) } ?: result.best))
+                }
                 when (route.screen) {
-                    Screen.SEARCH -> if (completedSearch == (searchText to searchFilter)) searchRows(keepScroll = true)
+                    Screen.SEARCH -> searchRows(keepScroll = true)
                     Screen.DOWNLOADS -> downloads()
                     Screen.DETAILS -> details?.let { rows(detailRows(it), keepScroll = true) }
                     Screen.HOME -> showHome(keepScroll = true)
@@ -2744,7 +2805,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
         store.alternateEnabled = enabled
         home = null
         homeLoaded = false
-        completedSearch = null
+        searchPages.clear()
         action {
             val ready = !enabled || store.refreshVersions()
             if (store.alternateEnabled != enabled) return@action

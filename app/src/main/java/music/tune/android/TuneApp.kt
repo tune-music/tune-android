@@ -71,6 +71,7 @@ internal class MusicStore(val context: Context) {
     val ynison = Ynison(this)
     val uploads = UserUploads(this)
     val externalLyrics = ExternalLyrics(this)
+    private val searchCache = SearchCache(context.cacheDir)
     @Volatile private var token: String? = preferences.getString("activeAccount", null)?.let(vault::read) ?: vault.read()
 
     init {
@@ -537,6 +538,22 @@ internal class MusicStore(val context: Context) {
         val uid = requireUser().uid
         return cached("collection:${kind.name}", { JSONObject().put("cards", JSONArray(it.map(Card::cached))) },
             { it.arr("cards").objects().mapNotNull(Card::fromCache) }, onCached) { online { likedCards(uid, kind) } }
+    }
+
+    suspend fun cachedSearch(query: String, type: String): SearchResults? {
+        val key = SearchCache.Key(requireUser().uid, query, type, alternateEnabled)
+        return withContext(Dispatchers.IO) { searchCache.read(key) }
+    }
+
+    suspend fun searchPage(query: String, type: String, page: Int): SearchResults {
+        val key = SearchCache.Key(requireUser().uid, query, type, alternateEnabled)
+        return online {
+            search(query, type, page).also { results ->
+                if (page == 0 && type != "lyrics" && profile.value?.uid == key.account && alternateEnabled == key.uncensored) {
+                    searchCache.write(key, results)
+                }
+            }
+        }
     }
 
     private fun encodePage(page: MusicPage) =
