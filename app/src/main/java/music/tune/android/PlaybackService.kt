@@ -151,7 +151,13 @@ class PlaybackService : MediaLibraryService(), Player.Listener {
                 .setAudioAttributes(AudioAttributes.Builder().setUsage(C.USAGE_MEDIA).setContentType(C.AUDIO_CONTENT_TYPE_MUSIC).build(), false)
                 .build()
         }, setting = { store.preferences.getInt("crossfade", -1) }, gain = ::baseVolume,
-            restoreGain = { volume(QueueItems.track(player.currentMediaItem)) })
+            restoreGain = { volume(QueueItems.track(player.currentMediaItem)) },
+            warm = { item ->
+                val uid = activeUser
+                val track = QueueItems.track(item)
+                if (uid != null && track != null) store.files.resolve(uid, track.id, false)
+            },
+            sleepAtEnd = { sleepAtEnd })
         val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java)
             .setAction(MainActivity.OPEN_PLAYER).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
@@ -397,7 +403,9 @@ class PlaybackService : MediaLibraryService(), Player.Listener {
     }
 
     override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
-        val automatic = reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO || reason == Player.MEDIA_ITEM_TRANSITION_REASON_REPEAT
+        val automatic = reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO ||
+            reason == Player.MEDIA_ITEM_TRANSITION_REASON_REPEAT ||
+            crossfade?.transitioning == true
         finishListen(automatic)
         if (automatic && sleepAtEnd) {
             sleepAtEnd = false

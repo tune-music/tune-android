@@ -2,6 +2,7 @@ package music.tune.android
 
 import android.animation.ValueAnimator
 import android.content.Context
+import android.graphics.Color
 import android.view.Gravity
 import android.view.View
 import android.view.animation.AccelerateDecelerateInterpolator
@@ -32,9 +33,12 @@ internal class WaveWordsView(private val activity: MainActivity) : FrameLayout(a
         content.setPadding(ui.dp(20), ui.dp(18), ui.dp(20), ui.dp(18))
         content.background = ui.shape(ui.palette.panel, 22)
         content.addView(ui.row().apply {
-            val badge = ui.text("Слова в волне", 12, ui.palette.accentText, bold = true).apply {
+            val badge = ui.row().apply {
                 setPadding(ui.dp(10), ui.dp(5), ui.dp(10), ui.dp(5))
                 background = ui.shape(0x24facc15, 30)
+                addView(IconView(activity, Symbol.WAVE, ui.palette.accentText).apply { iconSize = 12 },
+                    LinearLayout.LayoutParams(ui.dp(13), ui.dp(13)).apply { marginEnd = ui.dp(6) })
+                addView(ui.text("Слова в волне", 12, ui.palette.accentText, bold = true))
             }
             addView(badge)
             addView(View(activity), LinearLayout.LayoutParams(0, 1, 1f))
@@ -91,18 +95,32 @@ internal class WaveWordsView(private val activity: MainActivity) : FrameLayout(a
         val card = card ?: return
         val track = track ?: return
         feedbackButtons.removeAllViews()
-        fun addRating(title: String, state: String) {
-            feedbackButtons.addView(ui.chip(title, card.feedback == state) {
-                activity.action(onError = { activity.toast("Не удалось отправить оценку") }) {
-                    activity.store.waveExtras.rate(track, card, state)
+        fun addRating(title: String, state: String, symbol: Symbol) {
+            val active = card.feedback == state
+            val ink = if (active) Color.BLACK else ui.palette.text
+            feedbackButtons.addView(ui.row().apply {
+                gravity = Gravity.CENTER
+                minimumHeight = ui.dp(36)
+                setPadding(ui.dp(12), ui.dp(7), ui.dp(12), ui.dp(7))
+                background = ui.touch(if (active) ui.palette.accent else ui.palette.lifted, 30)
+                pressFeedback(.94f)
+                isSelected = active
+                isFocusable = true
+                addView(IconView(activity, symbol, ink).apply { iconSize = 13 },
+                    LinearLayout.LayoutParams(ui.dp(14), ui.dp(14)).apply { marginEnd = ui.dp(6) })
+                addView(ui.line(title, 13, ink, bold = true))
+                setOnClickListener {
+                    activity.action(onError = { activity.toast("Не удалось отправить оценку") }) {
+                        activity.store.waveExtras.rate(track, card, state)
+                    }
                 }
-            }.apply {
-                textSize = 13f
-                setPadding(ui.dp(8), 0, ui.dp(8), 0)
-            }, LinearLayout.LayoutParams(-2, ui.dp(42)).apply { marginEnd = ui.dp(6) })
+            }, LinearLayout.LayoutParams(-2, -2).apply {
+                gravity = Gravity.CENTER_VERTICAL
+                marginEnd = ui.dp(8)
+            })
         }
-        addRating("Больше такого", "like")
-        addRating("Мимо", "dislike")
+        addRating("Больше такого", "like", if (card.feedback == "like") Symbol.HEART_FILLED else Symbol.HEART)
+        addRating("Мимо", "dislike", if (card.feedback == "dislike") Symbol.THUMB_DOWN_FILLED else Symbol.THUMB_DOWN)
         feedbackButtons.addView(View(activity), LinearLayout.LayoutParams(0, 1, 1f))
         if (card.story != null) {
             more.textSize = 13f

@@ -8,6 +8,7 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.Uri
+import android.os.SystemClock
 import android.util.AtomicFile
 import androidx.core.content.ContextCompat
 import coil.imageLoader
@@ -35,6 +36,7 @@ import java.io.IOException
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 import javax.crypto.Cipher
 import javax.crypto.CipherInputStream
 import javax.crypto.spec.IvParameterSpec
@@ -69,6 +71,7 @@ internal class MusicFiles(private val store: MusicStore) {
     private val pending = linkedMapOf<String, Track>()
     private val downloadAssets = Semaphore(2)
     private val activeAssets = mutableSetOf<Pair<String, String>>()
+    private val streamCache = ConcurrentHashMap<String, Pair<Long, Stream>>()
 
     private fun accountFolder(uid: String) = File(context.filesDir, "music/${digest(uid)}")
     private fun directory(uid: String) = accountFolder(uid).apply { mkdirs() }
@@ -183,7 +186,10 @@ internal class MusicFiles(private val store: MusicStore) {
 
     suspend fun streamCacheSize() = withContext(Dispatchers.IO) { streamCacheFiles().sumOf(File::length) }
 
-    suspend fun clearStreamCache() = withContext(Dispatchers.IO) { streamCacheFiles().forEach { it.delete() } }
+    suspend fun clearStreamCache() = withContext(Dispatchers.IO) {
+        streamCache.clear()
+        streamCacheFiles().forEach { it.delete() }
+    }
 
     private fun downloadEntries(uid: String): List<JSONObject> = optional {
         JSONArray(store.preferences.getString("downloads:$uid", "[]")).objects()
@@ -228,6 +234,7 @@ internal class MusicFiles(private val store: MusicStore) {
         if (user == uid) return
         stopQueue()
         pending.clear()
+        streamCache.clear()
         _status.value = emptyMap()
         user = uid
         _paused.value = uid != null && store.preferences.getBoolean("downloadsPaused:$uid", false)
@@ -474,13 +481,18 @@ internal class MusicFiles(private val store: MusicStore) {
 
     private fun originalSource(uid: String, id: String, quality: String): Stream {
         if (store.profile.value?.uid != uid) throw MusicError("Войдите через Яндекс", 401)
+        val cacheKey = "$uid:$id:$quality"
+        val now = SystemClock.elapsedRealtime()
+        streamCache[cacheKey]?.takeIf { now - it.first < 90_000L }?.second?.let { return it }
         val api = store.api()
-        return try {
+        val resolved = try {
             api.file(id, quality, "raw")
         } catch (error: MusicError) {
             if (error.status == 0 || error.status in setOf(401, 429)) throw error
             api.file(id, quality, "encraw")
         }
+        streamCache[cacheKey] = SystemClock.elapsedRealtime() to resolved
+        return resolved
     }
 
     private fun fetch(source: Stream, directory: File, id: String, wifi: Network? = null, progress: (Int) -> Unit = {}): File {

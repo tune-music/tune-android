@@ -109,6 +109,8 @@ internal data class Card(
     val link: String? = null,
     val releaseType: String? = null,
     val eventDate: String? = null,
+    val clipPlayerId: String? = null,
+    val color: String? = null,
 ) {
     val key get() = "${kind.name}:${owner.orEmpty()}:$id"
     val isPodcast get() = kind == Kind.ALBUM && releaseType == "podcast"
@@ -125,6 +127,7 @@ internal data class Card(
 
     fun cached() = stored().put("kind", kind.name).put("owner", owner)
         .put("seeds", JSONArray(seeds)).put("link", link).put("eventDate", eventDate)
+        .put("clipPlayerId", clipPlayerId).put("color", color)
 
     companion object {
         fun fromCache(data: JSONObject): Card? {
@@ -132,7 +135,8 @@ internal data class Card(
             val id = data.text("id") ?: return null
             val title = data.text("title") ?: return null
             return Card(kind, id, title, data.text("subtitle").orEmpty(), data.text("coverUri"),
-                data.text("owner"), data.arr("seeds").items().mapNotNull(Any?::asId), data.text("link"), data.text("type"), data.text("eventDate"))
+                data.text("owner"), data.arr("seeds").items().mapNotNull(Any?::asId), data.text("link"), data.text("type"),
+                data.text("eventDate"), data.text("clipPlayerId"), data.text("color"))
         }
 
         fun album(value: JSONObject, requireTitle: Boolean = true): Card? {
@@ -165,9 +169,27 @@ internal data class Card(
             val seeds = (value.optJSONArray("seeds") ?: wave.arr("seeds")).items().mapNotNull(Any?::asId)
             val title = value.text("title") ?: wave.text("name") ?: return null
             if (seeds.isEmpty()) return null
-            return Card(Kind.WAVE, seeds.joinToString(","), title, "", value.text("compactImageUrl")
-                ?: value.obj("agent").obj("cover").text("uri") ?: value.text("imageUrl"), seeds = seeds)
+            val color = value.obj("colors").text("average")
+                ?: value.obj("agent").obj("cover").text("color")
+                ?: wave.obj("colors").text("average")
+                ?: value.obj("icon").text("backgroundColor")
+                ?: value.text("backgroundColor")
+            val cover = value.text("compactImageUrl")
+                ?: value.obj("agent").obj("cover").text("uri")
+                ?: value.text("imageUrl")
+                ?: value.text("backgroundImageUrl")
+            return Card(Kind.WAVE, seeds.joinToString(","), title, "", cover, seeds = seeds, color = color)
         }
+    }
+}
+
+internal fun parseHexColor(raw: String?): Int? {
+    val text = raw?.trim()?.takeIf(String::isNotEmpty) ?: return null
+    val digits = text.removePrefix("#")
+    return when (digits.length) {
+        6 -> digits.toLongOrNull(16)?.let { (0xff000000L or it).toInt() }
+        8 -> digits.toLongOrNull(16)?.toInt()
+        else -> optional { android.graphics.Color.parseColor(text) }
     }
 }
 

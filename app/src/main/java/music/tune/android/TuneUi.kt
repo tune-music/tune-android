@@ -55,15 +55,16 @@ internal class TuneUi(val context: Context, val palette: TuneColors = Palette) {
     fun shape(color: Int, radius: Int = 8) = GradientDrawable().apply { setColor(color); cornerRadius = dp(radius).toFloat() }
     fun touch(color: Int = Color.TRANSPARENT, radius: Int = 8, showSelection: Boolean = false,
               focusHighlight: Boolean = true) = shape(color, radius).apply {
+        val opaque = color != Color.TRANSPARENT
         val overlay = if (palette.light || color == palette.accent) 0x15000000 else 0x17ffffff
-        val highlight = ColorUtils.compositeColors(overlay, color)
+        val highlight = if (opaque) ColorUtils.compositeColors(overlay, color) else Color.TRANSPARENT
         val selected = if (showSelection) ColorUtils.compositeColors(0x1cfacc15, color) else color
         setColor(ColorStateList(arrayOf(
             intArrayOf(android.R.attr.state_pressed, android.R.attr.state_enabled),
             intArrayOf(android.R.attr.state_focused, android.R.attr.state_enabled),
             intArrayOf(android.R.attr.state_selected),
             intArrayOf(),
-        ), intArrayOf(highlight, if (focusHighlight) highlight else color, selected, color)))
+        ), intArrayOf(highlight, if (opaque && focusHighlight) highlight else color, selected, color)))
     }
 
     fun text(label: String, size: Int, color: Int = palette.text, bold: Boolean = false): TextView = TextView(context).apply {
@@ -104,11 +105,12 @@ internal class TuneUi(val context: Context, val palette: TuneColors = Palette) {
         accessibilityDelegate = ButtonAccessibility
     }
 
-    fun art(uri: String?, size: Int, circle: Boolean = false, corner: Int = 10, tone: ((Int) -> Unit)? = null): CoverView = CoverView(context, tone).apply {
-        background = shape(palette.lifted, if (circle) 500 else corner)
-        clipToOutline = true
-        bind(uri, size)
-    }
+    fun art(uri: String?, size: Int, circle: Boolean = false, corner: Int = 10, backdrop: Boolean = true, tone: ((Int) -> Unit)? = null): CoverView =
+        CoverView(context, tone, showPlaceholder = backdrop).apply {
+            background = shape(if (backdrop) palette.lifted else Color.TRANSPARENT, if (circle) 500 else corner)
+            clipToOutline = true
+            bind(uri, size)
+        }
 
     fun chip(label: String, active: Boolean = false, click: () -> Unit) = button(label, active, click).apply {
         minHeight = dp(40)
@@ -147,14 +149,21 @@ internal class TuneUi(val context: Context, val palette: TuneColors = Palette) {
 
 internal fun View.pressFeedback(scale: Float = .86f) {
     if (!ValueAnimator.areAnimatorsEnabled()) return
-    fun motion(target: Float, time: Long, release: Boolean) = ObjectAnimator.ofPropertyValuesHolder(this,
-        PropertyValuesHolder.ofFloat(View.SCALE_X, target), PropertyValuesHolder.ofFloat(View.SCALE_Y, target)).apply {
-        duration = time
-        interpolator = if (release) OvershootInterpolator(.85f) else DecelerateInterpolator()
+    fun motion(target: Float, alphaTarget: Float?, time: Long, release: Boolean): ObjectAnimator {
+        val holders = mutableListOf(
+            PropertyValuesHolder.ofFloat(View.SCALE_X, target),
+            PropertyValuesHolder.ofFloat(View.SCALE_Y, target),
+        )
+        if (alphaTarget != null) holders.add(PropertyValuesHolder.ofFloat(View.ALPHA, alphaTarget))
+        return ObjectAnimator.ofPropertyValuesHolder(this, *holders.toTypedArray()).apply {
+            duration = time
+            interpolator = if (release) OvershootInterpolator(.85f) else DecelerateInterpolator()
+        }
     }
     stateListAnimator = StateListAnimator().apply {
-        addState(intArrayOf(android.R.attr.state_pressed, android.R.attr.state_enabled), motion(scale, 95, false))
-        addState(intArrayOf(), motion(1f, 225, true))
+        addState(intArrayOf(android.R.attr.state_pressed, android.R.attr.state_enabled), motion(scale, .75f, 95, false))
+        addState(intArrayOf(android.R.attr.state_enabled), motion(1f, 1f, 225, true))
+        addState(intArrayOf(), motion(1f, null, 225, true))
     }
 }
 
@@ -165,13 +174,14 @@ private object ButtonAccessibility : View.AccessibilityDelegate() {
     }
 }
 
-internal class CoverView(context: Context, private val tone: ((Int) -> Unit)? = null) : FrameLayout(context) {
+internal class CoverView(context: Context, private val tone: ((Int) -> Unit)? = null, private val showPlaceholder: Boolean = true) : FrameLayout(context) {
     private val image = ImageView(context).apply { scaleType = ImageView.ScaleType.CENTER_CROP }
     private val placeholder = IconView(context, Symbol.NOTE, Palette.muted)
     private var lastOffline = false
 
     init {
         importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+        placeholder.visibility = if (showPlaceholder) View.VISIBLE else View.GONE
         addView(placeholder, LayoutParams(dp(32), dp(32), Gravity.CENTER))
         addView(image, LayoutParams(-1, -1))
     }
@@ -186,7 +196,7 @@ internal class CoverView(context: Context, private val tone: ((Int) -> Unit)? = 
         if (source == image.tag && lastOffline == offline) return
         image.tag = source
         lastOffline = offline
-        placeholder.visibility = View.VISIBLE
+        placeholder.visibility = if (showPlaceholder) View.VISIBLE else View.GONE
         if (source == null) {
             image.dispose()
             image.setImageDrawable(null)
@@ -198,7 +208,7 @@ internal class CoverView(context: Context, private val tone: ((Int) -> Unit)? = 
             if (tone != null) allowHardware(false)
             listener(onSuccess = { _, result ->
                 if (image.tag == source) {
-                    placeholder.visibility = View.INVISIBLE
+                    placeholder.visibility = if (showPlaceholder) View.INVISIBLE else View.GONE
                     tone?.invoke(coverTone(result.drawable as? BitmapDrawable))
                 }
             }, onError = { _, _ ->
@@ -230,9 +240,11 @@ internal class CoverView(context: Context, private val tone: ((Int) -> Unit)? = 
 
 internal enum class Symbol {
     HOME, SEARCH, LIBRARY, WAVE, SETTINGS, BACK, DOWN, MORE, PLAY, PAUSE, NEXT, PREVIOUS,
-    NOTE, HEART, HEART_FILLED, BAN, DOWNLOAD, CHECK, QUEUE, LYRICS, REPEAT, REPEAT_ONE, SHUFFLE,
-    CLOCK, ADD, CLOSE, SHARE, ARROW_UP, ARROW_DOWN, VIDEO, CONCERT, LINK, OUTPUT, MOON, THUMB_DOWN, ACCOUNT, GEAR, STATS,
-    TRASH, EDIT, FILTER, REORDER, PHOTO, SPEAKER, CIRCLE, CHECK_CIRCLE, FILE, DOWNLOAD_CIRCLE, UNLOCK, EYE_OFF, WIFI_OFF
+    NOTE, HEART, HEART_FILLED, HEART_SLASH, BAN, DOWNLOAD, CHECK, QUEUE, QUEUE_NEXT, QUEUE_LAST, PLAYLIST_ADD,
+    LYRICS, REPEAT, REPEAT_ONE, SHUFFLE, CLOCK, HISTORY, ADD, CLOSE, MINUS_CIRCLE, SHARE,
+    ARROW_UP, ARROW_DOWN, ARROW_UP_LEFT, VIDEO, CONCERT, LINK, OUTPUT, MOON, THUMB_DOWN, THUMB_DOWN_FILLED,
+    ACCOUNT, PERSON_MINUS, GEAR, STATS, TRASH, EDIT, FILTER, SORT, REORDER, PHOTO, SPEAKER, CIRCLE, CHECK_CIRCLE,
+    FILE, DOWNLOAD_CIRCLE, UNLOCK, EYE_OFF, WIFI_OFF, MIC_MUSIC, MIC, BOOK, BALLOON, GRID
 }
 
 internal class IconView(context: Context, var symbol: Symbol, var tint: Int) : View(context) {
@@ -269,8 +281,11 @@ internal class IconView(context: Context, var symbol: Symbol, var tint: Int) : V
         canvas.translate((width - side) / 2, (height - side) / 2)
         canvas.scale(side / 24f, side / 24f)
         canvas.scale(glyphScale, glyphScale, 12f, 12f)
-        paint.color = if (isPressed && isClickable) ColorUtils.setAlphaComponent(tint, (Color.alpha(tint) * .75f).toInt()) else tint
+        paint.color = if (!ValueAnimator.areAnimatorsEnabled() && isPressed && isClickable) {
+            ColorUtils.setAlphaComponent(tint, (Color.alpha(tint) * .75f).toInt())
+        } else tint
         paint.style = Paint.Style.STROKE
+        paint.pathEffect = null
         fun line(x: Number, y: Number, x2: Number, y2: Number) = canvas.drawLine(x.toFloat(), y.toFloat(), x2.toFloat(), y2.toFloat(), paint)
         fun circle(x: Number, y: Number, radius: Number) = canvas.drawCircle(x.toFloat(), y.toFloat(), radius.toFloat(), paint)
         fun shape(vararg points: Number, close: Boolean = false, fill: Boolean = false) {
@@ -296,15 +311,37 @@ internal class IconView(context: Context, var symbol: Symbol, var tint: Int) : V
             }
             Symbol.HOME -> shape(2, 11, 12, 3, 22, 11, 20, 11, 20, 21, 14, 21, 14, 15, 10, 15, 10, 21, 4, 21, 4, 11, close = true, fill = true)
             Symbol.SEARCH -> { circle(10.5f, 10.5f, 6.5f); line(16, 16, 21, 21) }
-            Symbol.LIBRARY -> { line(4, 4, 4, 20); line(9, 4, 9, 20); line(14, 4, 14, 20); line(17.5f, 5, 21, 19) }
+            Symbol.LIBRARY -> {
+                line(7.5f, 3.8f, 16.5f, 3.8f)
+                line(5.5f, 7f, 18.5f, 7f)
+                paint.style = Paint.Style.FILL
+                canvas.drawRoundRect(3.5f, 10.2f, 20.5f, 21f, 2.8f, 2.8f, paint)
+                paint.style = Paint.Style.STROKE
+            }
             Symbol.WAVE -> shape(2, 12, 5, 12, 8, 5, 11, 19, 14, 7, 17, 15, 19, 12, 22, 12)
             Symbol.SETTINGS -> { line(3, 6, 21, 6); line(3, 12, 21, 12); line(3, 18, 21, 18)
                 paint.style = Paint.Style.FILL; circle(8, 6, 2.2f); circle(16, 12, 2.2f); circle(10, 18, 2.2f) }
             Symbol.GEAR -> {
-                shape(10, 2, 14, 2, 15, 5, 17, 6, 20, 5.5f, 22, 9, 20, 11, 20, 13, 22, 15, 20, 18.5f,
-                    17, 18, 15, 19, 14, 22, 10, 22, 9, 19, 7, 18, 4, 18.5f, 2, 15, 4, 13, 4, 11,
-                    2, 9, 4, 5.5f, 7, 6, 9, 5, close = true)
-                circle(12, 12, 3.2f)
+                path.rewind()
+                val teeth = 8
+                val outer = 9.8f
+                val inner = 7.4f
+                for (i in 0 until teeth) {
+                    val base = i * 2.0 * Math.PI / teeth
+                    val step = 2.0 * Math.PI / (teeth * 4)
+                    val angles = doubleArrayOf(base - step * 1.1, base - step * .55, base + step * .55, base + step * 1.1)
+                    val radii = floatArrayOf(inner, outer, outer, inner)
+                    for (j in angles.indices) {
+                        val x = 12f + radii[j] * kotlin.math.cos(angles[j]).toFloat()
+                        val y = 12f + radii[j] * kotlin.math.sin(angles[j]).toFloat()
+                        if (i == 0 && j == 0) path.moveTo(x, y) else path.lineTo(x, y)
+                    }
+                }
+                path.close()
+                paint.pathEffect = CornerPathEffect(.9f)
+                canvas.drawPath(path, paint)
+                paint.pathEffect = null
+                circle(12, 12, 3.1f)
             }
             Symbol.STATS -> {
                 paint.style = Paint.Style.FILL
@@ -330,7 +367,7 @@ internal class IconView(context: Context, var symbol: Symbol, var tint: Int) : V
                 shape(9, 17, 9, 6, 20, 3, 20, 14)
                 paint.style = Paint.Style.FILL; circle(6.5f, 17.5f, 2.8f); circle(17.5f, 14.5f, 2.8f)
             }
-            Symbol.HEART, Symbol.HEART_FILLED -> {
+            Symbol.HEART, Symbol.HEART_FILLED, Symbol.HEART_SLASH -> {
                 if (symbol == Symbol.HEART_FILLED) paint.style = Paint.Style.FILL
                 path.rewind()
                 path.moveTo(12f, 20.5f)
@@ -340,14 +377,38 @@ internal class IconView(context: Context, var symbol: Symbol, var tint: Int) : V
                 path.cubicTo(21f, 14.6f, 14f, 18.8f, 12f, 20.5f)
                 path.close()
                 canvas.drawPath(path, paint)
+                if (symbol == Symbol.HEART_SLASH) line(3.5f, 3.5f, 20.5f, 20.5f)
             }
             Symbol.BAN -> { circle(12, 12, 8); line(6.5f, 6.5f, 17.5f, 17.5f) }
             Symbol.DOWNLOAD -> { line(12, 3, 12, 15); shape(7, 11, 12, 16, 17, 11); line(4, 21, 20, 21) }
             Symbol.CHECK -> shape(4, 12, 9, 17, 20, 6)
             Symbol.QUEUE -> { line(3, 6, 21, 6); line(3, 12, 17, 12); line(3, 18, 13, 18); shape(17, 16, 22, 19, 17, 22, close = true, fill = true) }
+            Symbol.QUEUE_NEXT -> {
+                shape(4, 4.5f, 7, 7, 4, 9.5f)
+                line(10, 7, 20.5f, 7)
+                line(4, 13, 20.5f, 13)
+                line(4, 18.5f, 17, 18.5f)
+            }
+            Symbol.QUEUE_LAST -> {
+                line(4, 6, 20.5f, 6)
+                line(4, 11.5f, 20.5f, 11.5f)
+                shape(4, 14.5f, 7, 17, 4, 19.5f)
+                line(10, 17, 20.5f, 17)
+            }
+            Symbol.PLAYLIST_ADD -> {
+                line(3.5f, 6, 19.5f, 6)
+                line(3.5f, 11.5f, 16.5f, 11.5f)
+                line(3.5f, 17, 12, 17)
+                line(17.5f, 13.5f, 17.5f, 20.5f)
+                line(14, 17, 21, 17)
+            }
             Symbol.LYRICS -> {
-                shape(7, 5, 4, 7, 4, 11, 7, 11); shape(13, 5, 10, 7, 10, 11, 13, 11)
-                line(17, 7, 21, 7); line(4, 16, 21, 16); line(4, 21, 16, 21)
+                shape(7.2f, 4.8f, 4.5f, 7, 4.5f, 10.5f, 7.2f, 10.5f)
+                shape(12.2f, 4.8f, 9.5f, 7, 9.5f, 10.5f, 12.2f, 10.5f)
+                line(16, 6.2f, 20.5f, 6.2f)
+                line(16, 10.2f, 20.5f, 10.2f)
+                line(4.5f, 15, 20.5f, 15)
+                line(4.5f, 19.5f, 15.5f, 19.5f)
             }
             Symbol.REPEAT, Symbol.REPEAT_ONE -> {
                 shape(3, 11, 3, 7, 20, 7); shape(16, 3, 20, 7, 16, 11)
@@ -357,31 +418,67 @@ internal class IconView(context: Context, var symbol: Symbol, var tint: Int) : V
             Symbol.SHUFFLE -> { shape(3, 6, 7, 6, 17, 18, 21, 18); shape(17, 14, 21, 18, 17, 22)
                 shape(3, 18, 7, 18, 10, 14); shape(14, 10, 17, 6, 21, 6); shape(17, 2, 21, 6, 17, 10) }
             Symbol.CLOCK -> { circle(12, 12, 8.5f); shape(12, 7, 12, 12, 16, 14) }
+            Symbol.HISTORY -> {
+                canvas.drawArc(3.8f, 3.8f, 20.2f, 20.2f, -155f, 305f, false, paint)
+                shape(3.4f, 5.2f, 4.5f, 8.8f, 8.1f, 7.7f)
+                shape(12, 7.5f, 12, 12.2f, 15.2f, 14)
+            }
             Symbol.ADD -> { line(12, 4, 12, 20); line(4, 12, 20, 12) }
             Symbol.CLOSE -> { line(5, 5, 19, 19); line(19, 5, 5, 19) }
+            Symbol.MINUS_CIRCLE -> { circle(12, 12, 8.5f); line(8, 12, 16, 12) }
             Symbol.SHARE -> { shape(8, 9, 5, 9, 5, 22, 19, 22, 19, 9, 16, 9)
                 line(12, 14, 12, 2); shape(8, 6, 12, 2, 16, 6) }
             Symbol.ARROW_UP -> { line(12, 20, 12, 4); shape(6, 10, 12, 4, 18, 10) }
             Symbol.ARROW_DOWN -> { line(12, 4, 12, 20); shape(6, 14, 12, 20, 18, 14) }
+            Symbol.ARROW_UP_LEFT -> { line(18, 18, 6, 6); shape(6, 14, 6, 6, 14, 6) }
             Symbol.VIDEO -> { canvas.drawRoundRect(3f, 5f, 21f, 19f, 2f, 2f, paint); shape(10, 9, 16, 12, 10, 15, close = true, fill = true) }
-            Symbol.CONCERT -> { shape(3, 5, 21, 5, 21, 19, 3, 19, close = true); line(14, 8, 14, 10); line(14, 14, 14, 16) }
+            Symbol.CONCERT -> {
+                canvas.drawRoundRect(3.5f, 5f, 20.5f, 20.5f, 3f, 3f, paint)
+                line(8, 2.8f, 8, 6.2f)
+                line(16, 2.8f, 16, 6.2f)
+                line(3.5f, 9.5f, 20.5f, 9.5f)
+                paint.style = Paint.Style.FILL
+                circle(7.5f, 13, 1.1f); circle(12, 13, 1.1f); circle(16.5f, 13, 1.1f)
+                circle(7.5f, 16.8f, 1.1f); circle(12, 16.8f, 1.1f)
+                paint.style = Paint.Style.STROKE
+            }
             Symbol.LINK -> { canvas.drawRoundRect(RectF(3f, 8f, 12f, 16f), 4f, 4f, paint)
                 canvas.drawRoundRect(RectF(12f, 8f, 21f, 16f), 4f, 4f, paint); line(8, 12, 16, 12) }
             Symbol.OUTPUT -> {
-                shape(7, 17, 3, 17, 3, 5, 21, 5, 21, 17, 17, 17)
-                shape(12, 13, 18, 21, 6, 21, close = true)
+                canvas.drawArc(3f, 3f, 21f, 21f, 140f, 260f, false, paint)
+                canvas.drawArc(6.5f, 6.5f, 17.5f, 17.5f, 145f, 250f, false, paint)
+                shape(12, 14, 16.5f, 20.5f, 7.5f, 20.5f, close = true, fill = true)
             }
             Symbol.MOON -> {
                 path.rewind()
-                path.moveTo(13f, 3f)
-                path.cubicTo(2f, 2f, 0f, 18f, 11f, 21f)
-                path.cubicTo(16f, 22.3f, 21f, 19f, 21f, 14f)
-                path.cubicTo(14f, 17f, 8f, 10f, 13f, 3f)
+                path.moveTo(13.2f, 3.5f)
+                path.cubicTo(4f, 3.5f, 2f, 16.5f, 10.5f, 20.2f)
+                path.cubicTo(15f, 22f, 19.5f, 19.5f, 20.5f, 15.2f)
+                path.cubicTo(14f, 17f, 8.8f, 11f, 13.2f, 3.5f)
+                path.close()
                 canvas.drawPath(path, paint)
+                shape(15.2f, 4.8f, 18.6f, 4.8f, 15.2f, 8.2f, 18.6f, 8.2f)
+                shape(18f, 9.8f, 21f, 9.8f, 18f, 12.8f, 21f, 12.8f)
             }
-            Symbol.THUMB_DOWN -> {
-                shape(19, 4, 22, 4, 22, 14, 19, 14, close = true)
-                shape(15, 4, 7, 4, 5, 6, 3, 12, 4, 14, 10, 14, 9, 19, 11, 21, 16, 14, 17, 7, 15, 4)
+            Symbol.THUMB_DOWN, Symbol.THUMB_DOWN_FILLED -> {
+                val fill = symbol == Symbol.THUMB_DOWN_FILLED
+                if (fill) paint.style = Paint.Style.FILL
+                canvas.drawRoundRect(17.5f, 4.5f, 21f, 13.5f, 1.5f, 1.5f, paint)
+                path.rewind()
+                path.moveTo(17.5f, 5f)
+                path.lineTo(9.2f, 5f)
+                path.cubicTo(7.4f, 5f, 6.2f, 6.1f, 5.7f, 7.6f)
+                path.lineTo(4.2f, 12.2f)
+                path.cubicTo(3.8f, 13.6f, 4.7f, 14.8f, 6.2f, 14.8f)
+                path.lineTo(10.6f, 14.8f)
+                path.lineTo(9.8f, 18.8f)
+                path.cubicTo(9.5f, 20.2f, 10.7f, 21f, 11.8f, 20.3f)
+                path.cubicTo(12.3f, 20f, 12.7f, 19.3f, 13.2f, 18.3f)
+                path.lineTo(16.2f, 13.5f)
+                path.lineTo(17.5f, 12.8f)
+                if (fill) path.close()
+                canvas.drawPath(path, paint)
+                paint.style = Paint.Style.STROKE
             }
             Symbol.ACCOUNT -> {
                 circle(12, 12, 9)
@@ -391,22 +488,80 @@ internal class IconView(context: Context, var symbol: Symbol, var tint: Int) : V
                 path.quadTo(12f, 11f, 17.5f, 18f)
                 canvas.drawPath(path, paint)
             }
+            Symbol.PERSON_MINUS -> {
+                canvas.drawArc(3f, 3f, 20f, 20f, 80f, 285f, false, paint)
+                circle(11.5f, 9, 2.5f)
+                path.rewind()
+                path.moveTo(6.8f, 16.8f)
+                path.quadTo(11.5f, 12.5f, 15.2f, 15.5f)
+                canvas.drawPath(path, paint)
+                line(15.5f, 18, 21, 18)
+            }
             Symbol.TRASH -> { shape(6, 7, 7, 21, 17, 21, 18, 7); line(4, 6, 20, 6); shape(9, 6, 9, 3, 15, 3, 15, 6)
                 line(10, 10, 10, 17); line(14, 10, 14, 17) }
             Symbol.EDIT -> { shape(4, 20, 5, 15, 17, 3, 21, 7, 9, 19, close = true); line(14, 6, 18, 10) }
             Symbol.FILTER -> { line(4, 6, 20, 6); line(7, 12, 17, 12); line(10, 18, 14, 18) }
+            Symbol.SORT -> {
+                line(8, 19, 8, 5); shape(4.5f, 8.5f, 8, 5, 11.5f, 8.5f)
+                line(16, 5, 16, 19); shape(12.5f, 15.5f, 16, 19, 19.5f, 15.5f)
+            }
             Symbol.REORDER -> { line(5, 7, 19, 7); line(5, 12, 19, 12); line(5, 17, 19, 17) }
             Symbol.PHOTO -> { canvas.drawRoundRect(3f, 4f, 21f, 20f, 2f, 2f, paint); circle(15, 9, 1.5f); shape(4, 17, 9, 12, 13, 16, 16, 13, 21, 17) }
             Symbol.SPEAKER -> { canvas.drawRoundRect(4f, 2f, 17f, 22f, 3f, 3f, paint); circle(10.5f, 8, 1.4f); circle(10.5f, 15.5f, 3.1f); line(20, 7, 20, 17) }
             Symbol.CIRCLE -> circle(12, 12, 8.5f)
             Symbol.CHECK_CIRCLE -> { circle(12, 12, 8.5f); shape(8, 12, 11, 15, 16, 9) }
             Symbol.FILE -> { shape(5, 3, 15, 3, 20, 8, 20, 21, 5, 21, close = true); shape(15, 3, 15, 8, 20, 8); line(8, 12, 16, 12); line(8, 16, 16, 16) }
-            Symbol.DOWNLOAD_CIRCLE -> { circle(12, 12, 9); line(12, 6, 12, 16); shape(8, 12, 12, 16, 16, 12) }
+            Symbol.DOWNLOAD_CIRCLE -> { circle(12, 12, 9); line(12, 7.5f, 12, 15.5f); shape(8.5f, 12.2f, 12, 15.8f, 15.5f, 12.2f) }
             Symbol.UNLOCK -> { canvas.drawRoundRect(5f, 10f, 19f, 22f, 2f, 2f, paint)
                 path.rewind(); path.moveTo(8f, 10f); path.lineTo(8f, 6f); path.cubicTo(8f, 1f, 17f, 1f, 17f, 6f); canvas.drawPath(path, paint)
                 line(12, 15, 12, 18) }
             Symbol.EYE_OFF -> { path.rewind(); path.moveTo(2f, 12f); path.quadTo(12f, 0f, 22f, 12f)
                 path.quadTo(12f, 24f, 2f, 12f); canvas.drawPath(path, paint); circle(12, 12, 3); line(3, 3, 21, 21) }
+            Symbol.MIC_MUSIC -> {
+                circle(15.2f, 8.2f, 4.2f)
+                line(12.2f, 5.2f, 18.2f, 11.2f)
+                shape(11.6f, 10.2f, 4.2f, 17.8f, 6.2f, 19.8f, 13.8f, 12.4f)
+                line(3.4f, 20.6f, 5.2f, 18.8f)
+            }
+            Symbol.MIC -> {
+                canvas.drawRoundRect(9f, 2.8f, 15f, 13.8f, 3f, 3f, paint)
+                canvas.drawArc(6f, 6.2f, 18f, 16.8f, 0f, 180f, false, paint)
+                line(12, 16.8f, 12, 20.5f)
+                line(8.2f, 20.5f, 15.8f, 20.5f)
+            }
+            Symbol.BOOK -> {
+                line(12, 6.2f, 12, 19.8f)
+                path.rewind()
+                path.moveTo(12f, 6.2f); path.quadTo(7.5f, 4.2f, 3f, 5.8f); path.lineTo(3f, 18.8f); path.quadTo(7.5f, 17.2f, 12f, 19.8f)
+                canvas.drawPath(path, paint)
+                path.rewind()
+                path.moveTo(12f, 6.2f); path.quadTo(16.5f, 4.2f, 21f, 5.8f); path.lineTo(21f, 18.8f); path.quadTo(16.5f, 17.2f, 12f, 19.8f)
+                canvas.drawPath(path, paint)
+            }
+            Symbol.BALLOON -> {
+                path.rewind()
+                path.moveTo(12f, 2.5f)
+                path.cubicTo(17.2f, 2.5f, 18.2f, 7.6f, 16.4f, 11.6f)
+                path.cubicTo(15f, 14.6f, 13.3f, 15.8f, 12f, 16f)
+                path.cubicTo(10.7f, 15.8f, 9f, 14.6f, 7.6f, 11.6f)
+                path.cubicTo(5.8f, 7.6f, 6.8f, 2.5f, 12f, 2.5f)
+                path.close()
+                canvas.drawPath(path, paint)
+                canvas.drawArc(8.5f, 4.8f, 14f, 10.5f, 190f, 60f, false, paint)
+                shape(10.7f, 17.4f, 12, 16, 13.3f, 17.4f, close = true)
+                path.rewind()
+                path.moveTo(12f, 17.5f)
+                path.cubicTo(10.5f, 19f, 13.5f, 20.5f, 11.5f, 22f)
+                canvas.drawPath(path, paint)
+            }
+            Symbol.GRID -> {
+                paint.style = Paint.Style.FILL
+                canvas.drawRoundRect(3.5f, 3.5f, 10.7f, 10.7f, 2f, 2f, paint)
+                canvas.drawRoundRect(13.3f, 3.5f, 20.5f, 10.7f, 2f, 2f, paint)
+                canvas.drawRoundRect(3.5f, 13.3f, 10.7f, 20.5f, 2f, 2f, paint)
+                canvas.drawRoundRect(13.3f, 13.3f, 20.5f, 20.5f, 2f, 2f, paint)
+                paint.style = Paint.Style.STROKE
+            }
         }
         canvas.restore()
     }

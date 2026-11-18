@@ -7,7 +7,11 @@ import android.app.Dialog
 import android.content.Intent
 import android.content.res.ColorStateList
 import android.graphics.Color
+import android.graphics.drawable.ClipDrawable
+import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.LayerDrawable
+import android.graphics.drawable.ShapeDrawable
 import android.media.MediaRouter2
 import android.os.Build
 import android.os.Bundle
@@ -18,6 +22,8 @@ import android.view.VelocityTracker
 import android.view.View
 import android.view.ViewConfiguration
 import android.view.ViewGroup
+import android.view.animation.DecelerateInterpolator
+import android.view.animation.PathInterpolator
 import android.widget.BaseAdapter
 import android.widget.FrameLayout
 import android.widget.LinearLayout
@@ -29,6 +35,7 @@ import android.widget.TextView
 import androidx.media3.common.Player
 import androidx.media3.session.SessionCommand
 import androidx.core.animation.doOnEnd
+import androidx.core.graphics.Insets
 import kotlinx.coroutines.Job
 
 internal class PlayerPanel(private val activity: MainActivity) {
@@ -42,9 +49,10 @@ internal class PlayerPanel(private val activity: MainActivity) {
     }
     private val title = TrackTitle(ui, 22, onDark = true)
     private val artist = ui.line("", 17, Palette.muted)
-    private val details = ui.line("", 12, Palette.muted)
+    private var topTone = Palette.lifted
+    private var toneAnimator: ValueAnimator? = null
     private val backdrop = GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM, intArrayOf(Palette.lifted, 0xff0d0d0d.toInt()))
-    private val art = CoverTrackPager(ui) { tone -> backdrop.colors = intArrayOf(tone, 0xff0d0d0d.toInt()) }
+    private val art = CoverTrackPager(ui) { tone -> animateTone(tone) }
     private val lyricBody = ui.column()
     private val lyricScroll = LyricsScroll().apply {
         isVerticalScrollBarEnabled = false
@@ -60,14 +68,32 @@ internal class PlayerPanel(private val activity: MainActivity) {
         addView(lyricScroll, FrameLayout.LayoutParams(-1, -1))
         addView(lyricStatus, FrameLayout.LayoutParams(-1, -1))
     }
-    private val elapsed = ui.text("0:00", 12, Palette.muted)
-    private val duration = ui.text("0:00", 12, Palette.muted)
+    private val elapsed = ui.text("0:00", 12, Palette.muted).apply { fontFeatureSettings = "tnum" }
+    private val duration = ui.text("0:00", 12, Palette.muted).apply { fontFeatureSettings = "tnum" }
+    private val seekLayers = LayerDrawable(arrayOf(
+        ui.shape(0x38ffffff, 10),
+        ClipDrawable(ui.shape(0x26ffffff, 10), Gravity.START, ClipDrawable.HORIZONTAL),
+        ClipDrawable(ui.shape(Palette.text, 10), Gravity.START, ClipDrawable.HORIZONTAL),
+    )).apply {
+        setId(0, android.R.id.background)
+        setId(1, android.R.id.secondaryProgress)
+        setId(2, android.R.id.progress)
+        val thin = ui.dp(5)
+        for (index in 0..2) {
+            setLayerHeight(index, thin)
+            setLayerGravity(index, Gravity.CENTER_VERTICAL)
+        }
+    }
+    private var seekThicknessAnimator: ValueAnimator? = null
     private val seek = SeekBar(activity).apply {
         max = 1000
-        progressTintList = ColorStateList.valueOf(Palette.text)
-        progressBackgroundTintList = ColorStateList.valueOf(0x38ffffff)
-        secondaryProgressTintList = ColorStateList.valueOf(0x26ffffff)
-        thumbTintList = ColorStateList.valueOf(Color.TRANSPARENT)
+        progressDrawable = seekLayers
+        thumb = ShapeDrawable().apply {
+            intrinsicWidth = 0
+            intrinsicHeight = 0
+            paint.color = Color.TRANSPARENT
+        }
+        thumbOffset = 0
         contentDescription = "Позиция трека"
         setPadding(0, 0, 0, 0)
         splitTrack = false
@@ -92,6 +118,8 @@ internal class PlayerPanel(private val activity: MainActivity) {
     private var lyricJob: Job? = null
     private var showingLyrics = false
     private var lyricMotion: AnimatorSet? = null
+    private var scrollAnimator: ValueAnimator? = null
+    private var scrollTargetY = -1
     private var lyrics: List<LyricsLine> = emptyList()
     private var lyricRows: List<TextView> = emptyList()
     private var timedLyrics = false
@@ -123,34 +151,41 @@ internal class PlayerPanel(private val activity: MainActivity) {
         isFillViewport = true
         val body = ui.column().apply {
             gravity = Gravity.CENTER_HORIZONTAL
+            clipChildren = false
+            clipToPadding = false
             setPadding(0, 0, 0, ui.dp(12))
         }
         val config = activity.resources.configuration
         val size = minOf(config.screenWidthDp - 48, (config.screenHeightDp * .44f).toInt(), 540).coerceAtLeast(140)
+        lyricPane.setPadding(ui.dp(24), 0, ui.dp(24), 0)
         body.addView(FrameLayout(activity).apply {
-            minimumHeight = ui.dp(size + 20)
+            clipChildren = false
+            clipToPadding = false
+            minimumHeight = ui.dp(size + 32)
             art.setCoverSize(ui.dp(size))
             addView(art, FrameLayout.LayoutParams(-1, -1))
             addView(lyricPane, FrameLayout.LayoutParams(-1, -1))
-        }, LinearLayout.LayoutParams(-1, ui.dp(size + 20), 1f))
-        body.addView(ui.row().apply {
+        }, LinearLayout.LayoutParams(-1, ui.dp(size + 32), 1f))
+        val controls = ui.column().apply {
+            setPadding(ui.dp(24), 0, ui.dp(24), 0)
+        }
+        controls.addView(ui.row().apply {
             addView(ui.column().apply {
                 addView(title.apply { label.setOnClickListener { activity.currentTrack()?.let(activity::openTrackAlbum) } }, ui.full())
                 addView(ui.space(6))
                 addView(artist.apply { setOnClickListener { activity.currentTrack()?.let(activity::openTrackArtist) } })
-                addView(details.apply { setPadding(0, ui.dp(5), 0, 0) })
             }, ui.weight())
             addView(dislike)
             addView(like)
         }, ui.full())
-        body.addView(ui.space(14))
-        body.addView(seek, ui.full(28))
-        body.addView(ui.row().apply {
+        controls.addView(ui.space(14))
+        controls.addView(seek, ui.full(28))
+        controls.addView(ui.row().apply {
             addView(elapsed, ui.weight())
             addView(duration)
         }, ui.full())
-        body.addView(ui.space(14))
-        body.addView(ui.row().apply {
+        controls.addView(ui.space(14))
+        controls.addView(ui.row().apply {
             addView(shuffle)
             addView(View(activity), LinearLayout.LayoutParams(0, 1, 1f))
             addView(skip(Symbol.PREVIOUS, "Предыдущий", -5_000, activity::previous))
@@ -161,25 +196,76 @@ internal class PlayerPanel(private val activity: MainActivity) {
             addView(View(activity), LinearLayout.LayoutParams(0, 1, 1f))
             addView(repeat)
         }, ui.full(76))
-        body.addView(ui.space(18))
-        body.addView(ui.row().apply {
+        controls.addView(ui.space(18))
+        controls.addView(ui.row().apply {
             listOf(lyricButton, ui.icon(Symbol.OUTPUT, "Устройство вывода", click = ::output),
                 soundButton, sleepButton, download, ui.icon(Symbol.QUEUE, "Очередь", click = ::showQueue)).forEach { icon ->
                 icon.iconSize = 21
                 addView(icon, LinearLayout.LayoutParams(0, ui.dp(44), 1f))
             }
         }, ui.full(44))
+        body.addView(controls, ui.full())
         addView(body, ViewGroup.LayoutParams(-1, -2))
+    }
+
+    private val container = ui.column().apply {
+        clipChildren = false
+        clipToPadding = false
+        toolbar.setPadding(ui.dp(24), 0, ui.dp(24), 0)
+        setPadding(0, ui.dp(8), 0, 0)
+        addView(toolbar, ui.full(44))
+        addView(layout, LinearLayout.LayoutParams(-1, 0, 1f))
     }
 
     val view: FrameLayout = PlayerSurface().apply {
         background = backdrop
         isClickable = true
-        addView(ui.column().apply {
-            setPadding(ui.dp(24), ui.dp(8), ui.dp(24), 0)
-            addView(toolbar, ui.full(44))
-            addView(layout, LinearLayout.LayoutParams(-1, 0, 1f))
-        }, FrameLayout.LayoutParams(-1, -1))
+        addView(container, FrameLayout.LayoutParams(-1, -1))
+    }
+
+    fun applyInsets(bars: Insets) {
+        container.setPadding(bars.left, ui.dp(8) + bars.top, bars.right, bars.bottom)
+    }
+
+    private fun animateTone(target: Int) {
+        if (topTone == target) return
+        toneAnimator?.cancel()
+        if (!ValueAnimator.areAnimatorsEnabled() || !view.isAttachedToWindow) {
+            topTone = target
+            backdrop.colors = intArrayOf(target, 0xff0d0d0d.toInt())
+            return
+        }
+        val start = topTone
+        toneAnimator = ValueAnimator.ofArgb(start, target).apply {
+            duration = 400
+            addUpdateListener {
+                topTone = it.animatedValue as Int
+                backdrop.colors = intArrayOf(topTone, 0xff0d0d0d.toInt())
+            }
+            start()
+        }
+    }
+
+    private fun animateSeekThickness(thick: Boolean) {
+        val target = ui.dp(if (thick) 10 else 5)
+        val current = seekLayers.getLayerHeight(0)
+        if (current == target) return
+        seekThicknessAnimator?.cancel()
+        if (!ValueAnimator.areAnimatorsEnabled()) {
+            for (index in 0..2) seekLayers.setLayerHeight(index, target)
+            seek.invalidate()
+            return
+        }
+        seekThicknessAnimator = ValueAnimator.ofInt(current, target).apply {
+            duration = 150
+            addUpdateListener { anim ->
+                val h = anim.animatedValue as Int
+                for (index in 0..2) seekLayers.setLayerHeight(index, h)
+                seekLayers.invalidateSelf()
+                seek.invalidate()
+            }
+            start()
+        }
     }
 
     init {
@@ -194,11 +280,15 @@ internal class PlayerPanel(private val activity: MainActivity) {
             }
         }
         seek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            override fun onStartTrackingTouch(bar: SeekBar) { dragging = true }
+            override fun onStartTrackingTouch(bar: SeekBar) {
+                dragging = true
+                animateSeekThickness(true)
+            }
             override fun onStopTrackingTouch(bar: SeekBar) {
                 val length = player?.duration ?: 0
                 if (length > 0) player?.seekTo(length * bar.progress / 1000)
                 dragging = false
+                animateSeekThickness(false)
             }
             override fun onProgressChanged(bar: SeekBar, progress: Int, fromUser: Boolean) {
                 if (!fromUser) return
@@ -231,23 +321,17 @@ internal class PlayerPanel(private val activity: MainActivity) {
         source.visibility = if (context.name.isBlank()) View.GONE else View.VISIBLE
         title.bind(track)
         artist.text = track.artistText
-        details.text = when {
-            player.playbackState == Player.STATE_BUFFERING -> "Загрузка…"
-            store.files.hasReplacement(track) -> "Подмена"
-            else -> ""
-        }
-        details.visibility = if (details.text.isEmpty()) View.GONE else View.VISIBLE
         fun neighbor(index: Int) = if (index in 0 until player.mediaItemCount && index != player.currentMediaItemIndex)
             QueueItems.track(player.getMediaItemAt(index)) else null
-        art.bind(neighbor(player.previousMediaItemIndex), track, neighbor(player.nextMediaItemIndex), player.isPlaying)
         val playing = player.isPlaying || player.playWhenReady && player.playbackState == Player.STATE_BUFFERING
+        art.bind(neighbor(player.previousMediaItemIndex), track, neighbor(player.nextMediaItemIndex), playing)
         activity.setIcon(toggle, if (playing) Symbol.PAUSE else Symbol.PLAY, if (playing) "Пауза" else "Воспроизвести", Palette.background)
         val liked = track.id in store.likes.value
         activity.setIcon(like, if (liked) Symbol.HEART_FILLED else Symbol.HEART,
             if (liked) "Убрать из «Мне нравится»" else "Мне нравится", if (liked) Palette.accent else Palette.text)
         val disliked = track.id in store.dislikes.value
-        activity.setIcon(dislike, Symbol.THUMB_DOWN, if (disliked) "Снять дизлайк" else "Не нравится",
-            if (disliked) Palette.accent else Palette.text)
+        activity.setIcon(dislike, if (disliked) Symbol.THUMB_DOWN_FILLED else Symbol.THUMB_DOWN,
+            if (disliked) "Снять дизлайк" else "Не нравится", if (disliked) Palette.accent else Palette.text)
         shuffle.isEnabled = context.wave == null
         shuffle.alpha = if (shuffle.isEnabled) 1f else .35f
         activity.setIcon(shuffle, Symbol.SHUFFLE, if (player.shuffleModeEnabled) "Выключить перемешивание" else "Перемешать",
@@ -289,26 +373,62 @@ internal class PlayerPanel(private val activity: MainActivity) {
         val now = player.currentPosition + 250
         val index = lyrics.indexOfLast { it.position?.let { position -> position <= now } == true }
         if (index != activeLine) {
-            lyricRows.getOrNull(activeLine)?.let { highlight(it, .32f) }
+            lyricRows.getOrNull(activeLine)?.let { highlight(it, false) }
             activeLine = index
-            lyricRows.getOrNull(index)?.let { highlight(it, 1f) }
+            lyricRows.getOrNull(index)?.let { highlight(it, true) }
         }
         val anchor = index.coerceAtLeast(0)
         if ((anchor != lastAnchor || recenterLyrics) && !lyricScroll.isManuallyScrolling && lyricScroll.height > 0) {
             val row = lyricRows[anchor]
             if (row.height == 0) return
-            val y = (row.top - (lyricScroll.height - row.height) / 2).coerceAtLeast(0)
-            if (lastAnchor < 0 || !ValueAnimator.areAnimatorsEnabled()) lyricScroll.scrollTo(0, y)
-            else lyricScroll.smoothScrollTo(0, y)
+            val maxScroll = (lyricBody.height - lyricScroll.height).coerceAtLeast(0)
+            val y = (row.top - (lyricScroll.height - row.height) / 2).coerceIn(0, maxScroll)
+            if (lastAnchor < 0 || !ValueAnimator.areAnimatorsEnabled()) {
+                scrollAnimator?.cancel()
+                scrollTargetY = y
+                lyricScroll.scrollTo(0, y)
+            } else {
+                animateLyricsScroll(y)
+            }
             lastAnchor = anchor
             recenterLyrics = false
         }
     }
 
-    private fun highlight(row: View, alpha: Float) {
-        row.isSelected = alpha == 1f
-        if (ValueAnimator.areAnimatorsEnabled()) row.animate().alpha(alpha).setDuration(220).start()
-        else row.alpha = alpha
+    private fun animateLyricsScroll(targetY: Int) {
+        if (lyricScroll.scrollY == targetY) return
+        if (scrollAnimator?.isRunning == true && scrollTargetY == targetY) return
+        scrollAnimator?.cancel()
+        scrollTargetY = targetY
+        scrollAnimator = ValueAnimator.ofInt(lyricScroll.scrollY, targetY).apply {
+            duration = 360
+            interpolator = PathInterpolator(0.25f, 0.1f, 0.25f, 1f)
+            addUpdateListener { lyricScroll.scrollTo(0, it.animatedValue as Int) }
+            start()
+        }
+    }
+
+    private fun highlight(row: View, active: Boolean) {
+        val alpha = if (active) 1f else .32f
+        val scale = if (active) 1f else .96f
+        if (row.width > 0) {
+            row.pivotX = row.width / 2f
+            row.pivotY = row.height / 2f
+        }
+        row.animate().cancel()
+        if (ValueAnimator.areAnimatorsEnabled()) {
+            row.animate()
+                .alpha(alpha)
+                .scaleX(scale)
+                .scaleY(scale)
+                .setDuration(260)
+                .setInterpolator(DecelerateInterpolator(1.6f))
+                .start()
+        } else {
+            row.alpha = alpha
+            row.scaleX = scale
+            row.scaleY = scale
+        }
     }
 
     private fun toggleLyrics() {
@@ -317,14 +437,25 @@ internal class PlayerPanel(private val activity: MainActivity) {
         view.keepScreenOn = showingLyrics
         lyricMotion?.let { motion -> lyricMotion = null; motion.cancel() }
         if (ValueAnimator.areAnimatorsEnabled()) {
+            val wasArtHidden = art.visibility != View.VISIBLE
+            val wasLyricsHidden = lyricPane.visibility != View.VISIBLE
             art.visibility = View.VISIBLE
             lyricPane.visibility = View.VISIBLE
+            if (showingLyrics && wasLyricsHidden) lyricPane.alpha = 0f
+            if (!showingLyrics && wasArtHidden) {
+                art.alpha = 0f
+                art.scaleX = .92f
+                art.scaleY = .92f
+            }
             lyricMotion = AnimatorSet().apply {
                 playTogether(
                     ObjectAnimator.ofFloat(art, View.ALPHA, if (showingLyrics) 0f else 1f),
+                    ObjectAnimator.ofFloat(art, View.SCALE_X, if (showingLyrics) .92f else 1f),
+                    ObjectAnimator.ofFloat(art, View.SCALE_Y, if (showingLyrics) .92f else 1f),
                     ObjectAnimator.ofFloat(lyricPane, View.ALPHA, if (showingLyrics) 1f else 0f),
                 )
-                duration = 230
+                duration = 250
+                interpolator = DecelerateInterpolator(1.3f)
                 doOnEnd { if (lyricMotion === it) finishLyricsTransition() }
             }.also { it.start() }
         } else finishLyricsTransition()
@@ -339,17 +470,24 @@ internal class PlayerPanel(private val activity: MainActivity) {
         lyricPane.alpha = if (showingLyrics) 1f else 0f
         art.visibility = if (showingLyrics) View.INVISIBLE else View.VISIBLE
         art.alpha = if (showingLyrics) 0f else 1f
+        art.scaleX = 1f
+        art.scaleY = 1f
         if (!showingLyrics) clearLyrics()
     }
 
     private fun clearLyrics() {
         lyricJob?.cancel()
+        scrollAnimator?.cancel()
+        scrollAnimator = null
+        scrollTargetY = -1
         lyrics = emptyList()
         lyricRows = emptyList()
         timedLyrics = false
         activeLine = -1
         lastAnchor = -1
         recenterLyrics = false
+        lyricBody.animate().cancel()
+        lyricBody.alpha = 1f
         lyricBody.removeAllViews()
         lyricStatus.removeAllViews()
         lyricBody.setPadding(0, 0, 0, 0)
@@ -377,10 +515,12 @@ internal class PlayerPanel(private val activity: MainActivity) {
                 ui.text(line.text.ifEmpty { "♪" }, 24, Color.WHITE, bold = true).apply {
                     gravity = Gravity.CENTER
                     alpha = if (timedLyrics) .32f else 1f
+                    scaleX = if (timedLyrics) .96f else 1f
+                    scaleY = if (timedLyrics) .96f else 1f
                     typeface = android.graphics.Typeface.create("sans-serif", android.graphics.Typeface.BOLD)
-                    setPadding(ui.dp(8), 0, ui.dp(8), 0)
+                    setPadding(ui.dp(8), ui.dp(2), ui.dp(8), ui.dp(2))
                     line.position?.let { time ->
-                        background = ui.touch()
+                        background = null
                         setOnClickListener {
                             lyricScroll.resetManualScroll()
                             player?.seekTo(time)
@@ -397,10 +537,17 @@ internal class PlayerPanel(private val activity: MainActivity) {
             }
             val hasAuthors = text.authors.isNotEmpty()
             if (hasAuthors) addCredit("Авторы: ${text.authors.joinToString(", ")}", 14, 0x8cffffff.toInt(), 14)
-            text.source?.label?.let { label ->
-                addCredit("Текст: $label", 13, 0x66ffffff, if (hasAuthors) 6 else 14)
+            if (text.source != LyricsSource.YANDEX) {
+                text.source?.label?.let { label ->
+                    addCredit("Текст: $label", 13, 0x66ffffff, if (hasAuthors) 6 else 14)
+                }
             }
             padLyrics()
+            if (ValueAnimator.areAnimatorsEnabled()) {
+                lyricBody.animate().cancel()
+                lyricBody.alpha = 0f
+                lyricBody.animate().alpha(1f).setDuration(220).start()
+            }
             lyricScroll.post { progress() }
         }
     }
@@ -439,7 +586,10 @@ internal class PlayerPanel(private val activity: MainActivity) {
         override fun dispatchTouchEvent(event: MotionEvent): Boolean {
             when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN -> startY = event.y
-                MotionEvent.ACTION_MOVE -> if (kotlin.math.abs(event.y - startY) > ViewConfiguration.get(activity).scaledTouchSlop) moving = true
+                MotionEvent.ACTION_MOVE -> if (kotlin.math.abs(event.y - startY) > ViewConfiguration.get(activity).scaledTouchSlop) {
+                    moving = true
+                    scrollAnimator?.cancel()
+                }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                     if (moving) {
                         lastTouch = android.os.SystemClock.uptimeMillis()
@@ -519,6 +669,8 @@ internal class PlayerPanel(private val activity: MainActivity) {
     private inner class PlayerSurface : FrameLayout(activity) {
         private var downX = 0f
         private var downY = 0f
+        private var dragOriginX = 0f
+        private var dragOriginY = 0f
         private var drag: PlayerDrag? = null
         private var startsInLyrics = false
         private var velocity: VelocityTracker? = null
@@ -538,6 +690,8 @@ internal class PlayerPanel(private val activity: MainActivity) {
                 velocity = VelocityTracker.obtain()
                 downX = event.rawX
                 downY = event.rawY
+                dragOriginX = 0f
+                dragOriginY = 0f
                 startsInLyrics = showingLyrics && startedIn(lyricScroll)
                 drag = if (startedIn(seek)) PlayerDrag.CHILD else null
             }
@@ -562,14 +716,21 @@ internal class PlayerPanel(private val activity: MainActivity) {
                     super.dispatchTouchEvent(cancel)
                     cancel.recycle()
                     animate().cancel()
-                    if (drag == PlayerDrag.HORIZONTAL) art.startDrag()
+                    if (drag == PlayerDrag.HORIZONTAL) {
+                        dragOriginX = dx
+                        art.startDrag()
+                    } else {
+                        dragOriginY = dy
+                    }
                 }
             }
             val handled = when (drag) {
                 PlayerDrag.VERTICAL, PlayerDrag.HORIZONTAL -> {
                     if (action == MotionEvent.ACTION_MOVE) {
-                        if (drag == PlayerDrag.VERTICAL) translationY = dy.coerceAtLeast(0f)
-                        else art.drag(dx)
+                        if (drag == PlayerDrag.VERTICAL) {
+                            translationY = (dy - dragOriginY).coerceAtLeast(0f)
+                            setSurfaceCornerRadius(if (translationY > 0f) ui.dp(36).toFloat() else 0f)
+                        } else art.drag(dx - dragOriginX)
                     }
                     if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) settle(action, dx, dy)
                     true
@@ -584,20 +745,32 @@ internal class PlayerPanel(private val activity: MainActivity) {
             return handled
         }
 
+        private fun setSurfaceCornerRadius(radius: Float) {
+            if (backdrop.cornerRadius != radius) {
+                backdrop.cornerRadius = radius
+                clipToOutline = radius > 0f
+            }
+        }
+
         private fun settle(action: Int, dx: Float, dy: Float) {
             val complete = action == MotionEvent.ACTION_UP
+            val moveX = dx - dragOriginX
+            val moveY = dy - dragOriginY
             velocity?.computeCurrentVelocity(1000)
             if (drag == PlayerDrag.VERTICAL) {
-                val projected = dy + (velocity?.yVelocity ?: 0f).coerceAtLeast(0f) * .18f
-                if (complete && (dy > minOf(ui.dp(118).toFloat(), height * .25f) ||
-                        (dy > ui.dp(20) && projected > ui.dp(190)))) {
+                val projected = moveY + (velocity?.yVelocity ?: 0f).coerceAtLeast(0f) * .18f
+                if (complete && (moveY > minOf(ui.dp(118).toFloat(), height * .25f) ||
+                        (moveY > ui.dp(20) && projected > ui.dp(190)))) {
+                    setSurfaceCornerRadius(ui.dp(36).toFloat())
                     activity.closePlayer(animate = true)
-                } else animate().translationY(0f).setDuration(220).start()
+                } else animate().translationY(0f).setDuration(220).withEndAction {
+                    if (translationY == 0f) setSurfaceCornerRadius(0f)
+                }.start()
             } else {
-                val projected = dx + (velocity?.xVelocity ?: 0f) * .18f
-                if (complete && (kotlin.math.abs(dx) > ui.dp(70) ||
-                        (kotlin.math.abs(dx) > ui.dp(20) && kotlin.math.abs(projected) > ui.dp(220)))) {
-                    if (dx < 0) art.finishDrag(1, activity::next) else art.finishDrag(-1, activity::previous)
+                val projected = moveX + (velocity?.xVelocity ?: 0f) * .18f
+                if (complete && (kotlin.math.abs(moveX) > ui.dp(70) ||
+                        (kotlin.math.abs(moveX) > ui.dp(20) && kotlin.math.abs(projected) > ui.dp(220)))) {
+                    if (moveX < 0) art.finishDrag(1, activity::next) else art.finishDrag(-1, activity::previousTrack)
                 } else art.settle()
             }
         }
@@ -613,8 +786,17 @@ internal class PlayerPanel(private val activity: MainActivity) {
         val player = player ?: return
         dialog?.dismiss()
         val body = ui.column()
-        val list = ListView(activity).apply { divider = null }
+        val list = ListView(activity).apply {
+            divider = null
+            selector = ColorDrawable(Color.TRANSPARENT)
+            overScrollMode = View.OVER_SCROLL_NEVER
+        }
+        var syncQueueActions: () -> Unit = {}
         val adapter = object : BaseAdapter() {
+            override fun notifyDataSetChanged() {
+                super.notifyDataSetChanged()
+                syncQueueActions()
+            }
             override fun getCount() = player.mediaItemCount
             override fun getItem(position: Int) = QueueItems.track(player.getMediaItemAt(position))
             override fun getItemId(position: Int) = position.toLong()
@@ -628,9 +810,14 @@ internal class PlayerPanel(private val activity: MainActivity) {
                     addView(ui.art(track.cover, 100), LinearLayout.LayoutParams(ui.dp(42), ui.dp(42)))
                     addView(ui.column().apply {
                         setPadding(ui.dp(10), 0, 0, 0)
-                        addView(ui.line(track.title, 14, if (current) Palette.accent else Palette.text, true))
+                        addView(TrackTitle(ui, 15, badgeSize = 13, onDark = true).apply {
+                            bind(track)
+                            label.setTextColor(if (current) Palette.accent else Palette.text)
+                        }, ui.full())
                         addView(ui.space(3)); addView(ui.line(track.artistText, 12, Palette.muted))
                     }, ui.weight())
+                    if (current) addView(PlayingBars(activity, Palette.accent).apply { running = player.isPlaying },
+                        LinearLayout.LayoutParams(ui.dp(18), ui.dp(18)).apply { marginStart = ui.dp(6); marginEnd = ui.dp(4) })
                     addView(ui.icon(Symbol.MORE, "Действия с треком") { queueMenu(position) })
                     setOnClickListener { player.seekToDefaultPosition(position); player.play() }
                     setOnLongClickListener { queueMenu(position); true }
@@ -649,7 +836,7 @@ internal class PlayerPanel(private val activity: MainActivity) {
         }
         queueAdapter = adapter
         list.adapter = adapter
-        val height = minOf(410, activity.resources.configuration.screenHeightDp - 150).coerceAtLeast(140)
+        val height = minOf(380, activity.resources.configuration.screenHeightDp - 200).coerceAtLeast(140)
         val sheet = activity.bottomSheet(body, dark = true)
         body.addView(ui.row().apply {
             setPadding(ui.dp(16), 0, ui.dp(6), 0)
@@ -658,6 +845,47 @@ internal class PlayerPanel(private val activity: MainActivity) {
             addView(ui.icon(Symbol.CLOSE, "Закрыть") { sheet.dismiss() })
         }, ui.full(55))
         body.addView(list, ui.full(height))
+        fun queuePill(symbol: Symbol, title: String, click: () -> Unit) = ui.row().apply {
+            gravity = Gravity.CENTER
+            background = ui.touch(Palette.lifted, 23)
+            pressFeedback(.95f)
+            isFocusable = true
+            addView(IconView(activity, symbol, Palette.text).apply { iconSize = 18 },
+                LinearLayout.LayoutParams(ui.dp(19), ui.dp(19)).apply { marginEnd = ui.dp(8) })
+            addView(ui.line(title, 15, Palette.text, bold = true))
+            setOnClickListener { click() }
+        }
+        val saveButton = queuePill(Symbol.PLAYLIST_ADD, "В плейлист") {
+            val tracks = (0 until player.mediaItemCount).mapNotNull { QueueItems.track(player.getMediaItemAt(it)) }
+            val defaultTitle = QueueItems.context(player.currentMediaItem).name.ifBlank { "Очередь" }
+            activity.input("Сохранить очередь", defaultTitle, "Название плейлиста") { title ->
+                activity.action {
+                    val uid = store.requireUser().uid
+                    val playlist = store.online { createPlaylist(uid, title) }
+                    store.changeLocalPlaylist(playlist)
+                    store.online { editPlaylist(playlist, tracks) }
+                    activity.toast("Очередь сохранена")
+                }
+            }
+        }
+        val clearButton = queuePill(Symbol.CLOSE, "Очистить") {
+            val from = player.currentMediaItemIndex + 1
+            if (from < player.mediaItemCount) {
+                player.removeMediaItems(from, player.mediaItemCount)
+                adapter.notifyDataSetChanged()
+            }
+        }
+        syncQueueActions = {
+            val hasUpcoming = player.currentMediaItemIndex + 1 < player.mediaItemCount
+            clearButton.isEnabled = hasUpcoming
+            clearButton.alpha = if (hasUpcoming) 1f else .4f
+        }
+        syncQueueActions()
+        body.addView(ui.row().apply {
+            setPadding(ui.dp(16), ui.dp(8), ui.dp(16), ui.dp(12))
+            addView(saveButton, LinearLayout.LayoutParams(0, ui.dp(46), 1f).apply { marginEnd = ui.dp(10) })
+            addView(clearButton, LinearLayout.LayoutParams(0, ui.dp(46), 1f))
+        }, ui.full())
         sheet.show()
         sheet.window?.setLayout(-1, -2)
         dialog = sheet
@@ -720,6 +948,9 @@ internal class PlayerPanel(private val activity: MainActivity) {
 
     fun dismiss() {
         lyricJob?.cancel()
+        scrollAnimator?.cancel()
+        toneAnimator?.cancel()
+        seekThicknessAnimator?.cancel()
         dialog?.dismiss()
     }
 }

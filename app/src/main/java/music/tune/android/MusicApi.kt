@@ -388,7 +388,8 @@ internal class MusicApi(
                         val url = video.text("embedUrl")?.takeIf { address ->
                             runCatching { URI(address) }.getOrNull()?.let { it.scheme == "https" && it.host != null } == true
                         } ?: return@mapNotNull null
-                        Card(Kind.CLIP, url, title, cover = video.text("cover"), link = url)
+                        Card(Kind.CLIP, url, title, cover = video.text("cover"), link = url,
+                            clipPlayerId = legacyClipPlayerId(url, video.text("providerVideoId")))
                     }
                 }
             }.distinctBy { it.id }
@@ -514,9 +515,11 @@ internal class MusicApi(
             val tag = station.obj("id").text("tag") ?: return@mapNotNull null
             val name = station.text("name") ?: return@mapNotNull null
             val seed = "$type:$tag"
-            type to Card(Kind.WAVE, seed, name, cover = station.obj("icon").text("imageUrl"), seeds = listOf(seed))
+            val icon = station.obj("icon")
+            type to Card(Kind.WAVE, seed, name, cover = icon.text("imageUrl"), seeds = listOf(seed),
+                color = icon.text("backgroundColor"))
         }.groupBy({ it.first }, { it.second })
-        return listOf("genre" to "Жанры", "mood" to "Настроение", "activity" to "Занятие", "epoch" to "Эпоха")
+        return listOf("genre" to "Жанры", "mood" to "Настроение", "activity" to "Занятие", "epoch" to "Эпоха", "local" to "Местное")
             .mapNotNull { (id, title) -> groups[id]?.let { Shelf(title, it) } }
     }
 
@@ -542,27 +545,26 @@ internal class MusicApi(
     fun clips(): List<Card> = get("clips/will/like", "page" to "0", "pageSize" to "50").objectValue()
         .arr("clips").objects().mapNotNull(::clip)
 
-    fun clipStream(card: Card): Pair<String, String> {
-        val model = get("clips", "clipIds" to card.id).objectList().firstOrNull()
-        val player = model?.text("playerId") ?: throw MusicError("Яндекс не прислал клип")
+    fun clipStreams(card: Card): List<ClipSource> {
+        val player = validatedClipPlayerId(card.clipPlayerId)
+            ?: card.id.takeUnless { "://" in it }?.let { clipPlayerId(get("clips", "clipIds" to it)) }
+            ?: throw MusicError("Яндекс не прислал адрес клипа")
         val connection = secureConnection("https://frontend.vh.yandex.ru/player/${segment(player)}.json?service=ya-music&from=ya-music")
-        val video = try {
+        try {
             connection.instanceFollowRedirects = false
             connection.setRequestProperty("Authorization", "OAuth $token")
             connection.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/130.0.0.0 Mobile Safari/537.36")
             connection.setRequestProperty("Referer", "https://music.yandex.ru/")
             connection.setRequestProperty("Origin", "https://music.yandex.ru")
-            if (connection.responseCode !in 200..299) throw MusicError("Клип недоступен")
-            JSONObject(connection.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() })
+            val status = connection.responseCode
+            val input = if (status in 200..299) connection.inputStream else connection.errorStream
+            val video = input?.bufferedReader(Charsets.UTF_8)?.use { reader ->
+                optional { JSONObject(reader.readText()) }
+            } ?: JSONObject()
+            return clipSources(video, status)
         } finally {
             connection.disconnect()
         }
-        val streams = video.obj("content").arr("streams").objects()
-        for ((kind, type) in listOf("HLS" to "application/x-mpegURL", "DASH" to "application/dash+xml")) {
-            val url = streams.firstOrNull { it.text("stream_type") == kind }?.text("url")
-            if (url?.startsWith("https://") == true) return url to type
-        }
-        throw MusicError("Яндекс не прислал видеопоток")
     }
 
     private fun clip(value: JSONObject): Card? {
@@ -571,7 +573,8 @@ internal class MusicApi(
         val id = data.text("clipId") ?: data.text("id") ?: return null
         val title = data.text("title") ?: return null
         val subtitle = data.arr("artists").objects().mapNotNull { it.text("name") }.joinToString(", ")
-        return Card(Kind.CLIP, id, title, subtitle, data.text("thumbnail") ?: data.obj("cover").text("uri"))
+        return Card(Kind.CLIP, id, title, subtitle, data.text("thumbnail") ?: data.obj("cover").text("uri"),
+            clipPlayerId = validatedClipPlayerId(data.text("playerId")))
     }
 
     fun concerts(city: String?): List<Card> {

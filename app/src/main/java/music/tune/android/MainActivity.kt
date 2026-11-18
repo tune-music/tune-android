@@ -7,7 +7,9 @@ import android.content.Context
 import android.content.Intent
 import android.content.res.ColorStateList
 import android.graphics.Color
+import android.graphics.drawable.GradientDrawable
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.text.InputType
 import android.view.Gravity
@@ -17,6 +19,7 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
 import android.view.ViewGroup
+import android.view.WindowManager
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
 import android.webkit.CookieManager
@@ -33,6 +36,8 @@ import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
+import androidx.core.graphics.ColorUtils
+import androidx.core.graphics.Insets
 import androidx.core.widget.doAfterTextChanged
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
@@ -200,6 +205,9 @@ class MainActivity : ComponentActivity(), Player.Listener {
     private var playerPanel: PlayerPanel? = null
     private var closingPlayer: View? = null
     private var videoPanel: ClipPanel? = null
+    private var systemInsets = Insets.NONE
+    private var imeBottom = 0
+    private var loginView: View? = null
 
     private val login = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
         if (result.resultCode == Activity.RESULT_FIRST_USER && store.profile.value == null) {
@@ -309,6 +317,19 @@ class MainActivity : ComponentActivity(), Player.Listener {
         if (lightMode) setTheme(R.style.TuneLightTheme)
         super.onCreate(savedInstanceState)
         WindowCompat.setDecorFitsSystemWindows(window, false)
+        if (Build.VERSION.SDK_INT >= 28) {
+            window.attributes = window.attributes.apply {
+                layoutInDisplayCutoutMode = if (Build.VERSION.SDK_INT >= 30) {
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+                } else {
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                }
+            }
+        }
+        if (Build.VERSION.SDK_INT >= 29) {
+            window.isStatusBarContrastEnforced = false
+            window.isNavigationBarContrastEnforced = false
+        }
         updateSystemBars()
         tab = savedInstanceState?.getString("tab")?.let { optional { Tab.valueOf(it) } } ?: Tab.HOME
         if (savedInstanceState?.getBoolean("reopenSettings") == true) stack.addLast(Route(Screen.SETTINGS))
@@ -321,12 +342,10 @@ class MainActivity : ComponentActivity(), Player.Listener {
         cityName = store.preferences.getString("cityName", "").orEmpty()
         openPlayerOnConnect = savedInstanceState?.getBoolean("player") == true
         root = FrameLayout(this).apply { setBackgroundColor(ui.palette.background) }
-        ViewCompat.setOnApplyWindowInsetsListener(root) { view, insets ->
-            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout() or
-                WindowInsetsCompat.Type.mandatorySystemGestures())
-            val ime = insets.getInsets(WindowInsetsCompat.Type.ime())
-            view.setPadding(bars.left, bars.top, bars.right, maxOf(bars.bottom, ime.bottom))
-            if (::navigation.isInitialized) navigation.visibility = if (ime.bottom > bars.bottom) View.GONE else View.VISIBLE
+        ViewCompat.setOnApplyWindowInsetsListener(root) { _, insets ->
+            systemInsets = insets.getInsets(WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout())
+            imeBottom = insets.getInsets(WindowInsetsCompat.Type.ime()).bottom
+            applySystemInsets()
             insets
         }
         setContentView(root)
@@ -388,7 +407,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
                 launch {
                     while (isActive) {
                         updateProgress()
-                        delay(250)
+                        delay(150)
                     }
                 }
             }
@@ -534,6 +553,20 @@ class MainActivity : ComponentActivity(), Player.Listener {
         }
     }
 
+    private fun applySystemInsets() {
+        val bars = systemInsets
+        val bottom = maxOf(bars.bottom, imeBottom)
+        if (::content.isInitialized && content.isAttachedToWindow) {
+            content.setPadding(bars.left, bars.top, bars.right, bottom)
+        }
+        loginView?.takeIf { it.isAttachedToWindow }?.setPadding(bars.left, bars.top, bars.right, bottom)
+        playerPanel?.applyInsets(bars)
+        videoPanel?.applyInsets(bars)
+        if (::navigation.isInitialized) {
+            navigation.visibility = if (imeBottom > bars.bottom) View.GONE else View.VISIBLE
+        }
+    }
+
     private fun showLogin(connecting: Boolean = false) {
         root.removeAllViews()
         root.setBackgroundColor(Color.BLACK)
@@ -544,7 +577,10 @@ class MainActivity : ComponentActivity(), Player.Listener {
             }
             login.launch(Intent(this, LoginActivity::class.java))
         }
+        loginView = landing
         root.addView(landing, FrameLayout.LayoutParams(-1, -1))
+        applySystemInsets()
+        ViewCompat.requestApplyInsets(root)
         updateSystemBars()
     }
 
@@ -577,6 +613,10 @@ class MainActivity : ComponentActivity(), Player.Listener {
         }
         val type = segments.firstOrNull()
         val id = segments.getOrNull(1)
+        if (type == "video" && uri.getQueryParameter("ids").isNullOrBlank()) {
+            push(Screen.CLIPS)
+            return
+        }
         if (type == "multivibe" && id?.matches(ROOM_ID) == true) {
             action {
                 val room = store.online { waveRoom(id) }
@@ -606,7 +646,8 @@ class MainActivity : ComponentActivity(), Player.Listener {
             "users" -> if (segments.getOrNull(2) == "playlists") segments.getOrNull(3)?.takeIf { it.matches(ID) }
                 ?.let { Card(Kind.PLAYLIST, it, "Плейлист", owner = id) } else null
             "clip" -> id?.takeIf { it.matches(ID) }?.let { Card(Kind.CLIP, it, "Клип") }
-            "video" -> uri.getQueryParameter("ids")?.substringBefore(',')?.takeIf { it.matches(ID) }?.let { Card(Kind.CLIP, it, "Клип") }
+            "video" -> selectedClipId(uri.getQueryParameter("ids"), uri.getQueryParameter("activeIndex"))
+                ?.let { Card(Kind.CLIP, it, "Клип") }
             else -> null
         }
         if (card == null) toast("Ссылка не распознана") else openCard(card)
@@ -667,6 +708,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
         detailToolbar = null
         detailTone = null
         detailChrome = Color.TRANSPARENT
+        loginView = null
         root.removeAllViews()
         root.setBackgroundColor(ui.palette.background)
         content = ui.column()
@@ -716,6 +758,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
         }, ui.full(60).apply { setMargins(ui.dp(10), 0, ui.dp(10), ui.dp(6)) })
         addMini()
         addNavigation()
+        applySystemInsets()
         ViewCompat.requestApplyInsets(root)
         updatePlaying()
         updateSystemBars()
@@ -755,7 +798,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
                 setTextColor(ui.palette.accentText)
                 tooltipText = "Выбрать город"
             })
-            Screen.ALBUMS, Screen.ARTISTS, Screen.PODCASTS, Screen.BOOKS -> addView(ui.icon(Symbol.SETTINGS, "Сортировка") {
+            Screen.ALBUMS, Screen.ARTISTS, Screen.PODCASTS, Screen.BOOKS -> addView(ui.icon(Symbol.SORT, "Сортировка") {
                 val choices = if (current.screen == Screen.ARTISTS) listOf("Недавние", "По названию") else listOf("Недавние", "По названию", "По исполнителю")
                 choose("Сортировка", choices) { order ->
                     store.preferences.edit().putInt("collectionOrder:${current.screen.name}", order).apply()
@@ -836,7 +879,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
                 tint = target
                 surface.setColor(tint)
             }
-        }, ::showPlayer, ::previous, ::next) { (controller?.currentPosition ?: 0L) <= 3_000L }
+        }, ::showPlayer, ::previousTrack, ::next) { true }
         bar.addView(miniPager, LinearLayout.LayoutParams(0, -1, 1f))
         miniLike = ui.icon(Symbol.HEART, "Мне нравится") { currentTrack()?.let { rate(it) } }
         bar.addView(miniLike)
@@ -1004,9 +1047,12 @@ class MainActivity : ComponentActivity(), Player.Listener {
                         store.preferences.edit().remove("recentSearches").apply()
                         loadSearch()
                     })
-                    recent.forEach { item -> add(shortcut(Symbol.CLOCK, item) { submitSearch(item) }) }
+                    recent.forEach { item -> add(shortcut(Symbol.HISTORY, item) { submitSearch(item) }) }
                 }
-                addAll(shelfRows(discovery))
+                discovery.forEach { shelf ->
+                    add(heading(shelf.title))
+                    addAll(waveGridRows(shelf.cards))
+                }
                 val picks = home?.personal.orEmpty().flatMap { it.cards }.filter { it.kind == Kind.PLAYLIST }.distinctBy { it.key }.take(12)
                 if (picks.isNotEmpty()) addAll(shelfRows(listOf(Shelf("Подборки", picks))))
                 else if (recent.isEmpty() && discovery.isEmpty()) add(Row.Layout { emptySearch() })
@@ -1200,6 +1246,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
             addView(ui.row().apply {
                 setPadding(ui.dp(12), ui.dp(12), ui.dp(12), ui.dp(12))
                 background = ui.touch(ui.palette.panel, 20)
+                pressFeedback(.97f)
                 addView(ui.art(card?.cover ?: track?.cover, 180, card?.kind == Kind.ARTIST, 12),
                     LinearLayout.LayoutParams(ui.dp(76), ui.dp(76)))
                 addView(ui.column().apply {
@@ -1237,7 +1284,11 @@ class MainActivity : ComponentActivity(), Player.Listener {
             Screen.CLIPS -> loadRows { store.online { clips() }.map(::entry).ifEmpty { listOf(note("Клипов пока нет")) } }
             Screen.CONCERTS -> loadConcerts()
             Screen.WAVE_ROOMS -> loadRooms()
-            Screen.STATIONS -> loadRows { shelfRows(store.online { stations() }) }
+            Screen.STATIONS -> loadRows {
+                store.online { stations() }.flatMap { shelf ->
+                    listOf(heading(shelf.title)) + waveGridRows(shelf.cards)
+                }
+            }
             Screen.KIDS -> loadKids()
             Screen.STATS -> stats()
             Screen.DEVICES -> devices()
@@ -1290,10 +1341,22 @@ class MainActivity : ComponentActivity(), Player.Listener {
                         if (downloaded == 0) "Скачанной музыки пока нет" else "Скачано: ${trackCount(downloaded)}") { push(Screen.DOWNLOADS) })
                 }
                 if (stations.isNotEmpty()) add(Row.Layout {
-                    horizontal(listOf(ui.chip("Все волны") { push(Screen.STATIONS) }) + stations.map { station ->
-                        val active = QueueItems.context(controller?.currentMediaItem).item == station.id
-                        ui.chip(station.title, active) { if (active) toggle() else openCard(station) }
-                    })
+                    val allWaves = ui.row().apply {
+                        gravity = Gravity.CENTER
+                        setPadding(ui.dp(15), 0, ui.dp(15), 0)
+                        background = GradientDrawable().apply {
+                            setColor(Color.TRANSPARENT)
+                            cornerRadius = ui.dp(20).toFloat()
+                            setStroke(ui.dp(1), ColorUtils.setAlphaComponent(ui.palette.text, 56))
+                        }
+                        pressFeedback(.95f)
+                        isFocusable = true
+                        addView(IconView(this@MainActivity, Symbol.GRID, ui.palette.text).apply { iconSize = 12 },
+                            LinearLayout.LayoutParams(ui.dp(13), ui.dp(13)).apply { marginEnd = ui.dp(7) })
+                        addView(ui.line("Все волны", 15, ui.palette.text, bold = true))
+                        setOnClickListener { push(Screen.STATIONS) }
+                    }.apply { layoutParams = LinearLayout.LayoutParams(-2, ui.dp(40)) }
+                    horizontal(listOf(allWaves) + stations.map(::stationChip))
                 })
                 addAll(quickRows())
                 if (page.recent.isNotEmpty()) {
@@ -1381,7 +1444,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
             importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
         }
         private val rail = ui.column()
-        private var heroState: Pair<PlayContext, Boolean>? = null
+        private var heroState: Triple<PlayContext, Boolean, Boolean>? = null
         private var wheelState: Pair<List<WheelItem>, String?>? = null
 
         init {
@@ -1396,7 +1459,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
             val context = QueueItems.context(player?.currentMediaItem)
             val active = context.kind == "radio" && (context.item == MY_WAVE || context.item == null && context.name == "Моя волна")
             val playing = active && player?.isPlaying == true
-            val state = context to playing
+            val state = Triple(context, active, player?.isPlaying == true)
             if (state == heroState) return
             heroState = state
             glow.playing = playing
@@ -1425,11 +1488,11 @@ class MainActivity : ComponentActivity(), Player.Listener {
                     gravity = Gravity.CENTER_HORIZONTAL
                     layoutParams = LinearLayout.LayoutParams(ui.dp(92), -2)
                     val circle = FrameLayout(this@MainActivity).apply {
-                        val color = optional { Color.parseColor(item.color ?: "") } ?: ui.palette.lifted
+                        val color = parseHexColor(item.color ?: item.card?.color) ?: ui.palette.lifted
                         background = ui.shape(color, 50).apply { if (active) setStroke(ui.dp(3), ui.palette.accent) }
                         val card = item.card
                         val size = if (active) 76 else 84
-                        if (card?.cover != null) addView(ui.art(card.cover, 200, circle = true),
+                        if (card?.cover != null) addView(ui.art(card.cover, 200, circle = true, backdrop = false),
                             FrameLayout.LayoutParams(ui.dp(size), ui.dp(size), Gravity.CENTER))
                         else addView(IconView(this@MainActivity, if (card == null) Symbol.SETTINGS else Symbol.WAVE, ui.palette.text),
                             FrameLayout.LayoutParams(ui.dp(42), ui.dp(42), Gravity.CENTER))
@@ -1449,6 +1512,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
                         maxLines = 2
                         gravity = Gravity.CENTER
                     }, ui.full())
+                    pressFeedback(.92f)
                     setOnClickListener {
                         store.waveExtras.wheelEvent(item, "CLICK")
                         if (active) toggle() else item.card?.let(::openCard) ?: waveSettings()
@@ -1486,7 +1550,13 @@ class MainActivity : ComponentActivity(), Player.Listener {
                 "playlist" -> "Плейлист «${ctx.name}»"
                 else -> ctx.name
             }
-            addView(ui.line("Сейчас играет: $now", 14, ui.palette.text, bold = true).apply { gravity = Gravity.CENTER })
+            addView(ui.row().apply {
+                gravity = Gravity.CENTER
+                addView(PlayingBars(this@MainActivity, ui.palette.accentText).apply {
+                    running = controller?.isPlaying == true
+                }, LinearLayout.LayoutParams(ui.dp(13), ui.dp(13)).apply { marginEnd = ui.dp(7) })
+                addView(ui.line("Сейчас играет: $now", 14, ui.palette.text, bold = true))
+            })
             addView(ui.space(18))
         }
         addView(ui.line("Моя волна", 36, bold = true).apply { gravity = Gravity.CENTER })
@@ -1508,6 +1578,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
         val padding = ui.dp(if (resources.configuration.screenWidthDp < 350) 12 else if (primary) 26 else 20)
         setPadding(padding, 0, padding, 0)
         background = ui.touch(if (primary) ui.palette.accent else ui.palette.panel, 24)
+        pressFeedback(.95f)
         val glyph = if (playing) PlayingBars(this@MainActivity, color).apply { running = true }
             else IconView(this@MainActivity, symbol, color).apply { iconSize = 18 }
         addView(glyph, LinearLayout.LayoutParams(ui.dp(18), ui.dp(18)))
@@ -1530,7 +1601,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
         val tiles = listOf<() -> View>(
             { quickTile("Мне нравится", Symbol.HEART_FILLED) { push(Screen.LIKES) } },
             { quickTile("Скачанное", Symbol.DOWNLOAD) { push(Screen.DOWNLOADS) } },
-            { quickTile("История", Symbol.CLOCK) { push(Screen.HISTORY) } },
+            { quickTile("История", Symbol.HISTORY) { push(Screen.HISTORY) } },
         ) + store.ownPlaylists.value.take(3).map { card ->
             { quickTile(card.title, cover = card.cover) { openCard(card) } }
         }
@@ -1590,23 +1661,28 @@ class MainActivity : ComponentActivity(), Player.Listener {
                     isFocusable = true
                 }
             })
-            add(libraryEntry(Symbol.DOWNLOAD, "Скачанные треки", downloaded.takeIf { it > 0 }?.toString()) { push(Screen.DOWNLOADS) })
+            add(libraryEntry(Symbol.DOWNLOAD_CIRCLE, "Скачанные треки", downloaded.takeIf { it > 0 }?.toString()) { push(Screen.DOWNLOADS) })
             add(libraryEntry(Symbol.LIBRARY, "Альбомы", savedCount(Kind.ALBUM)) { push(Screen.ALBUMS) })
-            add(libraryEntry(Symbol.NOTE, "Исполнители", savedCount(Kind.ARTIST)) { push(Screen.ARTISTS) })
-            add(libraryEntry(Symbol.NOTE, "Подкасты") { push(Screen.PODCASTS) })
-            add(libraryEntry(Symbol.LIBRARY, "Аудиокниги") { push(Screen.BOOKS) })
-            add(libraryEntry(Symbol.NOTE, "Детям") { push(Screen.KIDS) })
+            add(libraryEntry(Symbol.MIC_MUSIC, "Исполнители", savedCount(Kind.ARTIST)) { push(Screen.ARTISTS) })
+            add(libraryEntry(Symbol.MIC, "Подкасты") { push(Screen.PODCASTS) })
+            add(libraryEntry(Symbol.BOOK, "Аудиокниги") { push(Screen.BOOKS) })
+            add(libraryEntry(Symbol.BALLOON, "Детям") { push(Screen.KIDS) })
             add(libraryEntry(Symbol.CONCERT, "Концерты") { push(Screen.CONCERTS) })
-            add(libraryEntry(Symbol.CLOCK, "История") { push(Screen.HISTORY) })
+            add(libraryEntry(Symbol.HISTORY, "История") { push(Screen.HISTORY) })
             add(libraryEntry(Symbol.STATS, "Статистика") { push(Screen.STATS) })
             if (store.dislikes.value.isNotEmpty()) add(libraryEntry(Symbol.THUMB_DOWN, "Не нравится", store.dislikes.value.size.toString()) { push(Screen.DISLIKES) })
-            add(libraryEntry(Symbol.BAN, "Скрытые исполнители") { push(Screen.HIDDEN_ARTISTS) })
+            add(libraryEntry(Symbol.PERSON_MINUS, "Скрытые исполнители") { push(Screen.HIDDEN_ARTISTS) })
             add(Row.Layout {
                 ui.row().apply {
                     setPadding(ui.dp(16), ui.dp(26), ui.dp(16), ui.dp(10))
                     addView(ui.text("Плейлисты", 22, bold = true), ui.weight())
-                    addView(ui.text(if (byName) "По названию" else "Недавние", 14, ui.palette.muted, bold = true).apply {
+                    addView(ui.row().apply {
+                        gravity = Gravity.CENTER_VERTICAL
                         setPadding(ui.dp(8), ui.dp(10), ui.dp(8), ui.dp(10))
+                        background = ui.touch()
+                        addView(IconView(this@MainActivity, Symbol.SORT, ui.palette.muted).apply { iconSize = 13 },
+                            LinearLayout.LayoutParams(ui.dp(14), ui.dp(14)).apply { marginEnd = ui.dp(4) })
+                        addView(ui.text(if (byName) "По названию" else "Недавние", 14, ui.palette.muted, bold = true))
                         setOnClickListener { store.preferences.edit().putBoolean("playlistsByName", !byName).apply(); library() }
                         isFocusable = true
                     })
@@ -1625,14 +1701,16 @@ class MainActivity : ComponentActivity(), Player.Listener {
 
     private fun libraryEntry(symbol: Symbol, label: String, value: String? = null, click: () -> Unit) = Row.Layout {
         ui.row().apply {
-            minimumHeight = ui.dp(54)
-            setPadding(ui.dp(16), 0, ui.dp(16), 0)
-            addView(IconView(this@MainActivity, symbol, ui.palette.text).apply { iconSize = 21 },
-                LinearLayout.LayoutParams(ui.dp(32), ui.dp(44)))
-            addView(ui.line(label, 17).apply { setPadding(ui.dp(9), 0, 0, 0) }, ui.weight())
-            value?.let { addView(ui.line(it, 14, ui.palette.muted).apply { setPadding(0, 0, ui.dp(8), 0) }) }
-            addView(IconView(this@MainActivity, Symbol.BACK, ui.palette.muted).apply { rotation = 180f; iconSize = 15 },
-                LinearLayout.LayoutParams(ui.dp(20), ui.dp(36)))
+            minimumHeight = ui.dp(58)
+            setPadding(ui.dp(16), ui.dp(7), ui.dp(16), ui.dp(7))
+            addView(IconView(this@MainActivity, symbol, ui.palette.text).apply {
+                iconSize = 20
+                background = ui.shape(ui.palette.lifted, 13)
+            }, LinearLayout.LayoutParams(ui.dp(44), ui.dp(44)))
+            addView(ui.line(label, 17).apply { setPadding(ui.dp(14), 0, 0, 0) }, ui.weight())
+            value?.let { addView(ui.line(it, 15, ui.palette.muted).apply { setPadding(0, 0, ui.dp(8), 0) }) }
+            addView(IconView(this@MainActivity, Symbol.BACK, ui.palette.muted).apply { rotation = 180f; iconSize = 14 },
+                LinearLayout.LayoutParams(ui.dp(18), ui.dp(36)))
             background = ui.touch()
             setOnClickListener { click() }
             isFocusable = true
@@ -1724,7 +1802,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
         val uid = store.requireUser().uid
         val cards = store.online { dislikedArtists(uid) }
         cards.map { card ->
-            shortcut(Symbol.BAN, card.title, "Вернуть в рекомендации") {
+            shortcut(Symbol.PERSON_MINUS, card.title, "Вернуть в рекомендации") {
                 action { store.online { setArtistHidden(uid, card.id, false) }; if (route.screen == Screen.HIDDEN_ARTISTS) hiddenArtists() }
             }
         }.ifEmpty { listOf(note("Вы ещё не скрывали исполнителей")) }
@@ -2155,15 +2233,15 @@ class MainActivity : ComponentActivity(), Player.Listener {
             updateSelectionBar()
         }
         val removingDownloads = route.screen == Screen.DOWNLOADS
-        button(if (removingDownloads) Symbol.CLOSE else Symbol.DOWNLOAD, if (removingDownloads) "Удалить" else "Скачать", selected.isNotEmpty()) {
+        button(if (removingDownloads) Symbol.TRASH else Symbol.DOWNLOAD, if (removingDownloads) "Удалить" else "Скачать", selected.isNotEmpty()) {
             if (removingDownloads) confirm("Удалить выбранные загрузки?", "Удалить") {
                 action { selected.forEach { store.files.remove(it) }; endSelection() }
             } else action { store.files.enqueue(selected); endSelection() }
         }
-        button(Symbol.ADD, "В плейлист", selected.isNotEmpty()) { pickPlaylist(selected, ::endSelection) }
-        button(Symbol.QUEUE, "Далее", selected.isNotEmpty()) { enqueue(selected, next = true); endSelection() }
+        button(Symbol.PLAYLIST_ADD, "В плейлист", selected.isNotEmpty()) { pickPlaylist(selected, ::endSelection) }
+        button(Symbol.QUEUE_NEXT, "Далее", selected.isNotEmpty()) { enqueue(selected, next = true); endSelection() }
         val own = details?.card?.takeIf { it.kind == Kind.PLAYLIST && it.owner == userId }
-        if (own != null) button(Symbol.BAN, "Убрать", selected.isNotEmpty()) {
+        if (own != null) button(Symbol.MINUS_CIRCLE, "Убрать", selected.isNotEmpty()) {
             action {
                 store.online { editPlaylist(own, selected, remove = true) }
                 endSelection()
@@ -2383,24 +2461,145 @@ class MainActivity : ComponentActivity(), Player.Listener {
         }
     }
 
+    private fun waveDot(card: Card, size: Int = 24): FrameLayout {
+        val color = parseHexColor(card.color) ?: ui.palette.lifted
+        return FrameLayout(this).apply {
+            background = ui.shape(color, size)
+            clipToOutline = true
+            if (card.cover != null) {
+                addView(ui.art(card.cover, 100, circle = true, backdrop = false), FrameLayout.LayoutParams(-1, -1))
+            } else {
+                val glyph = (size * .6f).toInt()
+                addView(IconView(this@MainActivity, Symbol.WAVE, Color.WHITE).apply {
+                    iconSize = (size * .48f).toInt()
+                }, FrameLayout.LayoutParams(ui.dp(glyph), ui.dp(glyph), Gravity.CENTER))
+            }
+        }
+    }
+
+    private fun stationChip(station: Card): View {
+        val bars = PlayingBars(this, Color.BLACK)
+        val dot = waveDot(station, 24)
+        val label = ui.line(station.title, 15, ui.palette.text, bold = true)
+        val chip = ui.row().apply {
+            gravity = Gravity.CENTER
+            layoutParams = LinearLayout.LayoutParams(-2, ui.dp(40))
+            setPadding(ui.dp(10), 0, ui.dp(15), 0)
+            pressFeedback(.95f)
+            isFocusable = true
+            addView(FrameLayout(this@MainActivity).apply {
+                addView(dot, FrameLayout.LayoutParams(ui.dp(24), ui.dp(24), Gravity.CENTER))
+                addView(bars, FrameLayout.LayoutParams(ui.dp(13), ui.dp(13), Gravity.CENTER))
+            }, LinearLayout.LayoutParams(ui.dp(24), ui.dp(24)).apply { marginEnd = ui.dp(7) })
+            addView(label)
+            setOnClickListener {
+                val now = QueueItems.context(controller?.currentMediaItem)
+                if (now.kind == "radio" && now.item == station.id) toggle() else openCard(station)
+            }
+        }
+        chip.observePlayback {
+            val now = QueueItems.context(controller?.currentMediaItem)
+            val active = currentTrack() != null && now.kind == "radio" && now.item == station.id
+            chip.background = ui.touch(if (active) ui.palette.accent else ui.palette.lifted, 20)
+            label.setTextColor(if (active) Color.BLACK else ui.palette.text)
+            dot.visibility = if (active) View.INVISIBLE else View.VISIBLE
+            bars.visibility = if (active) View.VISIBLE else View.INVISIBLE
+            bars.running = active && controller?.isPlaying == true
+        }
+        return chip
+    }
+
+    private fun waveGridRows(cards: List<Card>) = cards.chunked(2).map { pair ->
+        Row.Layout {
+            ui.row().apply {
+                setPadding(ui.dp(16), ui.dp(5), ui.dp(16), ui.dp(5))
+                pair.forEachIndexed { index, card ->
+                    val bars = PlayingBars(this@MainActivity, Color.BLACK)
+                    val dot = if (card.cover != null || card.color != null) waveDot(card, 26) else null
+                    val label = ui.line(card.title, 15, ui.palette.text, bold = true)
+                    val lead = FrameLayout(this@MainActivity).apply {
+                        dot?.let { addView(it, FrameLayout.LayoutParams(ui.dp(26), ui.dp(26), Gravity.CENTER)) }
+                        addView(bars, FrameLayout.LayoutParams(ui.dp(14), ui.dp(14), Gravity.CENTER))
+                    }
+                    val tile = ui.row().apply {
+                        gravity = Gravity.CENTER_VERTICAL
+                        setPadding(ui.dp(14), 0, ui.dp(14), 0)
+                        pressFeedback(.95f)
+                        isFocusable = true
+                        addView(lead, LinearLayout.LayoutParams(ui.dp(if (dot != null) 26 else 18), ui.dp(26)).apply {
+                            marginEnd = ui.dp(8)
+                        })
+                        addView(label, ui.weight())
+                        setOnClickListener {
+                            val now = QueueItems.context(controller?.currentMediaItem)
+                            if (now.kind == "radio" && now.item == card.id) toggle() else openCard(card)
+                        }
+                    }
+                    tile.observePlayback {
+                        val now = QueueItems.context(controller?.currentMediaItem)
+                        val active = currentTrack() != null && now.kind == "radio" && now.item == card.id
+                        tile.background = ui.touch(if (active) ui.palette.accent else ui.palette.panel, 14)
+                        label.setTextColor(if (active) Color.BLACK else ui.palette.text)
+                        dot?.visibility = if (active) View.INVISIBLE else View.VISIBLE
+                        bars.visibility = if (active) View.VISIBLE else View.INVISIBLE
+                        bars.running = active && controller?.isPlaying == true
+                        lead.visibility = if (active || dot != null) View.VISIBLE else View.GONE
+                    }
+                    addView(tile, LinearLayout.LayoutParams(0, ui.dp(48), 1f).apply { if (index > 0) marginStart = ui.dp(10) })
+                }
+                if (pair.size == 1) addView(View(this@MainActivity), LinearLayout.LayoutParams(0, ui.dp(48), 1f).apply { marginStart = ui.dp(10) })
+            }
+        }
+    }
+
     private fun shelfRow(cards: List<Card>) = Row.Layout {
         val shelf = cards.take(20)
-        val covers = shelf.map { card -> ui.art(null, 300, card.kind == Kind.ARTIST) }
+        val covers = shelf.map { card -> ui.art(null, 300, card.kind == Kind.ARTIST, corner = 14) }
         val tiles = shelf.mapIndexed { index, card ->
-            ui.column().apply {
+            val title = ui.line(card.title, 15, bold = true)
+            val bars = PlayingBars(this@MainActivity, Color.BLACK)
+            val badge = FrameLayout(this@MainActivity).apply {
+                background = ui.shape(ui.palette.accent, 17)
+                elevation = ui.dp(4).toFloat()
+                visibility = View.GONE
+                addView(bars, FrameLayout.LayoutParams(ui.dp(16), ui.dp(16), Gravity.CENTER))
+            }
+            val tile = ui.column().apply {
                 background = ui.touch()
-                addView(covers[index], LinearLayout.LayoutParams(ui.dp(132), ui.dp(132)))
+                if (card.kind == Kind.ARTIST) gravity = Gravity.CENTER_HORIZONTAL
+                addView(FrameLayout(this@MainActivity).apply {
+                    addView(covers[index], FrameLayout.LayoutParams(-1, -1))
+                    addView(badge, FrameLayout.LayoutParams(ui.dp(34), ui.dp(34),
+                        if (card.kind == Kind.ARTIST) Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+                        else Gravity.BOTTOM or Gravity.END).apply {
+                        val margin = ui.dp(8)
+                        setMargins(margin, margin, margin, margin)
+                    })
+                }, LinearLayout.LayoutParams(ui.dp(148), ui.dp(148)))
                 addView(ui.space(8))
-                addView(ui.line(card.title, 14, bold = true))
-                if (card.subtitle.isNotBlank()) {
+                addView(title.apply {
+                    if (card.kind == Kind.ARTIST) gravity = Gravity.CENTER_HORIZONTAL
+                }, ui.full())
+                if (card.subtitle.isNotBlank() && (card.kind != Kind.ARTIST || card.subtitle != "Исполнитель")) {
                     addView(ui.space(4))
-                    addView(ui.line(card.subtitle, 12, ui.palette.muted))
+                    addView(ui.line(card.subtitle, 13, ui.palette.muted))
                 }
-                layoutParams = LinearLayout.LayoutParams(ui.dp(132), -2)
+                layoutParams = LinearLayout.LayoutParams(ui.dp(148), -2)
                 setOnClickListener { openCard(card) }
                 setOnLongClickListener { cardMenu(card, it); true }
                 isFocusable = true
             }
+            tile.observePlayback {
+                val now = QueueItems.context(controller?.currentMediaItem)
+                val itemKind = if (card.kind == Kind.WAVE) "radio" else card.kind.name.lowercase(Locale.ROOT)
+                val itemId = if (card.kind == Kind.PLAYLIST && !card.owner.isNullOrBlank()) "${card.owner}:${card.id}" else card.id
+                val active = currentTrack() != null && now.kind == itemKind &&
+                    (now.item == itemId || (card.kind == Kind.PLAYLIST && now.item == card.id))
+                badge.visibility = if (active) View.VISIBLE else View.GONE
+                bars.running = active && controller?.isPlaying == true
+                title.setTextColor(if (active) ui.palette.accentText else ui.palette.text)
+            }
+            tile
         }
         horizontal(tiles).apply {
             val requested = BooleanArray(shelf.size)
@@ -2748,14 +2947,14 @@ class MainActivity : ComponentActivity(), Player.Listener {
         fun item(title: String, icon: Symbol, destructive: Boolean = false, run: () -> Unit) {
             options += MenuAction(title, icon, destructive, run)
         }
-        if (card.kind != Kind.ARTIST) item("Сортировка и фильтры", Symbol.FILTER) { trackListMenu(page, anchor) }
+        if (card.kind != Kind.ARTIST) item("Сортировка и фильтры", Symbol.SORT) { trackListMenu(page, anchor) }
         if (card.kind in setOf(Kind.ARTIST, Kind.ALBUM)) item("Подменить ${if (card.kind == Kind.ARTIST) "исполнителя" else "альбом"}", Symbol.EDIT) {
             openReplacement(ReplacementTarget(card.kind.name.lowercase(Locale.ROOT), card.id, card.title))
         }
         card.url?.let { url -> item("Поделиться", Symbol.SHARE) { share(url) } }
         if (card.kind == Kind.ALBUM || card.kind == Kind.PLAYLIST && card.owner != userId) {
             val liked = card.key in store.savedCards.value
-            item(if (liked) "Убрать из коллекции" else "Добавить в коллекцию", if (liked) Symbol.HEART_FILLED else Symbol.HEART) {
+            item(if (liked) "Убрать из коллекции" else "Добавить в коллекцию", if (liked) Symbol.HEART_SLASH else Symbol.HEART) {
                 action { store.save(card) }
             }
         }
@@ -2839,7 +3038,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
             card.url?.let { url -> add(MenuAction("Поделиться", Symbol.SHARE) { share(url) }) }
             if (card.kind in setOf(Kind.ALBUM, Kind.ARTIST, Kind.PLAYLIST) && card.owner != userId) {
                 val saved = card.key in store.savedCards.value
-                add(MenuAction(if (saved) "Убрать из коллекции" else "В коллекцию", if (saved) Symbol.HEART_FILLED else Symbol.HEART) {
+                add(MenuAction(if (saved) "Убрать из коллекции" else "В коллекцию", if (saved) Symbol.HEART_SLASH else Symbol.HEART) {
                     action { store.save(card) }
                 })
             }
@@ -2855,13 +3054,13 @@ class MainActivity : ComponentActivity(), Player.Listener {
         val liked = track.id in store.likes.value
         val disliked = track.id in store.dislikes.value
         if (anchor == null) item("Устройства Яндекс Музыки", Symbol.SPEAKER, run = ::openDevices)
-        item(if (liked) "Убрать из «Мне нравится»" else "Нравится", if (liked) Symbol.HEART_FILLED else Symbol.HEART) { rate(track) }
+        item(if (liked) "Убрать из «Мне нравится»" else "Нравится", if (liked) Symbol.HEART_SLASH else Symbol.HEART) { rate(track) }
         item(if (disliked) "Снять дизлайк" else "Не нравится", Symbol.THUMB_DOWN) { rate(track, true) }
         if (currentTrack()?.id == track.id && (userId?.let { store.allowsAlternate(it, track.id) && store.versions.hasAudio(track.id) } == true ||
                 store.files.hasReplacement(track))) {
             item("Версия трека", Symbol.WAVE) { chooseVersion(track) }
         }
-        item("Добавить в плейлист", Symbol.ADD) { pickPlaylist(listOf(track)) }
+        item("Добавить в плейлист", Symbol.PLAYLIST_ADD) { pickPlaylist(listOf(track)) }
         if (track.uploaded) item("Редактировать трек", Symbol.EDIT) { editUploadedTrack(track) }
         item("Подменить трек", Symbol.EDIT) { openReplacement(ReplacementTarget("track", track.id, track.title, track)) }
         val downloadStatus = store.files.status.value[track.id]
@@ -2872,15 +3071,15 @@ class MainActivity : ComponentActivity(), Player.Listener {
             }
         }
         if (anchor != null && (controller?.mediaItemCount ?: 0) > 0) {
-            item("Играть следующим", Symbol.QUEUE) { enqueue(track, next = true) }
-            item("В конец очереди", Symbol.QUEUE) { enqueue(track, next = false) }
+            item("Играть следующим", Symbol.QUEUE_NEXT) { enqueue(track, next = true) }
+            item("В конец очереди", Symbol.QUEUE_LAST) { enqueue(track, next = false) }
         }
         if (track.album != null) item("Перейти к альбому", Symbol.LIBRARY) { openTrackAlbum(track) }
         track.artists.filter { it.id.isNotBlank() }.take(3).forEach { artist ->
-            item(artist.title, Symbol.NOTE) { openCard(artist) }
+            item(artist.title, Symbol.MIC_MUSIC) { openCard(artist) }
         }
         if (QueueItems.context(controller?.currentMediaItem).kind == "radio") track.artists.firstOrNull { it.id.isNotBlank() }?.let { artist ->
-            item("Не рекомендовать исполнителя", Symbol.BAN) {
+            item("Не рекомендовать исполнителя", Symbol.PERSON_MINUS) {
                 action {
                     val uid = store.requireUser().uid
                     store.online { setArtistHidden(uid, artist.id, true) }
@@ -2901,7 +3100,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
         if (store.files.hasReplacement(track)) item("Удалить подмену", Symbol.TRASH, true) {
             action { store.files.removeReplacement(track); toast("Подмена удалена") }
         }
-        if (playlist != null) item("Убрать из плейлиста", Symbol.TRASH, true) {
+        if (playlist != null) item("Убрать из плейлиста", Symbol.MINUS_CIRCLE, true) {
             action { store.online { editPlaylist(playlist, listOf(track), remove = true) }; loadDetails(playlist) }
         }
         if (anchor == null) trackActionsSheet(track, options) else actionMenu(anchor, options)
@@ -3220,9 +3419,11 @@ class MainActivity : ComponentActivity(), Player.Listener {
     private fun changes() {
         rows(listOf(
             heading("Tune ${BuildConfig.VERSION_NAME}"),
+            note("Полноэкранный плеер и клипы растянуты на весь экран без чёрных полос. Обновлены значки разделов, плавный скролл текста песни, перелистывание обложек свайпом и кроссфейд между треками."),
+            note("Исправлены цвета волн на главной, разделены подкасты и выпуски в поиске, сохраняются фильтры в списках и продолжается очередь загрузок после потери сети."),
+            heading("В прошлых версиях"),
             note("Tune работает в портретной ориентации. Верхняя панель плеера остаётся видимой при прокрутке, и свайп вниз с неё сворачивает плеер."),
             note("Лайки восстановленных треков сохраняются на устройстве и синхронизируются с Яндекс Музыкой, когда сервер их принимает."),
-            heading("В прошлых версиях"),
             note("Поле поиска перемещено в верхнюю часть экрана. Скачанные обложки и тексты доступны в офлайн-режиме."),
             note("Исправлены загрузка обложек, выравнивание в плеере и на главной и свечение «Моей волны»."),
             note("Настройки, коллекция и главная приведены к порядку Tune для iOS."),
@@ -3362,13 +3563,13 @@ class MainActivity : ComponentActivity(), Player.Listener {
         val value = store.overrides.read(uid, target.kind, target.id)
         rows(buildList {
             add(heading(value.title.ifBlank { target.title }))
-            add(shortcut(Symbol.NOTE, "Название", value.title.takeIf(String::isNotBlank)) {
+            add(shortcut(Symbol.EDIT, "Название", value.title.takeIf(String::isNotBlank)) {
                 input("Название", value.title, target.title) { saveReplacement(target, value.copy(title = it)) }
             })
-            if (target.kind == "track") add(shortcut(Symbol.ACCOUNT, "Исполнитель", value.artist.takeIf(String::isNotBlank)) {
+            if (target.kind == "track") add(shortcut(Symbol.MIC_MUSIC, "Исполнитель", value.artist.takeIf(String::isNotBlank)) {
                 input("Исполнитель", value.artist, target.track?.artistText.orEmpty()) { saveReplacement(target, value.copy(artist = it)) }
             })
-            add(shortcut(Symbol.NOTE, "Выбрать обложку") { coverPickerTarget = target; localCoverDocument.launch("image/*") })
+            add(shortcut(Symbol.PHOTO, "Выбрать обложку") { coverPickerTarget = target; localCoverDocument.launch("image/*") })
             add(shortcut(Symbol.LINK, "Ссылка на обложку") {
                 input("Ссылка на обложку", value.cover.takeIf { it.startsWith("https://") }.orEmpty(), "https://") { link ->
                     val uri = Uri.parse(link)
@@ -3377,7 +3578,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
                 }
             })
             target.track?.let { track ->
-                add(shortcut(Symbol.NOTE, "Выбрать аудиофайл", if (store.files.hasReplacement(track)) "Файл выбран" else null) {
+                add(shortcut(Symbol.WAVE, "Выбрать аудиофайл", if (store.files.hasReplacement(track)) "Файл выбран" else null) {
                     documentTrack = track
                     importAudio.launch(arrayOf("audio/*"))
                 })
@@ -3686,6 +3887,14 @@ class MainActivity : ComponentActivity(), Player.Listener {
             it.seekToPrevious()
         }
     }
+
+    internal fun previousTrack() {
+        controller?.let { player ->
+            root.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
+            if (player.hasPreviousMediaItem()) player.seekToPreviousMediaItem()
+            else player.seekToPrevious()
+        }
+    }
     internal fun next() {
         controller?.let { player ->
             root.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
@@ -3705,6 +3914,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
         playerPanel = PlayerPanel(this).also {
             content.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
             root.addView(it.view, FrameLayout.LayoutParams(-1, -1))
+            it.applyInsets(systemInsets)
             it.view.translationY = root.height.toFloat()
             it.view.animate().translationY(0f).setDuration(250).start()
             it.update()
@@ -3735,6 +3945,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
         videoPanel = ClipPanel(this, card).also {
             content.visibility = View.INVISIBLE
             root.addView(it.view, FrameLayout.LayoutParams(-1, -1))
+            it.applyInsets(systemInsets)
             it.load()
         }
         updateSystemBars()
