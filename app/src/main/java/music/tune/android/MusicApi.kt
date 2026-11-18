@@ -584,18 +584,18 @@ internal class MusicApi(
         val item = value.optJSONObject("concert") ?: value
         val id = item.text("concertId") ?: item.text("id") ?: return null
         val title = item.text("concertTitle") ?: return null
-        val subtitle = listOfNotNull(item.text("city"), item.text("place"), item.text("datetime")).joinToString(" · ")
-        val tickets = item.text("dataSessionId")?.let {
+        val subtitle = listOfNotNull(item.text("city"), item.text("place")).joinToString(" · ")
+        val tickets = item.text("dataSessionId")?.takeIf { it.matches(CONCERT_SESSION) }?.let {
             "https://widget.afisha.yandex.ru/w/sessions/${segment(it)}?clientKey=0d8ab1a6-1667-42cb-a98f-2fe7eff4b137"
         }
-        return Card(Kind.CONCERT, id, title, subtitle, item.obj("cover").text("uri"), link = tickets ?: "https://music.yandex.ru/concerts")
+        return Card(Kind.CONCERT, id, title, subtitle, item.obj("cover").text("uri"), link = tickets, eventDate = item.text("datetime"))
     }
 
     fun cities() = get("concerts/locations").objectValue().arr("locations").objects().mapNotNull { city ->
         val id = city.text("id") ?: return@mapNotNull null
         val name = city.text("name") ?: return@mapNotNull null
         id to name
-    }
+    }.distinctBy { it.first }
 
     private fun sequence(value: JSONObject) = value.arr("sequence").objects().mapNotNull {
         track(it.obj("track"), value.text("batchId"))
@@ -741,6 +741,7 @@ internal class MusicApi(
     }
 
     companion object {
+        private val CONCERT_SESSION = Regex("[a-zA-Z0-9_-]+")
         private const val BASE = "https://api.music.yandex.net"
         private const val CLIENT = "YandexMusicDesktopAppWindows/5.120.0"
         const val FROM = "tune-android"

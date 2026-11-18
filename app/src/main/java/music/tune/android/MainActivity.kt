@@ -747,7 +747,14 @@ class MainActivity : ComponentActivity(), Player.Listener {
         when (current.screen) {
             Screen.HOME -> addView(ui.icon(Symbol.ACCOUNT, "Настройки и аккаунт") { push(Screen.SETTINGS) })
             Screen.LIBRARY -> addView(ui.icon(Symbol.GEAR, "Настройки") { push(Screen.SETTINGS) })
-            Screen.CONCERTS -> addView(ui.icon(Symbol.SETTINGS, "Выбрать город") { chooseCity() })
+            Screen.CONCERTS -> addView(ui.button(concertCityLabel(), click = ::chooseCity).apply {
+                id = CONCERT_CITY_BUTTON
+                maxWidth = ui.dp(148)
+                maxLines = 1
+                ellipsize = android.text.TextUtils.TruncateAt.END
+                setTextColor(ui.palette.accentText)
+                tooltipText = "Выбрать город"
+            })
             Screen.ALBUMS, Screen.ARTISTS, Screen.PODCASTS, Screen.BOOKS -> addView(ui.icon(Symbol.SETTINGS, "Сортировка") {
                 val choices = if (current.screen == Screen.ARTISTS) listOf("Недавние", "По названию") else listOf("Недавние", "По названию", "По исполнителю")
                 choose("Сортировка", choices) { order ->
@@ -1228,13 +1235,10 @@ class MainActivity : ComponentActivity(), Player.Listener {
             Screen.ARTIST_COLLECTION, Screen.ARTIST_WAVE -> current.card?.let { artist -> artistFamiliar(artist, current.screen == Screen.ARTIST_WAVE) }
             Screen.SHELF -> rows(gridRows(current.shelf?.cards.orEmpty()))
             Screen.CLIPS -> loadRows { store.online { clips() }.map(::entry).ifEmpty { listOf(note("Клипов пока нет")) } }
-            Screen.CONCERTS -> loadRows {
-                listOf(shortcut(Symbol.CONCERT, cityName.ifBlank { "Выбрать город" }, action = ::chooseCity)) +
-                    store.online { concerts(city) }.map(::entry).ifEmpty { listOf(note("Ближайшие концерты не найдены")) }
-            }
+            Screen.CONCERTS -> loadConcerts()
             Screen.WAVE_ROOMS -> loadRooms()
             Screen.STATIONS -> loadRows { shelfRows(store.online { stations() }) }
-            Screen.KIDS -> loadRows { shelfRows(store.kids()) }
+            Screen.KIDS -> loadKids()
             Screen.STATS -> stats()
             Screen.DEVICES -> devices()
             Screen.HIDDEN_ARTISTS -> hiddenArtists()
@@ -1785,8 +1789,13 @@ class MainActivity : ComponentActivity(), Player.Listener {
                 add(libraryEntry(Symbol.WAVE, "Слушали в Волне") { push(Screen.ARTIST_WAVE, page.card) })
             }
             page.shelves.filter { it.cards.isNotEmpty() }.forEach { shelf ->
-                add(if (shelf.cards.size > 3) section(shelf.title, "Все") { openShelf(shelf) } else heading(shelf.title))
-                add(shelfRow(shelf.cards))
+                if (shelf.cards.all { it.kind == Kind.CONCERT }) {
+                    add(heading(shelf.title))
+                    addAll(shelf.cards.map(::concertRow))
+                } else {
+                    add(if (shelf.cards.size > 3) section(shelf.title, "Все") { openShelf(shelf) } else heading(shelf.title))
+                    add(shelfRow(shelf.cards))
+                }
             }
             if (page.card.kind == Kind.ARTIST) page.description?.takeIf(String::isNotBlank)?.let {
                 add(heading("Об исполнителе"))
@@ -2629,14 +2638,60 @@ class MainActivity : ComponentActivity(), Player.Listener {
         }
     }
 
+    private fun loadKids() = loadRows(loading = { listOf(Row.Layout { ui.loadingGrid(circle = false) }) }) { showCached ->
+        fun kidsRows(shelves: List<Shelf>) = shelfRows(shelves).ifEmpty {
+            listOf(Row.Layout { ui.pagePlaceholder(Symbol.NOTE, "Подборок пока нет") })
+        }
+        kidsRows(store.kids(showCached?.let { display -> { shelves -> display(kidsRows(shelves)) } }))
+    }
+
+    private fun loadConcerts() = loadRows { showCached ->
+        val requestedCity = city
+        fun concertRows(cards: List<Card>) = cards.map(::concertRow).ifEmpty {
+            listOf(Row.Layout { ui.pagePlaceholder(Symbol.CONCERT, "Нет предстоящих концертов") })
+        }
+        concertRows(store.concerts(requestedCity, showCached?.let { display -> { cards -> display(concertRows(cards)) } }))
+    }
+
+    private fun concertRow(card: Card) = Row.Layout {
+        ui.row().apply {
+            setPadding(ui.dp(16), ui.dp(7), ui.dp(16), ui.dp(7))
+            addView(ui.art(card.cover, 200, corner = 8), LinearLayout.LayoutParams(ui.dp(56), ui.dp(56)))
+            addView(ui.column().apply {
+                setPaddingRelative(ui.dp(12), 0, ui.dp(8), 0)
+                addView(ui.text(card.title, 16, bold = true))
+                listOfNotNull(card.subtitle.takeIf(String::isNotBlank), card.eventDate?.let(::formatConcertDate)).forEach { detail ->
+                    addView(ui.space(4))
+                    addView(ui.text(detail, 14, ui.palette.muted))
+                }
+            }, ui.weight())
+            card.link?.let { link ->
+                addView(ui.button("Билеты") { browser(link) }.apply { setTextColor(ui.palette.accentText) })
+            }
+        }
+    }
+
+    private fun concertCityLabel() = cityName.ifBlank { "Рядом" }
+
     private fun chooseCity() {
+        val page = route
         action {
-            val cities = store.online { cities() }
-            choose("Город", listOf("Рядом со мной") + cities.map { it.second }) { index ->
-                city = cities.getOrNull(index - 1)?.first
-                cityName = cities.getOrNull(index - 1)?.second.orEmpty()
+            val cities = store.concertCities()
+            if (route !== page) return@action
+            choose("Город", listOf("Рядом") + cities.map { it.second }, cities.indexOfFirst { it.first == city } + 1) { index ->
+                val chosen = cities.getOrNull(index - 1)
+                if (city == chosen?.first) return@choose
+                city = chosen?.first
+                cityName = chosen?.second.orEmpty()
                 store.preferences.edit().putString("city", city).putString("cityName", cityName).apply()
-                if (route.screen == Screen.CONCERTS) load()
+                if (route === page) {
+                    findViewById<TextView>(CONCERT_CITY_BUTTON)?.text = concertCityLabel()
+                    restorePosition = null
+                    listHasContent = false
+                    pageHasRows = false
+                    rows(emptyList(), transient = true)
+                    loadConcerts()
+                }
             }
         }
     }
@@ -3980,6 +4035,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
             Screen.HISTORY, Screen.ALBUMS, Screen.ARTISTS, Screen.PODCASTS, Screen.BOOKS)
         private val FAVORITE = View.generateViewId()
         private val DETAIL_HEADER_TITLE = View.generateViewId()
+        private val CONCERT_CITY_BUTTON = View.generateViewId()
         private val ROOM_ID = Regex("[a-zA-Z0-9_-]{1,150}")
         private val SHARED_LINK = Regex("""https://music\.yandex\.(?:ru|com|kz)/[^\s<>"»]+""")
         private val FILTERS = listOf("Всё" to "track,album,artist,playlist,podcast,podcast_episode", "Треки" to "track",

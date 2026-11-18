@@ -108,6 +108,7 @@ internal data class Card(
     val seeds: List<String> = emptyList(),
     val link: String? = null,
     val releaseType: String? = null,
+    val eventDate: String? = null,
 ) {
     val key get() = "${kind.name}:${owner.orEmpty()}:$id"
     val isPodcast get() = kind == Kind.ALBUM && releaseType == "podcast"
@@ -123,7 +124,7 @@ internal data class Card(
         .put("coverUri", cover).put("subtitle", subtitle).put("type", releaseType)
 
     fun cached() = stored().put("kind", kind.name).put("owner", owner)
-        .put("seeds", JSONArray(seeds)).put("link", link)
+        .put("seeds", JSONArray(seeds)).put("link", link).put("eventDate", eventDate)
 
     companion object {
         fun fromCache(data: JSONObject): Card? {
@@ -131,7 +132,7 @@ internal data class Card(
             val id = data.text("id") ?: return null
             val title = data.text("title") ?: return null
             return Card(kind, id, title, data.text("subtitle").orEmpty(), data.text("coverUri"),
-                data.text("owner"), data.arr("seeds").items().mapNotNull(Any?::asId), data.text("link"), data.text("type"))
+                data.text("owner"), data.arr("seeds").items().mapNotNull(Any?::asId), data.text("link"), data.text("type"), data.text("eventDate"))
         }
 
         fun album(value: JSONObject, requireTitle: Boolean = true): Card? {
@@ -171,6 +172,13 @@ internal data class Card(
 }
 
 internal data class Shelf(val title: String, val cards: List<Card>)
+internal fun formatConcertDate(value: String): String? {
+    val day = optional { java.time.LocalDate.parse(value.substringBefore('T')) } ?: return null
+    val date = day.format(java.time.format.DateTimeFormatter.ofPattern("d MMMM uuuu", Locale.forLanguageTag("ru")))
+    val time = value.substringAfter('T', "").take(5)
+        .takeIf { candidate -> optional { java.time.LocalTime.parse(candidate) } != null }
+    return if (time == null) date else "$date · $time"
+}
 internal data class HomePage(val personal: List<Shelf> = emptyList(), val trends: List<Shelf> = emptyList(), val recent: List<Track> = emptyList()) {
     val hasContent get() = personal.isNotEmpty() || trends.isNotEmpty() || recent.isNotEmpty()
 }

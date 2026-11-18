@@ -560,9 +560,15 @@ internal class MusicStore(val context: Context) {
         JSONObject().put("card", page.card.cached()).put("tracks", JSONArray(page.tracks.map(Track::stored)))
             .put("description", page.description).put("disks", JSONArray(page.disks)).put("publicPlaylist", page.publicPlaylist)
             .put("latestRelease", page.latestRelease?.cached())
-            .put("shelves", JSONArray(page.shelves.map { shelf ->
-                JSONObject().put("title", shelf.title).put("cards", JSONArray(shelf.cards.map(Card::cached)))
-            }))
+            .put("shelves", encodeShelves(page.shelves))
+
+    private fun encodeShelves(shelves: List<Shelf>) = JSONArray(shelves.map { shelf ->
+        JSONObject().put("title", shelf.title).put("cards", JSONArray(shelf.cards.map(Card::cached)))
+    })
+
+    private fun decodeShelves(data: JSONArray) = data.objects().mapNotNull { shelf ->
+        shelf.text("title")?.let { Shelf(it, shelf.arr("cards").objects().mapNotNull(Card::fromCache)) }
+    }
 
     suspend fun movePlaylistTrack(before: MusicPage, after: MusicPage, from: Int, to: Int) {
         val uid = requireUser().uid
@@ -576,9 +582,7 @@ internal class MusicStore(val context: Context) {
     suspend fun details(card: Card, onCached: ((MusicPage) -> Unit)? = null): MusicPage = cached("page:${card.key}", ::encodePage, { value ->
         val savedCard = Card.fromCache(value.obj("card")) ?: return@cached null
         val tracks = value.arr("tracks").objects().mapNotNull { Track.parse(it) }
-        val shelves = value.arr("shelves").objects().mapNotNull { shelf ->
-            shelf.text("title")?.let { Shelf(it, shelf.arr("cards").objects().mapNotNull(Card::fromCache)) }
-        }
+        val shelves = decodeShelves(value.arr("shelves"))
         MusicPage(savedCard, tracks, shelves, value.text("description"), value.arr("disks").items().mapNotNull { (it as? Number)?.toInt() },
             value.opt("publicPlaylist") as? Boolean, value.optJSONObject("latestRelease")?.let(Card::fromCache))
     }, onCached) {
@@ -612,23 +616,54 @@ internal class MusicStore(val context: Context) {
         val cache = homeFile(requireUser().uid)
         optional {
             val raw = org.json.JSONTokener(cache.readFully().toString(Charsets.UTF_8)).nextValue()
-            fun read(list: JSONArray) = list.objects().mapNotNull { entry ->
-                entry.text("title")?.let { Shelf(it, entry.arr("cards").objects().mapNotNull(Card::fromCache)) }
-            }
             when (raw) {
-                is JSONObject -> HomePage(read(raw.arr("personal")), read(raw.arr("trends")), raw.arr("recent").objects().mapNotNull { Track.parse(it) })
-                is JSONArray -> HomePage(read(raw))
+                is JSONObject -> HomePage(decodeShelves(raw.arr("personal")), decodeShelves(raw.arr("trends")),
+                    raw.arr("recent").objects().mapNotNull { Track.parse(it) })
+                is JSONArray -> HomePage(decodeShelves(raw))
                 else -> HomePage()
             }
         } ?: HomePage()
     }
 
-    private suspend fun loadShelves(sources: List<Pair<String, String>>) = coroutineScope {
-        sources.map { (name, uri) -> async { optional { online { homeShelf(name, uri) } } } }.awaitAll()
-            .filterNotNull().filter { it.cards.isNotEmpty() }
+    private suspend fun loadShelves(sources: List<Pair<String, String>>, reportFailure: Boolean = false) = coroutineScope {
+        val results = sources.map { (name, uri) ->
+            async {
+                try {
+                    Result.success(online { homeShelf(name, uri) })
+                } catch (error: Exception) {
+                    if (error is CancellationException) throw error
+                    Result.failure(error)
+                }
+            }
+        }.awaitAll()
+        val shelves = results.mapNotNull { it.getOrNull() }.filter { it.cards.isNotEmpty() }
+        if (reportFailure && shelves.isEmpty()) {
+            results.firstNotNullOfOrNull { it.exceptionOrNull() }?.let { throw it }
+        }
+        shelves
     }
 
-    suspend fun kids(): List<Shelf> = loadShelves(online { homeSources(kids = true) }.flatten().distinct())
+    suspend fun kids(onCached: ((List<Shelf>) -> Unit)? = null): List<Shelf> = cached(
+        "kids", { JSONObject().put("shelves", encodeShelves(it)) }, { decodeShelves(it.arr("shelves")) }, onCached,
+    ) {
+        val sources = online { homeSources(kids = true) }.flatten().distinct()
+        loadShelves(sources, reportFailure = true).distinctBy { shelf -> shelf.cards.map(Card::key) }
+    }
+
+    suspend fun concerts(city: String?, onCached: ((List<Card>) -> Unit)? = null): List<Card> = cached(
+        "concerts:${city.orEmpty()}", { JSONObject().put("cards", JSONArray(it.map(Card::cached))) },
+        { it.arr("cards").objects().mapNotNull(Card::fromCache) }, onCached,
+    ) { online { concerts(city) } }
+
+    suspend fun concertCities(): List<Pair<String, String>> = cached(
+        "concert-cities",
+        { entries -> JSONObject().put("cities", JSONArray(entries.map { (id, name) -> JSONObject().put("id", id).put("name", name) })) },
+        { data -> data.arr("cities").objects().mapNotNull { city ->
+            val id = city.text("id") ?: return@mapNotNull null
+            val name = city.text("name") ?: return@mapNotNull null
+            id to name
+        } },
+    ) { online { cities() } }
 
     suspend fun home(): HomePage = coroutineScope {
         val uid = requireUser().uid
@@ -639,10 +674,7 @@ internal class MusicStore(val context: Context) {
         val page = HomePage(personal.await(), trends.await(), recent.await())
         if (page.hasContent) withContext(Dispatchers.IO) {
             optional {
-                fun store(shelves: List<Shelf>) = JSONArray(shelves.map { shelf ->
-                    JSONObject().put("title", shelf.title).put("cards", JSONArray(shelf.cards.map(Card::cached)))
-                })
-                homeFile(uid).writeText(JSONObject().put("personal", store(page.personal)).put("trends", store(page.trends))
+                homeFile(uid).writeText(JSONObject().put("personal", encodeShelves(page.personal)).put("trends", encodeShelves(page.trends))
                     .put("recent", JSONArray(page.recent.map(Track::stored))).toString())
             }
         }
