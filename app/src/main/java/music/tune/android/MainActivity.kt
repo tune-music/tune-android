@@ -67,7 +67,14 @@ private enum class Screen(val label: String) {
 }
 
 private data class ReplacementTarget(val kind: String, val id: String, val title: String, val track: Track? = null)
-private data class Route(val screen: Screen, val card: Card? = null, val shelf: Shelf? = null, val replacement: ReplacementTarget? = null)
+private class Route(val screen: Screen, var card: Card? = null, val shelf: Shelf? = null, val replacement: ReplacementTarget? = null) {
+    var position: TrackListPosition? = null
+    var filter = ""
+    var order = TrackOrder.ORIGINAL
+    var downloadedOnly = false
+    var filterVisible = false
+}
+private data class TrackListPosition(val index: Int, val offset: Int, val trackId: String?)
 private data class TrackList(val tracks: List<Track>, val context: PlayContext, val art: Symbol? = null)
 private enum class TrackOrder(val label: String) {
     ORIGINAL("Исходный порядок"), TITLE("По названию"), ARTIST("По исполнителю"), RECENT("По дате добавления")
@@ -114,12 +121,12 @@ class MainActivity : ComponentActivity(), Player.Listener {
     private var pendingPlayback: (() -> Unit)? = null
     private var tab = Tab.HOME
     private val paths = Tab.entries.associateWith { ArrayDeque<Route>() }
+    private val roots = mapOf(Tab.HOME to Route(Screen.HOME), Tab.SEARCH to Route(Screen.SEARCH), Tab.LIBRARY to Route(Screen.LIBRARY))
     private val stack get() = paths.getValue(tab)
-    private val route get() = stack.lastOrNull() ?: Route(when (tab) {
-        Tab.HOME -> Screen.HOME
-        Tab.SEARCH -> Screen.SEARCH
-        Tab.LIBRARY -> Screen.LIBRARY
-    })
+    private val route get() = stack.lastOrNull() ?: roots.getValue(tab)
+    private var displayedRoute: Route? = null
+    private var restorePosition: TrackListPosition? = null
+    private var pageHasRows = false
     private var pendingLink: Uri? = null
     private var pendingShortcut: String? = null
     private var pendingVoiceSearch: String? = null
@@ -341,8 +348,18 @@ class MainActivity : ComponentActivity(), Player.Listener {
         connectPlayer()
         lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
+                val resumedPage = displayedRoute
                 launch { store.profile.collect { user -> showAccount(user) } }
-                launch { if (!store.offline && store.profile.value != null) optional { store.refreshAccount() } }
+                launch {
+                    val uid = store.profile.value?.uid
+                    if (!store.offline && uid != null) {
+                        optional { store.refreshAccount() }
+                        if (uid == userId && resumedPage === displayedRoute && listHasContent &&
+                            pageJob?.isActive != true && !reordering && resumedPage?.screen in COLLECTION_REFRESH_PAGES) {
+                            load()
+                        }
+                    }
+                }
                 launch { store.messages.collect(::toast) }
                 launch { store.likes.collect { refreshCollection(); updatePlaying() } }
                 launch { store.dislikes.collect { refreshCollection(); playerPanel?.update() } }
@@ -447,6 +464,8 @@ class MainActivity : ComponentActivity(), Player.Listener {
             homeLoaded = false
             details = null
             paths.values.forEach { it.clear() }
+            roots.values.forEach { it.position = null }
+            displayedRoute = null
             tab = Tab.HOME
             searchText = ""
             searchDraft = ""
@@ -620,7 +639,11 @@ class MainActivity : ComponentActivity(), Player.Listener {
 
     private fun render() {
         saveSearchPosition()
+        saveTrackPage()
         val current = route
+        displayedRoute = current
+        restorePosition = current.position
+        pageHasRows = false
         pageJob?.cancel()
         listHasContent = false
         suggestionJob?.cancel()
@@ -630,9 +653,9 @@ class MainActivity : ComponentActivity(), Player.Listener {
         reorderDone = null
         waveHead = null
         trackList = null
-        trackFilter = ""
-        trackOrder = TrackOrder.ORIGINAL
-        onlyDownloaded = false
+        trackFilter = current.filter
+        trackOrder = current.order
+        onlyDownloaded = current.downloadedOnly
         filterField = null
         filterBar = null
         selecting = false
@@ -670,7 +693,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
             if (current.screen == Screen.DETAILS) setOnScrollListener(object : android.widget.AbsListView.OnScrollListener {
                 override fun onScrollStateChanged(view: android.widget.AbsListView, state: Int) = Unit
                 override fun onScroll(view: android.widget.AbsListView, first: Int, visible: Int, total: Int) {
-                    toolbarTitle?.text = if (first > 0) details?.card?.title ?: current.card?.title.orEmpty() else ""
+                    updateDetailsTitle(current, view, first)
                     updateDetailChrome()
                 }
             })
@@ -685,6 +708,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
         list = pageList
         adapter = pageAdapter
         content.addView(pageList, LinearLayout.LayoutParams(-1, 0, 1f))
+        if (current.filterVisible) showTrackFilter(focus = false)
         content.addView(ui.row().apply {
             background = ui.shape(ui.palette.panel, 20)
             visibility = View.GONE
@@ -713,7 +737,13 @@ class MainActivity : ComponentActivity(), Player.Listener {
             Screen.SHELF -> current.shelf?.title.orEmpty()
             else -> current.screen.label
         }
-        addView(ui.line(title, if (stack.isEmpty()) 32 else 18, bold = true).also { toolbarTitle = it }, ui.weight())
+        addView(ui.line(title, if (stack.isEmpty()) 32 else 18, bold = true).also {
+            if (current.screen == Screen.DETAILS) {
+                it.alpha = 0f
+                it.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+            }
+            toolbarTitle = it
+        }, ui.weight())
         when (current.screen) {
             Screen.HOME -> addView(ui.icon(Symbol.ACCOUNT, "Настройки и аккаунт") { push(Screen.SETTINGS) })
             Screen.LIBRARY -> addView(ui.icon(Symbol.GEAR, "Настройки") { push(Screen.SETTINGS) })
@@ -742,7 +772,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
                 })
                 addView(menuButton { anchor -> details?.let { pageMenu(it, anchor) } ?: toast("Дождитесь загрузки") }
                     .also { detailMenu = it })
-                if (current.card?.kind == Kind.PLAYLIST && current.card.owner == userId) {
+                if (current.card?.let { it.kind == Kind.PLAYLIST && it.owner == userId } == true) {
                     addView(ui.button("Готово") { setReordering(false) }.apply {
                         visibility = View.GONE
                         textSize = 16f
@@ -1805,6 +1835,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
         })
         addView(ui.space(6))
         addView(ui.text(card.title, if (artist) 30 else 26, bold = true).apply {
+            id = DETAIL_HEADER_TITLE
             gravity = Gravity.CENTER
             maxLines = 3
             ellipsize = android.text.TextUtils.TruncateAt.END
@@ -1849,6 +1880,26 @@ class MainActivity : ComponentActivity(), Player.Listener {
                 addView(roundIcon(Symbol.WAVE, "Волна исполнителя") { startWave(listOf("artist:${card.id}"), card.title) })
             } else addTrackControls(this, page.tracks, readyContext)
         }, ui.full())
+    }
+
+    private fun updateDetailsTitle(current: Route, page: android.widget.AbsListView, first: Int) {
+        val title = toolbarTitle ?: return
+        val caption = details?.card?.title ?: current.card?.title.orEmpty()
+        if (title.text != caption) title.text = caption
+        val header = page.getChildAt(0)
+        val heading = header?.findViewById<TextView>(DETAIL_HEADER_TITLE)
+        val alpha = when {
+            first > 0 -> 1f
+            heading == null -> 0f
+            else -> {
+                val bottom = header.top + heading.bottom
+                val range = ui.dp(34)
+                if (playbackMotion.enabled) (1f - bottom.toFloat() / range).coerceIn(0f, 1f)
+                else if (bottom <= 0) 1f else 0f
+            }
+        }
+        title.alpha = alpha
+        title.importantForAccessibility = if (alpha >= .5f) View.IMPORTANT_FOR_ACCESSIBILITY_YES else View.IMPORTANT_FOR_ACCESSIBILITY_NO
     }
 
     private fun updateDetailChrome() {
@@ -1979,11 +2030,12 @@ class MainActivity : ComponentActivity(), Player.Listener {
         }
     }
 
-    private fun showTrackFilter() {
+    private fun showTrackFilter(focus: Boolean = true) {
         if (filterBar != null) return
         val field = EditText(this).apply {
             setSingleLine()
             hint = "Поиск в списке"
+            setText(trackFilter)
             setTextColor(ui.palette.text)
             setHintTextColor(ui.palette.muted)
             setPadding(ui.dp(13), 0, ui.dp(8), 0)
@@ -2003,8 +2055,10 @@ class MainActivity : ComponentActivity(), Player.Listener {
         filterBar = bar
         filterField = field
         content.addView(bar, 1, ui.full(52))
-        field.requestFocus()
-        field.post { getSystemService(InputMethodManager::class.java).showSoftInput(field, InputMethodManager.SHOW_IMPLICIT) }
+        if (focus) {
+            field.requestFocus()
+            field.post { getSystemService(InputMethodManager::class.java).showSoftInput(field, InputMethodManager.SHOW_IMPLICIT) }
+        }
     }
 
     private fun hideTrackFilter() {
@@ -2398,19 +2452,42 @@ class MainActivity : ComponentActivity(), Player.Listener {
         }, ViewGroup.LayoutParams(-2, -2))
     }
 
-    private fun rows(newRows: List<Row>, keepScroll: Boolean = false) {
-        val list = list ?: return
-        val offset = list.getChildAt(0)?.top ?: 0
+    private fun listPosition(): TrackListPosition? {
+        val list = list ?: return null
+        val child = list.getChildAt(0) ?: return null
         val position = list.firstVisiblePosition
+        val currentAdapter = adapter ?: return null
+        val id = if (position in 0 until currentAdapter.count) (currentAdapter.getItem(position) as? Row.Music)?.track?.id else null
+        return TrackListPosition(position, child.top, id)
+    }
+
+    private fun saveTrackPage() {
+        val displayed = displayedRoute ?: return
+        if (displayed.screen == Screen.SEARCH) return
+        displayed.filter = trackFilter
+        displayed.order = trackOrder
+        displayed.downloadedOnly = onlyDownloaded
+        displayed.filterVisible = filterBar != null
+        if (pageHasRows) displayed.position = listPosition()
+    }
+
+    private fun rows(newRows: List<Row>, keepScroll: Boolean = false, transient: Boolean = false) {
+        val list = list ?: return
         val currentAdapter = adapter ?: return
-        val visibleId = if (keepScroll && route.screen == Screen.LIKES && position < currentAdapter.count)
-            (currentAdapter.getItem(position) as? Row.Music)?.track?.id else null
-        val anchor = visibleId?.let { id ->
-            newRows.indexOfFirst { it is Row.Music && it.track.id == id }.takeIf { it >= 0 }
-        } ?: position
+        val position = if (transient) null else restorePosition ?: if (keepScroll) listPosition() else null
         currentAdapter.replace(newRows)
-        if (keepScroll && anchor in newRows.indices) list.setSelectionFromTop(anchor, offset)
-        else list.setSelection(0)
+        if (!transient && newRows.isNotEmpty()) {
+            restorePosition = null
+            pageHasRows = true
+        }
+        if (position != null && newRows.isNotEmpty()) {
+            val anchor = position.index.coerceIn(newRows.indices)
+            val id = position.trackId
+            val target = if (id == null || (newRows[anchor] as? Row.Music)?.track?.id == id) anchor
+            else newRows.indices.asSequence().filter { (newRows[it] as? Row.Music)?.track?.id == id }
+                .minByOrNull { kotlin.math.abs(it - anchor) } ?: anchor
+            list.setSelectionFromTop(target, position.offset)
+        } else list.setSelection(0)
         if (selecting) updateSelectionBar()
     }
 
@@ -2428,12 +2505,12 @@ class MainActivity : ComponentActivity(), Player.Listener {
             if (listHasContent) toast(error)
             else rows(listOf(Row.Layout {
                 ui.pagePlaceholder(Symbol.WIFI_OFF, "Не удалось загрузить", error) { load() }
-            }))
+            }), transient = true)
         }) {
             coroutineScope {
                 val skeleton = if (listHasContent) null else launch {
                     delay(200)
-                    if (!listHasContent) rows(loading())
+                    if (!listHasContent) rows(loading(), transient = true)
                 }
                 try {
                     display(block(showCached))
@@ -2674,8 +2751,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
                         val changed = card.copy(title = name)
                         store.changeLocalPlaylist(changed)
                         if (route.card?.key == card.key) {
-                            stack.removeLast()
-                            stack.addLast(Route(Screen.DETAILS, changed))
+                            route.card = changed
                             loadDetails(changed)
                         }
                     }
@@ -2686,7 +2762,10 @@ class MainActivity : ComponentActivity(), Player.Listener {
                     action {
                         store.online { deletePlaylist(card) }
                         store.changeLocalPlaylist(card, remove = true)
-                        if (route.card?.key == card.key) onBackPressedDispatcher.onBackPressed()
+                        if (route.card?.key == card.key) {
+                            stack.removeLast()
+                            render()
+                        }
                     }
                 }
             }
@@ -3897,7 +3976,10 @@ class MainActivity : ComponentActivity(), Player.Listener {
         private val SHORTCUTS = setOf("music.tune.android.SHORTCUT_WAVE", "music.tune.android.SHORTCUT_SEARCH", "music.tune.android.SHORTCUT_LIKES", OPEN_DOWNLOADS)
         private const val MY_WAVE = "user:onyourwave"
         private val ID = Regex("[0-9]+")
+        private val COLLECTION_REFRESH_PAGES = setOf(Screen.DETAILS, Screen.LIKES, Screen.DISLIKES,
+            Screen.HISTORY, Screen.ALBUMS, Screen.ARTISTS, Screen.PODCASTS, Screen.BOOKS)
         private val FAVORITE = View.generateViewId()
+        private val DETAIL_HEADER_TITLE = View.generateViewId()
         private val ROOM_ID = Regex("[a-zA-Z0-9_-]{1,150}")
         private val SHARED_LINK = Regex("""https://music\.yandex\.(?:ru|com|kz)/[^\s<>"»]+""")
         private val FILTERS = listOf("Всё" to "track,album,artist,playlist,podcast,podcast_episode", "Треки" to "track",
