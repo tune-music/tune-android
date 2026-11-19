@@ -48,6 +48,7 @@ internal class MiniTrackPager(
     private var tracks = List<Track?>(3) { null }
     private var x = 0f
     private var y = 0f
+    private var dragOriginX = 0f
     private var offset = 0f
     private var axis = 0
     private var velocity: VelocityTracker? = null
@@ -111,6 +112,7 @@ internal class MiniTrackPager(
             MotionEvent.ACTION_DOWN -> {
                 x = event.x
                 y = event.y
+                dragOriginX = 0f
                 axis = 0
                 velocity?.recycle()
                 velocity = VelocityTracker.obtain().also { it.addMovement(event) }
@@ -122,6 +124,7 @@ internal class MiniTrackPager(
                 val dy = event.y - y
                 if (axis == 0 && maxOf(abs(dx), abs(dy)) > slop) {
                     axis = if (abs(dx) > abs(dy)) 1 else 2
+                    if (axis == 1) dragOriginX = dx
                     animator?.cancel()
                     removeCallbacks(settleTimeout)
                     awaitingTrack = false
@@ -130,8 +133,9 @@ internal class MiniTrackPager(
                     isPressed = false
                 }
                 if (axis == 1 && ValueAnimator.areAnimatorsEnabled()) {
-                    val neighbor = if (dx < 0) tracks[2] else tracks[0].takeIf { canPageBack() }
-                    place((dx * if (neighbor == null) .24f else 1f).coerceIn(-width.toFloat(), width.toFloat()))
+                    val moveX = dx - dragOriginX
+                    val neighbor = if (moveX < 0) tracks[2] else tracks[0].takeIf { canPageBack() }
+                    place((moveX * if (neighbor == null) .24f else 1f).coerceIn(-width.toFloat(), width.toFloat()))
                 } else if (axis == 2 && ValueAnimator.areAnimatorsEnabled()) {
                     tiles[1].view.translationY = (dy * .17f).coerceIn(-ui.dp(14).toFloat(), 0f)
                 }
@@ -148,9 +152,10 @@ internal class MiniTrackPager(
                 isPressed = false
                 parent.requestDisallowInterceptTouchEvent(false)
                 tiles[1].view.animate().translationY(0f).setDuration(160).start()
-                if (!cancelled && axis == 1 && (abs(dx) > minOf(width * .3f, ui.dp(70).toFloat()) ||
-                            abs(dx) > slop && abs(speed) > ui.dp(550) && dx * speed > 0)) {
-                    val goingForward = dx < 0
+                val moveX = dx - dragOriginX
+                if (!cancelled && axis == 1 && (abs(moveX) > minOf(width * .3f, ui.dp(70).toFloat()) ||
+                            abs(moveX) > slop && abs(speed) > ui.dp(550) && moveX * speed > 0)) {
+                    val goingForward = moveX < 0
                     val target = if (goingForward) -width.toFloat() else width.toFloat()
                     val action = if (goingForward) next else previous
                     if ((if (goingForward) tracks[2] else tracks[0].takeIf { canPageBack() }) != null) {

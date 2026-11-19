@@ -72,6 +72,10 @@ internal class MusicFiles(private val store: MusicStore) {
     private val downloadAssets = Semaphore(2)
     private val activeAssets = mutableSetOf<Pair<String, String>>()
     private val streamCache = ConcurrentHashMap<String, Pair<Long, Stream>>()
+    @Volatile private var coverIndexUid: String? = null
+    @Volatile private var coverFolder: File? = null
+    private val savedCoverNames = ConcurrentHashMap.newKeySet<String>()
+    @Volatile private var coverIndexReady = false
 
     private fun accountFolder(uid: String) = File(context.filesDir, "music/${digest(uid)}")
     private fun directory(uid: String) = accountFolder(uid).apply { mkdirs() }
@@ -87,7 +91,15 @@ internal class MusicFiles(private val store: MusicStore) {
     private fun artwork(uid: String, cover: String) = File(accountFolder(uid), "covers/${digest(cover)}.jpg")
     private fun words(uid: String, trackId: String) = AtomicFile(File(accountFolder(uid), "lyrics/${digest(trackId)}.json"))
 
-    fun savedCover(cover: String): File? = store.profile.value?.uid?.let { artwork(it, cover).takeIf(File::isFile) }
+    fun savedCover(cover: String): File? {
+        val uid = store.profile.value?.uid ?: return null
+        if (coverIndexUid == uid && coverIndexReady) {
+            if (savedCoverNames.isEmpty()) return null
+            val name = "${digest(cover)}.jpg"
+            return if (name in savedCoverNames) coverFolder?.let { File(it, name) } else null
+        }
+        return artwork(uid, cover).takeIf(File::isFile)
+    }
 
     fun savedLyrics(uid: String, trackId: String): AtomicFile? = words(uid, trackId).takeIf { it.baseFile.exists() }
 
@@ -143,6 +155,7 @@ internal class MusicFiles(private val store: MusicStore) {
             try {
                 bytes.writeTo(stream)
                 output.finishWrite(stream)
+                if (coverIndexUid == uid) savedCoverNames.add(file.name)
             } catch (error: Exception) {
                 output.failWrite(stream)
                 throw error
@@ -237,6 +250,20 @@ internal class MusicFiles(private val store: MusicStore) {
         streamCache.clear()
         _status.value = emptyMap()
         user = uid
+        coverIndexReady = false
+        savedCoverNames.clear()
+        coverIndexUid = uid
+        val folder = uid?.let { File(accountFolder(it), "covers") }
+        coverFolder = folder
+        if (uid != null && folder != null) {
+            store.scope.launch(Dispatchers.IO) {
+                val names = folder.list()
+                if (coverIndexUid == uid) {
+                    if (names != null) savedCoverNames.addAll(names.asList())
+                    coverIndexReady = true
+                }
+            }
+        }
         _paused.value = uid != null && store.preferences.getBoolean("downloadsPaused:$uid", false)
         if (uid != null) {
             val queue = optional { JSONArray(store.preferences.getString("downloadsQueue:$uid", "[]")).objects() }.orEmpty()
@@ -402,7 +429,11 @@ internal class MusicFiles(private val store: MusicStore) {
                 downloaded(uid, track.id)?.let { if (!it.delete()) throw MusicError("Не удалось удалить загрузку") }
                 updateIndex(uid, track, edition = null)
                 words(uid, track.id).delete()
-                if (cover != null && index(uid).none { it.cover == cover }) artwork(uid, cover).delete()
+                if (cover != null && index(uid).none { it.cover == cover }) {
+                    val artFile = artwork(uid, cover)
+                    artFile.delete()
+                    if (coverIndexUid == uid && !artFile.isFile) savedCoverNames.remove(artFile.name)
+                }
             }
         }
         _revision.value++

@@ -41,6 +41,10 @@ class TuneApp : Application() {
     }
 }
 
+internal data class SleepState(val stopAtMs: Long? = null, val afterTrack: Boolean = false) {
+    val active get() = stopAtMs != null || afterTrack
+}
+
 internal class MusicStore(val context: Context) {
     val preferences: SharedPreferences = context.getSharedPreferences("tune", Context.MODE_PRIVATE)
     val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -63,6 +67,8 @@ internal class MusicStore(val context: Context) {
     val ownPlaylists = _ownPlaylists.asStateFlow()
     private val _savedPlaylists = MutableStateFlow<List<Card>>(emptyList())
     val savedPlaylists = _savedPlaylists.asStateFlow()
+    private val _sleepTimer = MutableStateFlow(SleepState())
+    val sleepTimer = _sleepTimer.asStateFlow()
     private val _message = kotlinx.coroutines.flow.MutableSharedFlow<String>(extraBufferCapacity = 4)
     val messages = _message
     val files = MusicFiles(this)
@@ -129,6 +135,7 @@ internal class MusicStore(val context: Context) {
         set(value) { preferences.edit().putString("downloadQuality", value).apply() }
 
     fun message(text: String) { _message.tryEmit(text) }
+    fun setSleepState(state: SleepState) { _sleepTimer.value = state }
 
     suspend fun refreshVersions(): Boolean = withContext(Dispatchers.IO) { versions.refresh(network = !offline) }
 

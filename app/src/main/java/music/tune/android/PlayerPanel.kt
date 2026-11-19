@@ -9,7 +9,6 @@ import android.content.res.ColorStateList
 import android.graphics.Color
 import android.graphics.drawable.ClipDrawable
 import android.graphics.drawable.ColorDrawable
-import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.LayerDrawable
 import android.graphics.drawable.ShapeDrawable
 import android.media.MediaRouter2
@@ -37,6 +36,9 @@ import androidx.media3.session.SessionCommand
 import androidx.core.animation.doOnEnd
 import androidx.core.graphics.Insets
 import kotlinx.coroutines.Job
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 internal class PlayerPanel(private val activity: MainActivity) {
     private val ui = TuneUi(activity)
@@ -51,7 +53,7 @@ internal class PlayerPanel(private val activity: MainActivity) {
     private val artist = ui.line("", 17, Palette.muted)
     private var topTone = Palette.lifted
     private var toneAnimator: ValueAnimator? = null
-    private val backdrop = GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM, intArrayOf(Palette.lifted, 0xff0d0d0d.toInt()))
+    private val backdrop = SmoothGradientDrawable(Palette.lifted, 0xff0d0d0d.toInt())
     private val art = CoverTrackPager(ui) { tone -> animateTone(tone) }
     private val lyricBody = ui.column()
     private val lyricScroll = LyricsScroll().apply {
@@ -63,6 +65,8 @@ internal class PlayerPanel(private val activity: MainActivity) {
     }
     private val lyricStatus = FrameLayout(activity)
     private val lyricPane = FrameLayout(activity).apply {
+        clipChildren = true
+        clipToPadding = true
         visibility = View.GONE
         alpha = 0f
         addView(lyricScroll, FrameLayout.LayoutParams(-1, -1))
@@ -98,8 +102,8 @@ internal class PlayerPanel(private val activity: MainActivity) {
         setPadding(0, 0, 0, 0)
         splitTrack = false
     }
+    private val bufferRing = BufferRingView(activity)
     private val toggle = ui.icon(Symbol.PLAY, "Воспроизвести", Palette.background, activity::toggle).apply {
-        layoutParams = LinearLayout.LayoutParams(ui.dp(76), ui.dp(76))
         background = ui.touch(Palette.text, 40)
         iconSize = 30
     }
@@ -110,7 +114,12 @@ internal class PlayerPanel(private val activity: MainActivity) {
     private val like = ui.icon(Symbol.HEART, "Мне нравится") { activity.currentTrack()?.let { activity.rate(it) } }
     private val dislike = ui.icon(Symbol.THUMB_DOWN, "Не нравится") { activity.currentTrack()?.let { activity.rate(it, true) } }
     private val lyricButton = ui.icon(Symbol.LYRICS, "Текст песни", click = ::toggleLyrics)
-    private val download = ui.icon(Symbol.DOWNLOAD_CIRCLE, "Скачать трек", click = ::toggleDownload)
+    private val download = ui.icon(Symbol.DOWNLOAD_CIRCLE, "Скачать трек", click = ::toggleDownload).apply { iconSize = 21 }
+    private val downloadRing = ProgressRingView(activity, 0x38ffffff, Palette.accent).apply { visibility = View.GONE }
+    private val downloadSlot = FrameLayout(activity).apply {
+        addView(download, FrameLayout.LayoutParams(-1, -1))
+        addView(downloadRing, FrameLayout.LayoutParams(ui.dp(22), ui.dp(22), Gravity.CENTER))
+    }
     private val soundButton = ui.icon(Symbol.SETTINGS, "Настройки звука", click = ::showSound)
     private val sleepButton = ui.icon(Symbol.MOON, "Таймер сна", click = ::sleepTimer)
     private var dragging = false
@@ -157,7 +166,7 @@ internal class PlayerPanel(private val activity: MainActivity) {
         }
         val config = activity.resources.configuration
         val size = minOf(config.screenWidthDp - 48, (config.screenHeightDp * .44f).toInt(), 540).coerceAtLeast(140)
-        lyricPane.setPadding(ui.dp(24), 0, ui.dp(24), 0)
+        lyricPane.setPadding(ui.dp(24), ui.dp(12), ui.dp(24), ui.dp(10))
         body.addView(FrameLayout(activity).apply {
             clipChildren = false
             clipToPadding = false
@@ -167,6 +176,7 @@ internal class PlayerPanel(private val activity: MainActivity) {
             addView(lyricPane, FrameLayout.LayoutParams(-1, -1))
         }, LinearLayout.LayoutParams(-1, ui.dp(size + 32), 1f))
         val controls = ui.column().apply {
+            clipChildren = false
             setPadding(ui.dp(24), 0, ui.dp(24), 0)
         }
         controls.addView(ui.row().apply {
@@ -184,24 +194,29 @@ internal class PlayerPanel(private val activity: MainActivity) {
             addView(elapsed, ui.weight())
             addView(duration)
         }, ui.full())
-        controls.addView(ui.space(14))
+        controls.addView(ui.space(7))
         controls.addView(ui.row().apply {
+            clipChildren = false
             addView(shuffle)
             addView(View(activity), LinearLayout.LayoutParams(0, 1, 1f))
             addView(skip(Symbol.PREVIOUS, "Предыдущий", -5_000, activity::previous))
             addView(View(activity), LinearLayout.LayoutParams(0, 1, 1f))
-            addView(toggle)
+            addView(FrameLayout(activity).apply {
+                clipChildren = false
+                addView(bufferRing, FrameLayout.LayoutParams(ui.dp(90), ui.dp(90), Gravity.CENTER))
+                addView(toggle, FrameLayout.LayoutParams(ui.dp(76), ui.dp(76), Gravity.CENTER))
+            }, LinearLayout.LayoutParams(ui.dp(90), ui.dp(90)))
             addView(View(activity), LinearLayout.LayoutParams(0, 1, 1f))
             addView(skip(Symbol.NEXT, "Следующий", 5_000, activity::next))
             addView(View(activity), LinearLayout.LayoutParams(0, 1, 1f))
             addView(repeat)
-        }, ui.full(76))
-        controls.addView(ui.space(18))
+        }, ui.full(90))
+        controls.addView(ui.space(11))
         controls.addView(ui.row().apply {
-            listOf(lyricButton, ui.icon(Symbol.OUTPUT, "Устройство вывода", click = ::output),
-                soundButton, sleepButton, download, ui.icon(Symbol.QUEUE, "Очередь", click = ::showQueue)).forEach { icon ->
-                icon.iconSize = 21
-                addView(icon, LinearLayout.LayoutParams(0, ui.dp(44), 1f))
+            listOf<View>(lyricButton, ui.icon(Symbol.OUTPUT, "Устройство вывода", click = ::output),
+                soundButton, sleepButton, downloadSlot, ui.icon(Symbol.QUEUE, "Очередь", click = ::showQueue)).forEach { item ->
+                (item as? IconView)?.iconSize = 21
+                addView(item, LinearLayout.LayoutParams(0, ui.dp(44), 1f))
             }
         }, ui.full(44))
         body.addView(controls, ui.full())
@@ -232,7 +247,7 @@ internal class PlayerPanel(private val activity: MainActivity) {
         toneAnimator?.cancel()
         if (!ValueAnimator.areAnimatorsEnabled() || !view.isAttachedToWindow) {
             topTone = target
-            backdrop.colors = intArrayOf(target, 0xff0d0d0d.toInt())
+            backdrop.setColors(target, 0xff0d0d0d.toInt())
             return
         }
         val start = topTone
@@ -240,7 +255,7 @@ internal class PlayerPanel(private val activity: MainActivity) {
             duration = 400
             addUpdateListener {
                 topTone = it.animatedValue as Int
-                backdrop.colors = intArrayOf(topTone, 0xff0d0d0d.toInt())
+                backdrop.setColors(topTone, 0xff0d0d0d.toInt())
             }
             start()
         }
@@ -271,7 +286,7 @@ internal class PlayerPanel(private val activity: MainActivity) {
     init {
         lyricScroll.addOnLayoutChangeListener { _, _, top, _, bottom, _, oldTop, _, oldBottom ->
             if (bottom - top != oldBottom - oldTop) {
-                lyricScroll.setFadingEdgeLength((lyricScroll.height * .14f).toInt())
+                lyricScroll.setFadingEdgeLength((lyricScroll.height * .16f).toInt())
                 if (lyricRows.isNotEmpty()) {
                     padLyrics()
                     lastAnchor = -1
@@ -324,6 +339,7 @@ internal class PlayerPanel(private val activity: MainActivity) {
         fun neighbor(index: Int) = if (index in 0 until player.mediaItemCount && index != player.currentMediaItemIndex)
             QueueItems.track(player.getMediaItemAt(index)) else null
         val playing = player.isPlaying || player.playWhenReady && player.playbackState == Player.STATE_BUFFERING
+        bufferRing.buffering = player.playWhenReady && player.playbackState == Player.STATE_BUFFERING
         art.bind(neighbor(player.previousMediaItemIndex), track, neighbor(player.nextMediaItemIndex), playing)
         activity.setIcon(toggle, if (playing) Symbol.PAUSE else Symbol.PLAY, if (playing) "Пауза" else "Воспроизвести", Palette.background)
         val liked = track.id in store.likes.value
@@ -342,6 +358,7 @@ internal class PlayerPanel(private val activity: MainActivity) {
             if (mode == Player.REPEAT_MODE_OFF) Palette.muted else Palette.accent)
         updateDownload()
         updateSoundButton()
+        updateSleepButton()
         queueAdapter?.notifyDataSetChanged()
         progress()
     }
@@ -350,11 +367,31 @@ internal class PlayerPanel(private val activity: MainActivity) {
         val track = activity.currentTrack() ?: return
         val saved = store.files.has(track)
         val loading = store.files.status.value[track.id]
-        activity.setIcon(download, if (saved) Symbol.CHECK_CIRCLE else Symbol.DOWNLOAD_CIRCLE, when {
-            saved -> "Удалить загрузку"
-            loading?.percent != null -> "Скачивается: ${loading.percent}%"
-            else -> "Скачать трек"
-        }, if (saved || loading?.percent != null) Palette.accent else Palette.text)
+        val percent = loading?.percent
+        if (!saved && percent != null) {
+            download.visibility = View.INVISIBLE
+            download.isEnabled = false
+            downloadRing.visibility = View.VISIBLE
+            downloadRing.progress = percent / 100f
+            downloadSlot.contentDescription = "Скачивается: $percent%"
+            downloadSlot.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_YES
+        } else {
+            downloadRing.visibility = View.GONE
+            download.visibility = View.VISIBLE
+            download.isEnabled = true
+            downloadSlot.contentDescription = null
+            downloadSlot.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_AUTO
+            activity.setIcon(download, if (saved) Symbol.CHECK_CIRCLE else Symbol.DOWNLOAD_CIRCLE,
+                if (saved) "Удалить загрузку" else "Скачать трек",
+                if (saved) Palette.accent else Palette.text)
+        }
+    }
+
+    fun updateSleepButton() {
+        val active = store.sleepTimer.value.active
+        activity.setIcon(sleepButton, Symbol.MOON,
+            if (active) "Таймер сна включён" else "Таймер сна",
+            if (active) Palette.accent else 0xd9ffffff.toInt())
     }
 
     fun progress() {
@@ -554,7 +591,7 @@ internal class PlayerPanel(private val activity: MainActivity) {
 
     private fun padLyrics() {
         val padding = if (timedLyrics) (lyricScroll.height / 2 - ui.dp(16)).coerceAtLeast(0) else ui.dp(16)
-        lyricScroll.setFadingEdgeLength((lyricScroll.height * .14f).toInt())
+        lyricScroll.setFadingEdgeLength((lyricScroll.height * .16f).toInt())
         lyricBody.setPadding(0, padding, 0, padding)
     }
 
@@ -749,6 +786,7 @@ internal class PlayerPanel(private val activity: MainActivity) {
             if (backdrop.cornerRadius != radius) {
                 backdrop.cornerRadius = radius
                 clipToOutline = radius > 0f
+                invalidateOutline()
             }
         }
 
@@ -938,15 +976,33 @@ internal class PlayerPanel(private val activity: MainActivity) {
     }
 
     private fun sleepTimer() {
-        val minutes = listOf(15, 30, 45, 60, -1, 0)
-        activity.choose("Таймер сна", listOf("15 минут", "30 минут", "45 минут", "1 час", "После этого трека", "Выключить")) { index ->
-            val args = Bundle().apply { putInt("minutes", minutes[index]) }
+        val current = store.sleepTimer.value
+        val title = when {
+            current.stopAtMs != null -> {
+                val time = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(current.stopAtMs))
+                "Таймер сна · до $time"
+            }
+            current.afterTrack -> "Таймер сна · после трека"
+            else -> "Таймер сна"
+        }
+        val options = mutableListOf(
+            "15 минут" to 15,
+            "30 минут" to 30,
+            "45 минут" to 45,
+            "1 час" to 60,
+            "После этого трека" to -1,
+        )
+        if (current.active) options += "Выключить" to 0
+        activity.choose(title, options.map { it.first }) { index ->
+            val value = options[index].second
+            val args = Bundle().apply { putInt("minutes", value) }
             player?.sendCustomCommand(SessionCommand(QueueItems.SLEEP, Bundle.EMPTY), args)
-            activity.toast(when (minutes[index]) { 0 -> "Таймер выключен"; -1 -> "Музыка остановится после трека"; else -> "Таймер запущен" })
+            activity.toast(when (value) { 0 -> "Таймер выключен"; -1 -> "Музыка остановится после трека"; else -> "Таймер запущен" })
         }
     }
 
     fun dismiss() {
+        bufferRing.buffering = false
         lyricJob?.cancel()
         scrollAnimator?.cancel()
         toneAnimator?.cancel()

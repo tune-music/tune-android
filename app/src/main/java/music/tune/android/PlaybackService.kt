@@ -60,6 +60,12 @@ internal object QueueItems {
     const val DISLIKE = "tune.track.dislike"
     private const val TRACK = "tune.track"
     private const val CONTEXT = "tune.context"
+    private val trackCache = object : LinkedHashMap<String, Track>(16, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Track>?) = size > 16
+    }
+    private val contextCache = object : LinkedHashMap<String, PlayContext>(16, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, PlayContext>?) = size > 16
+    }
 
     fun make(track: Track, source: PlayContext, uid: String? = null): MediaItem {
         val data = Bundle().apply {
@@ -74,16 +80,23 @@ internal object QueueItems {
         return builder.build()
     }
 
-    fun track(item: MediaItem?): Track? = item?.mediaMetadata?.extras?.getString(TRACK)?.let { raw ->
-        optional { Track.parse(JSONObject(raw)) }
+    fun track(item: MediaItem?): Track? {
+        val raw = item?.mediaMetadata?.extras?.getString(TRACK) ?: return null
+        synchronized(trackCache) { trackCache[raw] }?.let { return it }
+        return optional { Track.parse(JSONObject(raw)) }?.also { parsed ->
+            synchronized(trackCache) { trackCache[raw] = parsed }
+        }
     }
 
     fun context(item: MediaItem?): PlayContext {
         val raw = item?.mediaMetadata?.extras?.getString(CONTEXT) ?: return PlayContext()
-        return optional {
+        synchronized(contextCache) { contextCache[raw] }?.let { return it }
+        return (optional {
             val data = JSONObject(raw)
             PlayContext(data.text("kind") ?: "various", data.text("item"), data.text("name").orEmpty(), data.text("wave"))
-        } ?: PlayContext()
+        } ?: PlayContext()).also { parsed ->
+            synchronized(contextCache) { contextCache[raw] = parsed }
+        }
     }
 }
 
@@ -318,12 +331,28 @@ class PlaybackService : MediaLibraryService(), Player.Listener {
                 }
                 QueueItems.SLEEP -> {
                     sleep?.cancel()
+                    sleep = null
                     val minutes = args.getInt("minutes").coerceIn(-1, 180)
-                    sleepAtEnd = minutes == -1
-                    if (minutes > 0) sleep = scope.launch {
-                        delay(minutes * 60_000L)
-                        player.pause()
-                        store.message("Таймер сна остановил музыку")
+                    when {
+                        minutes == -1 -> {
+                            sleepAtEnd = true
+                            store.setSleepState(SleepState(afterTrack = true))
+                        }
+                        minutes > 0 -> {
+                            sleepAtEnd = false
+                            val delayMs = minutes * 60_000L
+                            store.setSleepState(SleepState(stopAtMs = System.currentTimeMillis() + delayMs))
+                            sleep = scope.launch {
+                                delay(delayMs)
+                                store.setSleepState(SleepState())
+                                player.pause()
+                                store.message("Таймер сна остановил музыку")
+                            }
+                        }
+                        else -> {
+                            sleepAtEnd = false
+                            store.setSleepState(SleepState())
+                        }
                     }
                 }
                 QueueItems.EXTEND_WAVE -> extendWave(play = true)
@@ -409,6 +438,7 @@ class PlaybackService : MediaLibraryService(), Player.Listener {
         finishListen(automatic)
         if (automatic && sleepAtEnd) {
             sleepAtEnd = false
+            store.setSleepState(SleepState())
             player.pause()
             store.message("Таймер сна остановил музыку")
         }
@@ -674,6 +704,7 @@ class PlaybackService : MediaLibraryService(), Player.Listener {
         finishListen(false)
         store.preferences.unregisterOnSharedPreferenceChangeListener(settingsListener)
         optional { connectivity.unregisterNetworkCallback(networkCallback) }
+        store.setSleepState(SleepState())
         crossfade?.release()
         scope.cancel()
         player.removeListener(this)

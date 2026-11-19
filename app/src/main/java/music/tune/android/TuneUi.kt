@@ -1,8 +1,5 @@
 package music.tune.android
 
-import android.animation.ObjectAnimator
-import android.animation.PropertyValuesHolder
-import android.animation.StateListAnimator
 import android.animation.ValueAnimator
 import android.content.Context
 import android.content.res.ColorStateList
@@ -13,11 +10,13 @@ import android.graphics.LinearGradient
 import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.Path
+import android.graphics.PixelFormat
 import android.graphics.RadialGradient
 import android.graphics.RectF
 import android.graphics.Shader
 import android.graphics.Typeface
 import android.graphics.drawable.BitmapDrawable
+import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
 import android.text.TextUtils
 import android.view.Gravity
@@ -108,7 +107,7 @@ internal class TuneUi(val context: Context, val palette: TuneColors = Palette) {
     fun art(uri: String?, size: Int, circle: Boolean = false, corner: Int = 10, backdrop: Boolean = true, tone: ((Int) -> Unit)? = null): CoverView =
         CoverView(context, tone, showPlaceholder = backdrop).apply {
             background = shape(if (backdrop) palette.lifted else Color.TRANSPARENT, if (circle) 500 else corner)
-            clipToOutline = true
+            clipToOutline = circle || corner > 0
             bind(uri, size)
         }
 
@@ -149,22 +148,76 @@ internal class TuneUi(val context: Context, val palette: TuneColors = Palette) {
 
 internal fun View.pressFeedback(scale: Float = .86f) {
     if (!ValueAnimator.areAnimatorsEnabled()) return
-    fun motion(target: Float, alphaTarget: Float?, time: Long, release: Boolean): ObjectAnimator {
-        val holders = mutableListOf(
-            PropertyValuesHolder.ofFloat(View.SCALE_X, target),
-            PropertyValuesHolder.ofFloat(View.SCALE_Y, target),
-        )
-        if (alphaTarget != null) holders.add(PropertyValuesHolder.ofFloat(View.ALPHA, alphaTarget))
-        return ObjectAnimator.ofPropertyValuesHolder(this, *holders.toTypedArray()).apply {
-            duration = time
-            interpolator = if (release) OvershootInterpolator(.85f) else DecelerateInterpolator()
+    foreground = PressFeedbackDrawable(this, scale)
+}
+
+private class PressFeedbackDrawable(
+    private val host: View,
+    private val pressedScale: Float,
+) : Drawable() {
+    private var wasPressed = false
+    private var releasing = false
+    private var restAlpha = 1f
+
+    override fun isStateful() = true
+
+    override fun onStateChange(state: IntArray): Boolean {
+        var pressed = false
+        var enabled = false
+        for (flag in state) {
+            when (flag) {
+                android.R.attr.state_pressed -> pressed = true
+                android.R.attr.state_enabled -> enabled = true
+            }
+        }
+        val active = pressed && enabled
+        if (active == wasPressed) return false
+        wasPressed = active
+        if (active) {
+            if (!releasing) restAlpha = host.alpha
+            releasing = false
+            host.animate().cancel()
+            host.animate()
+                .scaleX(pressedScale)
+                .scaleY(pressedScale)
+                .alpha(restAlpha * .75f)
+                .setDuration(95)
+                .setInterpolator(DecelerateInterpolator())
+                .withEndAction(null)
+                .start()
+        } else {
+            releasing = true
+            host.animate().cancel()
+            val anim = host.animate()
+                .scaleX(1f)
+                .scaleY(1f)
+                .setDuration(225)
+                .setInterpolator(OvershootInterpolator(.85f))
+                .withEndAction { releasing = false }
+            if (enabled) anim.alpha(restAlpha)
+            anim.start()
+        }
+        return false
+    }
+
+    override fun jumpToCurrentState() {
+        super.jumpToCurrentState()
+        if (wasPressed || releasing) {
+            host.animate().cancel()
+            host.scaleX = 1f
+            host.scaleY = 1f
+            if (host.isEnabled) host.alpha = restAlpha
+            wasPressed = false
+            releasing = false
         }
     }
-    stateListAnimator = StateListAnimator().apply {
-        addState(intArrayOf(android.R.attr.state_pressed, android.R.attr.state_enabled), motion(scale, .75f, 95, false))
-        addState(intArrayOf(android.R.attr.state_enabled), motion(1f, 1f, 225, true))
-        addState(intArrayOf(), motion(1f, null, 225, true))
-    }
+
+    override fun draw(canvas: Canvas) = Unit
+    override fun setAlpha(alpha: Int) = Unit
+    override fun setColorFilter(colorFilter: android.graphics.ColorFilter?) = Unit
+
+    @Deprecated("Deprecated in Java")
+    override fun getOpacity(): Int = PixelFormat.TRANSLUCENT
 }
 
 private object ButtonAccessibility : View.AccessibilityDelegate() {
@@ -567,9 +620,9 @@ internal class IconView(context: Context, var symbol: Symbol, var tint: Int) : V
     }
 }
 
-internal class WaveBackdrop(context: MainActivity, private val backgroundColor: Int) : View(context) {
-    private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
-    private val motion = context.playbackMotion
+internal class WaveBackdrop(private val activity: MainActivity, private val backgroundColor: Int) : View(activity) {
+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.DITHER_FLAG)
+    private val motion = activity.playbackMotion
     private val visibleBounds = android.graphics.Rect()
     private val density = resources.displayMetrics.density
     private val speeds = doubleArrayOf(0.69, 0.42, 0.53)
@@ -599,6 +652,10 @@ internal class WaveBackdrop(context: MainActivity, private val backgroundColor: 
             floatArrayOf(0f, .22f, .72f, 1f), Shader.TileMode.CLAMP) else null
     }
 
+    fun resumeIfPlaying() {
+        if (playing) invalidate()
+    }
+
     override fun onVisibilityAggregated(isVisible: Boolean) {
         super.onVisibilityAggregated(isVisible)
         lastFrame = null
@@ -606,7 +663,7 @@ internal class WaveBackdrop(context: MainActivity, private val backgroundColor: 
     }
 
     override fun onDraw(canvas: Canvas) {
-        val animated = playing && motion.enabled && isShown && windowVisibility == VISIBLE && getLocalVisibleRect(visibleBounds)
+        val animated = playing && motion.enabled && !activity.hasOverlay && isShown && windowVisibility == VISIBLE && getLocalVisibleRect(visibleBounds)
         if (animated) {
             val now = android.os.SystemClock.uptimeMillis()
             lastFrame?.let { phase += (now - it) / 1000.0 }
@@ -664,5 +721,120 @@ internal class PlayingBars(context: MainActivity, color: Int) : View(context) {
         val REST = doubleArrayOf(.45, .85, .6, .35)
         val SPEEDS = doubleArrayOf(2.4, 3.3, 2.8, 3.8)
         val PHASES = doubleArrayOf(0.0, 1.3, 2.2, .6)
+    }
+}
+
+internal class BufferRingView(private val activity: MainActivity) : View(activity) {
+    private val stroke = 3f * resources.displayMetrics.density
+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = 0xe6ffffff.toInt()
+        style = Paint.Style.STROKE
+        strokeWidth = stroke
+        strokeCap = Paint.Cap.ROUND
+    }
+    private val oval = RectF()
+    private var shown = false
+    private val showRing = Runnable {
+        if (!buffering || !isAttachedToWindow) return@Runnable
+        shown = true
+        visibility = VISIBLE
+        animate().cancel()
+        if (ValueAnimator.areAnimatorsEnabled()) {
+            alpha = 0f
+            animate().alpha(1f).setDuration(200).start()
+        } else alpha = 1f
+        invalidate()
+    }
+
+    init {
+        importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_NO
+        visibility = INVISIBLE
+        alpha = 0f
+        activity.playbackMotion.observe(this)
+    }
+
+    var buffering = false
+        set(value) {
+            if (field == value) return
+            field = value
+            removeCallbacks(showRing)
+            animate().cancel()
+            if (value) {
+                postDelayed(showRing, 600)
+            } else {
+                shown = false
+                if (ValueAnimator.areAnimatorsEnabled() && isAttachedToWindow) {
+                    animate().alpha(0f).setDuration(150).withEndAction {
+                        if (!buffering) visibility = INVISIBLE
+                    }.start()
+                } else {
+                    alpha = 0f
+                    visibility = INVISIBLE
+                }
+            }
+        }
+
+    override fun onSizeChanged(w: Int, h: Int, oldW: Int, oldH: Int) {
+        super.onSizeChanged(w, h, oldW, oldH)
+        val inset = stroke / 2f
+        oval.set(inset, inset, w - inset, h - inset)
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        if (!shown || oval.isEmpty) return
+        val angle = if (buffering && activity.playbackMotion.enabled) {
+            ((android.os.SystemClock.uptimeMillis() % 900L) / 900f) * 360f - 90f
+        } else -90f
+        canvas.drawArc(oval, angle, 108f, false, paint)
+        if (buffering && activity.playbackMotion.enabled && isShown && windowVisibility == VISIBLE) {
+            postInvalidateOnAnimation()
+        }
+    }
+
+    override fun onDetachedFromWindow() {
+        removeCallbacks(showRing)
+        animate().cancel()
+        super.onDetachedFromWindow()
+    }
+}
+
+internal class ProgressRingView(context: Context, trackColor: Int, progressColor: Int) : View(context) {
+    private val stroke = 2.5f * resources.displayMetrics.density
+    private val trackPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = trackColor
+        style = Paint.Style.STROKE
+        strokeWidth = stroke
+    }
+    private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = progressColor
+        style = Paint.Style.STROKE
+        strokeWidth = stroke
+        strokeCap = Paint.Cap.ROUND
+    }
+    private val oval = RectF()
+
+    init {
+        importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_NO
+    }
+
+    var progress = 0f
+        set(value) {
+            val clamped = value.coerceIn(0f, 1f)
+            if (field != clamped) {
+                field = clamped
+                invalidate()
+            }
+        }
+
+    override fun onSizeChanged(w: Int, h: Int, oldW: Int, oldH: Int) {
+        super.onSizeChanged(w, h, oldW, oldH)
+        val inset = stroke / 2f
+        oval.set(inset, inset, w - inset, h - inset)
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        if (oval.isEmpty) return
+        canvas.drawArc(oval, 0f, 360f, false, trackPaint)
+        canvas.drawArc(oval, -90f, progress.coerceIn(.04f, 1f) * 360f, false, fillPaint)
     }
 }
