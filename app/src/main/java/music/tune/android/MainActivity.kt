@@ -84,7 +84,8 @@ private class Route(val screen: Screen, var card: Card? = null, val shelf: Shelf
 private data class TrackListPosition(val index: Int, val offset: Int, val trackId: String?)
 private data class TrackList(val tracks: List<Track>, val context: PlayContext, val art: Symbol? = null)
 private enum class TrackOrder(val label: String) {
-    ORIGINAL("Исходный порядок"), TITLE("По названию"), ARTIST("По исполнителю"), RECENT("По дате добавления")
+    ORIGINAL("Как в списке"), TITLE("По названию"), ARTIST("По исполнителю"),
+    RECENT("Сначала новые"), OLDEST("Сначала старые")
 }
 
 private enum class SearchPagination { MORE, LOADING, RETRY }
@@ -907,7 +908,8 @@ class MainActivity : ComponentActivity(), Player.Listener {
             })
             Screen.ALBUMS, Screen.ARTISTS, Screen.PODCASTS, Screen.BOOKS -> addView(ui.icon(Symbol.SORT, "Сортировка") {
                 val choices = if (current.screen == Screen.ARTISTS) listOf("Недавние", "По названию") else listOf("Недавние", "По названию", "По исполнителю")
-                choose("Сортировка", choices) { order ->
+                val selected = store.preferences.getInt("collectionOrder:${current.screen.name}", 0).takeIf { it in choices.indices } ?: 0
+                choose("Сортировка", choices, selected) { order ->
                     store.preferences.edit().putInt("collectionOrder:${current.screen.name}", order).apply()
                     collection(current.screen)
                 }
@@ -1079,8 +1081,18 @@ class MainActivity : ComponentActivity(), Player.Listener {
         field.doAfterTextChanged { editable ->
             syncActions()
             val value = editable.toString()
-            searchDraft = value
             val query = value.trim()
+            val link = SHARED_LINK.find(query)?.value ?: TUNE_LINK.find(query)?.value
+            if (link != null) {
+                searchDraft = ""
+                searchText = ""
+                searchHints = null
+                field.text.clear()
+                hideKeyboard()
+                openLink(Uri.parse(link))
+                return@doAfterTextChanged
+            }
+            searchDraft = value
             if (query == searchText) return@doAfterTextChanged
             searchText = query
             searchPages.clear()
@@ -1804,7 +1816,15 @@ class MainActivity : ComponentActivity(), Player.Listener {
     private fun library() {
         val byName = store.preferences.getBoolean("playlistsByName", false)
         val sort = compareBy<Card, String>(java.text.Collator.getInstance(Locale.forLanguageTag("ru"))) { it.title }
-        val displayed = listOf(store.ownPlaylists.value, store.savedPlaylists.value).flatMap { if (byName) it.sortedWith(sort) else it }
+        fun playlistCards(items: List<Card>, own: Boolean) = (if (byName) items.sortedWith(sort) else items).map { card ->
+            val sub = if (own) {
+                if (card.trackCount > 0) trackCount(card.trackCount) else card.subtitle
+            } else {
+                if (card.trackCount > 0) "Добавлен · ${trackCount(card.trackCount)}" else "Добавлен в коллекцию"
+            }
+            card.copy(subtitle = sub)
+        }
+        val displayed = playlistCards(store.ownPlaylists.value, own = true) + playlistCards(store.savedPlaylists.value, own = false)
         val count = store.likes.value.size
         val downloaded = store.files.downloaded().size
         rows(buildList {
@@ -2280,7 +2300,8 @@ class MainActivity : ComponentActivity(), Player.Listener {
             TrackOrder.ORIGINAL -> filtered
             TrackOrder.TITLE -> filtered.sortedWith(compareBy(order) { it.title })
             TrackOrder.ARTIST -> filtered.sortedWith(compareBy(order) { it.artistText })
-            TrackOrder.RECENT -> filtered.sortedByDescending { it.addedAt ?: Long.MIN_VALUE }
+            TrackOrder.RECENT -> filtered.sortedWith(compareBy<Track> { it.addedAt == null }.thenByDescending { it.addedAt ?: Long.MIN_VALUE })
+            TrackOrder.OLDEST -> filtered.sortedWith(compareBy<Track> { it.addedAt == null }.thenBy { it.addedAt ?: Long.MAX_VALUE })
         }
     }
 
@@ -2350,8 +2371,9 @@ class MainActivity : ComponentActivity(), Player.Listener {
                 }
             })
             add(MenuAction("Сортировка · ${trackOrder.label}", Symbol.FILTER) {
-                val choices = TrackOrder.entries.filter { it != TrackOrder.RECENT || all.any { item -> item.addedAt != null } }
-                choose("Сортировка", choices.map { it.label }) { trackOrder = choices[it]; updateTrackFilter() }
+                val hasDates = all.any { item -> item.addedAt != null }
+                val choices = TrackOrder.entries.filter { it !in setOf(TrackOrder.RECENT, TrackOrder.OLDEST) || hasDates }
+                choose("Сортировка", choices.map { it.label }, choices.indexOf(trackOrder)) { trackOrder = choices[it]; updateTrackFilter() }
             })
             if (route.screen != Screen.DOWNLOADS) add(MenuAction(if (onlyDownloaded) "Показать все треки" else "Только скачанные", Symbol.DOWNLOAD) {
                 onlyDownloaded = !onlyDownloaded
@@ -3442,7 +3464,8 @@ class MainActivity : ComponentActivity(), Player.Listener {
             if (store.allowsAlternate(uid, track.id) && store.versions.hasAudio(track.id)) add("Без цензуры" to "alternate")
             if (store.files.hasReplacement(track)) add("Моя подмена" to "local")
         }
-        choose("Версия трека", options.map { (title, value) -> if (value == current) "$title ✓" else title }) { index ->
+        val selected = options.indexOfFirst { it.second == current }.takeIf { it >= 0 } ?: 0
+        choose("Версия трека", options.map { it.first }, selected) { index ->
             store.files.selectVersion(track, options[index].second)
             reloadVersion(track.id)
         }
@@ -3473,22 +3496,88 @@ class MainActivity : ComponentActivity(), Player.Listener {
         action {
             val uid = store.requireUser().uid
             val cards = store.online { playlists(uid) }
-            choose("Добавить в плейлист", listOf("Создать плейлист") + cards.map { it.title }) { index ->
-                if (index == 0) input("Новый плейлист", "", "Название") { title ->
-                    action {
-                        val card = store.online { createPlaylist(uid, title) }
-                        store.changeLocalPlaylist(card)
-                        store.online { editPlaylist(card, tracks) }
-                        toast("Добавлено в «${card.title}»")
-                        done()
+            val dark = playerPanel != null
+            val style = if (dark) TuneUi(this) else ui
+            val body = style.column()
+            val sheet = bottomSheet(body, dark = dark, scrollContent = false)
+            body.addView(FrameLayout(this).apply {
+                val heading = if (tracks.size == 1) "Добавить в плейлист" else "Добавить в плейлист: ${tracks.size}"
+                addView(style.line(heading, 17, bold = true).apply { gravity = Gravity.CENTER },
+                    FrameLayout.LayoutParams(-1, -1).apply { marginStart = style.dp(80); marginEnd = style.dp(80) })
+                addView(style.line("Отмена", 16, style.palette.accentText, bold = true).apply {
+                    gravity = Gravity.CENTER
+                    setPadding(style.dp(14), 0, style.dp(14), 0)
+                    background = style.touch()
+                    isFocusable = true
+                    pressFeedback(.94f)
+                    setOnClickListener { sheet.dismiss() }
+                }, FrameLayout.LayoutParams(-2, -1, Gravity.END).apply { marginEnd = style.dp(4) })
+            }, style.full(52))
+            val rows = style.column().apply { setPadding(0, style.dp(4), 0, style.dp(12)) }
+            rows.addView(style.row().apply {
+                setPadding(style.dp(16), style.dp(8), style.dp(16), style.dp(8))
+                background = style.touch()
+                isFocusable = true
+                pressFeedback(.96f)
+                addView(IconView(this@MainActivity, Symbol.ADD, Color.BLACK).apply {
+                    iconSize = 20
+                    background = style.shape(style.palette.accent, 10)
+                }, LinearLayout.LayoutParams(style.dp(50), style.dp(50)))
+                addView(style.line("Новый плейлист", 16, bold = true).apply {
+                    setPadding(style.dp(12), 0, 0, 0)
+                }, style.weight())
+                setOnClickListener {
+                    sheet.dismiss()
+                    input("Новый плейлист", "", "Название") { title ->
+                        action {
+                            val card = store.online { createPlaylist(uid, title) }
+                            store.changeLocalPlaylist(card)
+                            store.online { editPlaylist(card, tracks) }
+                            toast("Добавлено в «${card.title}»")
+                            done()
+                        }
                     }
-                } else action {
-                    val card = cards[index - 1]
-                    store.online { editPlaylist(card, tracks) }
-                    toast("Добавлено в «${card.title}»")
-                    done()
                 }
+            }, style.full())
+            cards.forEach { card ->
+                val sub = if (card.trackCount > 0) trackCount(card.trackCount) else card.subtitle.ifBlank { "Плейлист" }
+                rows.addView(style.row().apply {
+                    setPadding(style.dp(16), style.dp(8), style.dp(16), style.dp(8))
+                    background = style.touch()
+                    isFocusable = true
+                    pressFeedback(.96f)
+                    addView(style.art(card.cover, 120, corner = 10), LinearLayout.LayoutParams(style.dp(50), style.dp(50)))
+                    addView(style.column().apply {
+                        setPadding(style.dp(12), 0, 0, 0)
+                        addView(style.line(card.title, 16, bold = true))
+                        addView(style.space(3))
+                        addView(style.line(sub, 14, style.palette.muted))
+                    }, style.weight())
+                    setOnClickListener {
+                        sheet.dismiss()
+                        action {
+                            store.online { editPlaylist(card, tracks) }
+                            toast("Добавлено в «${card.title}»")
+                            done()
+                        }
+                    }
+                }, style.full())
             }
+            val scroller = ScrollView(this).apply {
+                isVerticalScrollBarEnabled = false
+                overScrollMode = View.OVER_SCROLL_NEVER
+                addView(rows, FrameLayout.LayoutParams(-1, -2))
+            }
+            body.addView(scroller, LinearLayout.LayoutParams(-1, 0, 1f))
+            val usable = android.graphics.Rect().also(window.decorView::getWindowVisibleDisplayFrame)
+            rows.measure(
+                View.MeasureSpec.makeMeasureSpec(usable.width().coerceAtLeast(style.dp(320)), View.MeasureSpec.EXACTLY),
+                View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
+            )
+            val sheetHeight = minOf(style.dp(52) + rows.measuredHeight, (usable.height() * .74f).toInt()).coerceAtLeast(style.dp(160))
+            sheet.window?.setWindowAnimations(R.style.TuneSheetAnimation)
+            sheet.show()
+            sheet.window?.setLayout(-1, sheetHeight)
         }
     }
 
@@ -3723,8 +3812,10 @@ class MainActivity : ComponentActivity(), Player.Listener {
     private fun changes() {
         rows(listOf(
             heading("Tune ${BuildConfig.VERSION_NAME}"),
-            note("Обновлены экраны «Статистика», «Занятое место», «Устройства» и «Подмена» — карточки, сводные плитки, нумерация любимых треков и очистка статистики в панели сверху."),
+            note("В «Очереди» плеера добавлен режим «Изменить» для перестановки и удаления треков, а окно добавления в плейлист теперь показывает обложки и число треков."),
+            note("Добавлены сортировка «Сначала старые», галочки текущего выбора в списках, автооткрытие ссылок из поиска и подписи числа треков у плейлистов в коллекции."),
             heading("В прошлых версиях"),
+            note("Обновлены экраны «Статистика», «Занятое место», «Устройства» и «Подмена» — карточки, сводные плитки, нумерация любимых треков и очистка статистики в панели сверху."),
             note("Убраны подвисания на главной при прокрутке и переключении вкладок, сглажен градиент без полос в плеере и шапках страниц."),
             note("В плеере появились кольца буферизации и прогресса загрузки, активная подсветка таймера сна, компактные уведомления вместо системных тостов, исправлен скачок клавиатуры в поле зеркала LRCLIB и выровнены мелочи в коллекции, поиске и мини-плеере."),
             note("Полноэкранный плеер и клипы растянуты на весь экран без чёрных полос. Обновлены значки разделов, плавный скролл текста песни, перелистывание обложек свайпом и кроссфейд между треками."),
@@ -4766,6 +4857,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
         private val CONCERT_CITY_BUTTON = View.generateViewId()
         private val ROOM_ID = Regex("[a-zA-Z0-9_-]{1,150}")
         private val SHARED_LINK = Regex("""https://music\.yandex\.(?:ru|com|kz)/[^\s<>"»]+""")
+        private val TUNE_LINK = Regex("""tune://[^\s<>"»]+""")
         private val FILTERS = listOf("Всё" to "track,album,artist,playlist,podcast,podcast_episode", "Треки" to "track",
             "Исполнители" to "artist", "Альбомы" to "album", "Плейлисты" to "playlist",
             "Подкасты" to "podcast", "По тексту" to "lyrics")

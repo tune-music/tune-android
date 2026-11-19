@@ -111,6 +111,7 @@ internal data class Card(
     val eventDate: String? = null,
     val clipPlayerId: String? = null,
     val color: String? = null,
+    val trackCount: Int = 0,
 ) {
     val key get() = "${kind.name}:${owner.orEmpty()}:$id"
     val isPodcast get() = kind == Kind.ALBUM && releaseType == "podcast"
@@ -127,7 +128,7 @@ internal data class Card(
 
     fun cached() = stored().put("kind", kind.name).put("owner", owner)
         .put("seeds", JSONArray(seeds)).put("link", link).put("eventDate", eventDate)
-        .put("clipPlayerId", clipPlayerId).put("color", color)
+        .put("clipPlayerId", clipPlayerId).put("color", color).put("trackCount", trackCount)
 
     companion object {
         fun fromCache(data: JSONObject): Card? {
@@ -136,7 +137,7 @@ internal data class Card(
             val title = data.text("title") ?: return null
             return Card(kind, id, title, data.text("subtitle").orEmpty(), data.text("coverUri"),
                 data.text("owner"), data.arr("seeds").items().mapNotNull(Any?::asId), data.text("link"), data.text("type"),
-                data.text("eventDate"), data.text("clipPlayerId"), data.text("color"))
+                data.text("eventDate"), data.text("clipPlayerId"), data.text("color"), data.optInt("trackCount", 0))
         }
 
         fun album(value: JSONObject, requireTitle: Boolean = true): Card? {
@@ -161,7 +162,8 @@ internal data class Card(
             val owner = value.obj("owner").text("uid") ?: value.text("uid") ?: fallbackOwner ?: return null
             val cover = value.obj("cover")
             return Card(Kind.PLAYLIST, id, title, value.obj("owner").text("name") ?: "Плейлист",
-                cover.text("uri") ?: cover.arr("itemsUri").opt(0).asId() ?: value.text("ogImage"), owner)
+                cover.text("uri") ?: cover.arr("itemsUri").opt(0).asId() ?: value.text("ogImage"), owner,
+                trackCount = value.optInt("trackCount", 0))
         }
 
         fun wave(value: JSONObject): Card? {

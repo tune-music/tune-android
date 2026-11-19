@@ -124,7 +124,10 @@ internal fun MainActivity.trackActionsSheet(track: Track, actions: List<MenuActi
             addView(dark.line(track.artistText, 14, Palette.muted))
         }, dark.weight())
     }, dark.full())
-    actions.forEach { action ->
+    actions.forEachIndexed { index, action ->
+        if (action.destructive && index > 0 && !actions[index - 1].destructive) {
+            body.addView(dark.divider(), dark.full(1).apply { marginStart = dark.dp(20) })
+        }
         body.addView(dark.actionRow(action, sheet = true) { sheet.dismiss(); action.run() }, dark.full())
     }
     body.addView(dark.space(14))

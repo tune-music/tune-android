@@ -829,8 +829,10 @@ internal class PlayerPanel(private val activity: MainActivity) {
             selector = ColorDrawable(Color.TRANSPARENT)
             overScrollMode = View.OVER_SCROLL_NEVER
         }
+        var editing = false
         var syncQueueActions: () -> Unit = {}
-        val adapter = object : BaseAdapter() {
+        lateinit var adapter: BaseAdapter
+        adapter = object : BaseAdapter() {
             override fun notifyDataSetChanged() {
                 super.notifyDataSetChanged()
                 syncQueueActions()
@@ -843,22 +845,43 @@ internal class PlayerPanel(private val activity: MainActivity) {
                 val current = position == player.currentMediaItemIndex
                 val row = ui.row().apply {
                     minimumHeight = ui.dp(58)
-                    setPadding(ui.dp(16), 0, ui.dp(4), 0)
+                    setPadding(ui.dp(16), 0, ui.dp(if (editing) 8 else 14), 0)
                     background = ui.touch()
-                    addView(ui.art(track.cover, 100), LinearLayout.LayoutParams(ui.dp(42), ui.dp(42)))
+                    addView(ui.art(track.cover, 100, corner = 8), LinearLayout.LayoutParams(ui.dp(46), ui.dp(46)))
                     addView(ui.column().apply {
-                        setPadding(ui.dp(10), 0, 0, 0)
-                        addView(TrackTitle(ui, 15, badgeSize = 13, onDark = true).apply {
+                        setPadding(ui.dp(12), 0, ui.dp(6), 0)
+                        addView(TrackTitle(ui, 16, badgeSize = 13, onDark = true).apply {
                             bind(track)
                             label.setTextColor(if (current) Palette.accent else Palette.text)
                         }, ui.full())
-                        addView(ui.space(3)); addView(ui.line(track.artistText, 12, Palette.muted))
+                        addView(ui.space(3)); addView(ui.line(track.artistText, 14, Palette.muted))
                     }, ui.weight())
-                    if (current) addView(PlayingBars(activity, Palette.accent).apply { running = player.isPlaying },
-                        LinearLayout.LayoutParams(ui.dp(18), ui.dp(18)).apply { marginStart = ui.dp(6); marginEnd = ui.dp(4) })
-                    addView(ui.icon(Symbol.MORE, "Действия с треком") { queueMenu(position) })
-                    setOnClickListener { player.seekToDefaultPosition(position); player.play() }
-                    setOnLongClickListener { queueMenu(position); true }
+                    if (editing) {
+                        if (position > 0) addView(ui.icon(Symbol.ARROW_UP, "Переместить выше", Palette.muted) {
+                            if (position in 1 until player.mediaItemCount) {
+                                player.moveMediaItem(position, position - 1)
+                                adapter.notifyDataSetChanged()
+                            }
+                        }.apply { iconSize = 16 }, LinearLayout.LayoutParams(ui.dp(34), ui.dp(40)))
+                        if (position < player.mediaItemCount - 1) addView(ui.icon(Symbol.ARROW_DOWN, "Переместить ниже", Palette.muted) {
+                            if (position in 0 until player.mediaItemCount - 1) {
+                                player.moveMediaItem(position, position + 1)
+                                adapter.notifyDataSetChanged()
+                            }
+                        }.apply { iconSize = 16 }, LinearLayout.LayoutParams(ui.dp(34), ui.dp(40)))
+                        if (!current) addView(ui.icon(Symbol.MINUS_CIRCLE, "Убрать из очереди", 0xffff6a65.toInt()) {
+                            if (position in 0 until player.mediaItemCount && position != player.currentMediaItemIndex) {
+                                player.removeMediaItem(position)
+                                adapter.notifyDataSetChanged()
+                            }
+                        }.apply { iconSize = 18 }, LinearLayout.LayoutParams(ui.dp(36), ui.dp(40)))
+                        else addView(View(activity), LinearLayout.LayoutParams(ui.dp(36), ui.dp(40)))
+                    } else {
+                        if (current) addView(PlayingBars(activity, Palette.accent).apply { running = player.isPlaying },
+                            LinearLayout.LayoutParams(ui.dp(18), ui.dp(18)).apply { marginStart = ui.dp(6) })
+                        setOnClickListener { player.seekToDefaultPosition(position); player.play() }
+                        setOnLongClickListener { queueMenu(position); true }
+                    }
                 }
                 if (position < player.currentMediaItemIndex) row.alpha = .5f
                 if (position != player.currentMediaItemIndex + 1) return row
@@ -876,12 +899,27 @@ internal class PlayerPanel(private val activity: MainActivity) {
         list.adapter = adapter
         val height = minOf(380, activity.resources.configuration.screenHeightDp - 200).coerceAtLeast(140)
         val sheet = activity.bottomSheet(body, dark = true)
-        body.addView(ui.row().apply {
-            setPadding(ui.dp(16), 0, ui.dp(6), 0)
-            addView(ui.text("Очередь", 22, bold = true), ui.weight())
-            addView(ui.icon(Symbol.MORE, "Действия с очередью") { queueActions() })
-            addView(ui.icon(Symbol.CLOSE, "Закрыть") { sheet.dismiss() })
-        }, ui.full(55))
+        val queueTitle = QueueItems.context(player.currentMediaItem).name.ifBlank { "Очередь" }
+        val editButton = ui.line("Изменить", 15, Palette.text, bold = true).apply {
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(ui.dp(16), 0, ui.dp(12), 0)
+            background = ui.touch()
+            isFocusable = true
+            pressFeedback(.94f)
+            setOnClickListener {
+                editing = !editing
+                text = if (editing) "Готово" else "Изменить"
+                setTextColor(if (editing) Palette.accent else Palette.text)
+                adapter.notifyDataSetChanged()
+            }
+        }
+        body.addView(FrameLayout(activity).apply {
+            addView(ui.line(queueTitle, 17, bold = true).apply { gravity = Gravity.CENTER },
+                FrameLayout.LayoutParams(-1, -1).apply { marginStart = ui.dp(92); marginEnd = ui.dp(92) })
+            addView(editButton, FrameLayout.LayoutParams(-2, -1, Gravity.START))
+            addView(ui.icon(Symbol.CLOSE, "Закрыть") { sheet.dismiss() },
+                FrameLayout.LayoutParams(ui.dp(48), -1, Gravity.END).apply { marginEnd = ui.dp(4) })
+        }, ui.full(52))
         body.addView(list, ui.full(height))
         fun queuePill(symbol: Symbol, title: String, click: () -> Unit) = ui.row().apply {
             gravity = Gravity.CENTER
@@ -927,7 +965,7 @@ internal class PlayerPanel(private val activity: MainActivity) {
         sheet.show()
         sheet.window?.setLayout(-1, -2)
         dialog = sheet
-        list.setSelection((player.currentMediaItemIndex - 1).coerceAtLeast(0))
+        list.setSelectionFromTop(player.currentMediaItemIndex.coerceAtLeast(0), (ui.dp(height) / 2 - ui.dp(29)).coerceAtLeast(0))
         sheet.setOnDismissListener {
             queueAdapter = null
             if (dialog == sheet) dialog = null
@@ -941,8 +979,9 @@ internal class PlayerPanel(private val activity: MainActivity) {
         val commands = buildList<Pair<String, Int?>> {
             if (position > 0) add("Выше" to position - 1)
             if (position < player.mediaItemCount - 1) add("Ниже" to position + 1)
-            add("Убрать из очереди" to null)
+            if (position != player.currentMediaItemIndex) add("Убрать из очереди" to null)
         }
+        if (commands.isEmpty()) return
         activity.choose(track.title, commands.map { it.first }) { index ->
             if (position !in 0 until player.mediaItemCount || player.getMediaItemAt(position).mediaId != track.id) {
                 activity.toast("Очередь обновилась")
@@ -951,27 +990,6 @@ internal class PlayerPanel(private val activity: MainActivity) {
             val target = commands[index].second
             if (target == null) player.removeMediaItem(position)
             else if (target in 0 until player.mediaItemCount) player.moveMediaItem(position, target)
-        }
-    }
-
-    private fun queueActions() {
-        val player = player ?: return
-        activity.choose("Очередь", listOf("Сохранить как плейлист", "Очистить после текущего трека")) { index ->
-            if (index == 0) {
-                val tracks = (0 until player.mediaItemCount).mapNotNull { QueueItems.track(player.getMediaItemAt(it)) }
-                activity.input("Сохранить очередь", "", "Название плейлиста") { title ->
-                    activity.action {
-                        val uid = store.requireUser().uid
-                        val playlist = store.online { createPlaylist(uid, title) }
-                        store.changeLocalPlaylist(playlist)
-                        store.online { editPlaylist(playlist, tracks) }
-                        activity.toast("Очередь сохранена")
-                    }
-                }
-            } else {
-                val from = player.currentMediaItemIndex + 1
-                if (from < player.mediaItemCount) player.removeMediaItems(from, player.mediaItemCount)
-            }
         }
     }
 

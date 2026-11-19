@@ -145,7 +145,10 @@ internal class SoundSheet(private val activity: MainActivity) {
         ui.row().apply {
             minimumHeight = ui.dp(48)
             setPadding(ui.dp(16), 0, ui.dp(16), 0)
-            val value = ui.line(format(level.coerceIn(min, max)), 14, ui.palette.muted).apply { gravity = Gravity.END }
+            val value = ui.line(format(level.coerceIn(min, max)), 14, ui.palette.muted).apply {
+                gravity = Gravity.END
+                fontFeatureSettings = "tnum"
+            }
             addView(ui.text(title, 15), LinearLayout.LayoutParams(ui.dp(78), -2))
             addView(SeekBar(activity).apply {
                 this.max = max - min
