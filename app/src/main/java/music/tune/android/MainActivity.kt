@@ -1399,9 +1399,31 @@ class MainActivity : ComponentActivity(), Player.Listener {
                     addView(ui.text(title, 19, bold = true).apply { maxLines = 2; ellipsize = android.text.TextUtils.TruncateAt.END })
                     addView(ui.space(4)); addView(ui.line(subtitle, 14, ui.palette.muted))
                 }, ui.weight())
-                if (track != null) addView(ui.icon(Symbol.PLAY, "Воспроизвести", Color.BLACK, open).apply {
-                    background = ui.touch(ui.palette.accent, 30)
-                })
+                if (track != null) {
+                    val icon = ui.icon(Symbol.PLAY, "Воспроизвести", Color.BLACK) {
+                        if (currentTrack()?.id == track.id) toggle() else open()
+                    }.apply { iconSize = 15 }
+                    val bars = PlayingBars(this@MainActivity, Color.BLACK)
+                    addView(FrameLayout(this@MainActivity).apply {
+                        background = ui.touch(ui.palette.accent, 19)
+                        pressFeedback(.92f)
+                        isFocusable = true
+                        addView(icon, FrameLayout.LayoutParams(-1, -1))
+                        addView(bars, FrameLayout.LayoutParams(ui.dp(16), ui.dp(16), Gravity.CENTER))
+                        setOnClickListener { if (currentTrack()?.id == track.id) toggle() else open() }
+                        observePlayback {
+                            val active = currentTrack()?.id == track.id && controller?.isPlaying == true
+                            icon.visibility = if (active) View.GONE else View.VISIBLE
+                            bars.visibility = if (active) View.VISIBLE else View.GONE
+                            bars.running = active
+                        }
+                    }, LinearLayout.LayoutParams(ui.dp(38), ui.dp(38)))
+                } else {
+                    addView(IconView(this@MainActivity, Symbol.BACK, ui.palette.muted).apply {
+                        rotation = 180f
+                        iconSize = 14
+                    }, LinearLayout.LayoutParams(ui.dp(24), ui.dp(38)))
+                }
                 setOnClickListener { open() }
                 isFocusable = true
             }, ui.full())
@@ -2048,6 +2070,17 @@ class MainActivity : ComponentActivity(), Player.Listener {
                         }
                         start += count
                     }
+                    add(Row.Layout {
+                        ui.column().apply {
+                            setPadding(ui.dp(16), ui.dp(14), ui.dp(16), ui.dp(6))
+                            page.description?.takeIf(String::isNotBlank)?.let { label ->
+                                addView(ui.text(label, 13, ui.palette.muted))
+                                addView(ui.space(4))
+                            }
+                            addView(ui.text("${trackCount(page.tracks.size)} · ${durationSummary(page.tracks.sumOf { it.duration })}",
+                                13, ui.palette.muted))
+                        }
+                    })
                 } else addAll(trackRows(displayed, context, owned))
             } else if (page.card.kind != Kind.ARTIST) add(Row.Layout {
                 val ownPlaylist = page.card.kind == Kind.PLAYLIST && page.card.owner == userId
@@ -2071,9 +2104,42 @@ class MainActivity : ComponentActivity(), Player.Listener {
                     add(shelfRow(shelf.cards))
                 }
             }
-            if (page.card.kind == Kind.ARTIST) page.description?.takeIf(String::isNotBlank)?.let {
+            if (page.card.kind == Kind.ARTIST) page.description?.takeIf(String::isNotBlank)?.let { about ->
                 add(heading("Об исполнителе"))
-                add(note(it))
+                add(Row.Layout {
+                    var expanded = false
+                    lateinit var bio: TextView
+                    lateinit var more: TextView
+                    ui.column().apply {
+                        setPadding(ui.dp(16), ui.dp(4), ui.dp(16), ui.dp(14))
+                        bio = ui.text(about, 15, ColorUtils.setAlphaComponent(ui.palette.text, 196)).apply {
+                            maxLines = 3
+                            ellipsize = android.text.TextUtils.TruncateAt.END
+                            setLineSpacing(ui.dp(2).toFloat(), 1f)
+                        }
+                        more = ui.text("Читать дальше", 15, ui.palette.accentText, bold = true).apply {
+                            setPadding(0, ui.dp(8), 0, 0)
+                            visibility = View.GONE
+                        }
+                        addView(bio, ui.full())
+                        addView(more)
+                        bio.post {
+                            val truncated = bio.layout?.let { layout ->
+                                layout.lineCount > 0 && layout.getEllipsisCount(layout.lineCount - 1) > 0
+                            } == true
+                            if (truncated && !expanded) more.visibility = View.VISIBLE
+                        }
+                        background = ui.touch()
+                        setOnClickListener {
+                            if (more.visibility != View.VISIBLE && !expanded) return@setOnClickListener
+                            expanded = !expanded
+                            bio.maxLines = if (expanded) Int.MAX_VALUE else 3
+                            bio.ellipsize = if (expanded) null else android.text.TextUtils.TruncateAt.END
+                            more.text = if (expanded) "Свернуть" else "Читать дальше"
+                            more.visibility = View.VISIBLE
+                        }
+                    }
+                })
             }
         }
     }
@@ -2087,7 +2153,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
         setPadding(ui.dp(16), ui.dp(10), ui.dp(16), ui.dp(12))
         val size = minOf(if (artist) 190 else 220, resources.configuration.screenWidthDp - 60).coerceAtLeast(100)
         addView(ui.art(card.cover, 800, artist, 18) { tone ->
-            val top = if (ui.palette.light) androidx.core.graphics.ColorUtils.blendARGB(tone, ui.palette.background, .70f) else tone
+            val top = if (ui.palette.light) ColorUtils.blendARGB(tone, ui.palette.background, .70f) else tone
             gradient.setColors(top, ui.palette.background)
             if (route.card?.key == card.key) {
                 detailTone = top
@@ -2124,17 +2190,26 @@ class MainActivity : ComponentActivity(), Player.Listener {
         })
         if (card.kind != Kind.PLAYLIST && card.subtitle.isNotBlank()) {
             addView(ui.space(6))
-            addView(ui.text(card.subtitle, 15, ui.palette.muted, bold = true).apply { gravity = Gravity.CENTER })
+            val mainArtist = if (card.kind == Kind.ALBUM) {
+                page.tracks.firstOrNull()?.artists?.firstOrNull { it.id.isNotBlank() && card.subtitle.contains(it.title, ignoreCase = true) }
+            } else null
+            addView(ui.text(card.subtitle, 15, ui.palette.muted, bold = true).apply {
+                gravity = Gravity.CENTER
+                if (mainArtist != null) {
+                    background = ui.touch()
+                    pressFeedback(.96f)
+                    setOnClickListener { openCard(mainArtist) }
+                }
+            })
         }
         if (!artist && context == null) {
             addView(ui.space(6))
             addView(ui.loadingShape(), LinearLayout.LayoutParams(ui.dp(102), ui.dp(13)))
         } else if (!artist && page.tracks.isNotEmpty()) {
-            val minutes = page.tracks.sumOf { it.duration } / 60_000L
             val parts = buildList {
                 if (card.kind == Kind.PLAYLIST && card.owner != userId && card.subtitle.isNotBlank() && card.subtitle != "Плейлист") add(card.subtitle)
                 add(trackCount(page.tracks.size, episodes = card.isPodcast))
-                if (card.kind != Kind.ALBUM) add(if (minutes >= 60) "${minutes / 60} ч ${minutes % 60} мин" else "$minutes мин")
+                if (card.kind != Kind.ALBUM) add(durationSummary(page.tracks.sumOf { it.duration }))
             }
             addView(ui.space(6))
             addView(ui.text(parts.joinToString(" · "), 13, ui.palette.muted).apply { gravity = Gravity.CENTER })
@@ -2633,6 +2708,11 @@ class MainActivity : ComponentActivity(), Player.Listener {
             1 -> one; in 2..4 -> few; else -> many
         }
         return "$count $noun"
+    }
+
+    private fun durationSummary(durationMs: Long): String {
+        val minutes = (durationMs / 60_000L).coerceAtLeast(0L)
+        return if (minutes >= 60) "${minutes / 60} ч ${minutes % 60} мин" else "$minutes мин"
     }
 
     private fun trackCount(count: Int, episodes: Boolean = false): String =
@@ -3812,9 +3892,10 @@ class MainActivity : ComponentActivity(), Player.Listener {
     private fun changes() {
         rows(listOf(
             heading("Tune ${BuildConfig.VERSION_NAME}"),
+            note("На страницах альбомов появились подпись лейбла и общая длительность, биография исполнителя сворачивается в 3 строки с кнопкой «Читать дальше», имя артиста в шапке альбома кликабельно, а в «Лучшем результате» поиска видны живые столбцы воспроизведения."),
+            heading("В прошлых версиях"),
             note("В «Очереди» плеера добавлен режим «Изменить» для перестановки и удаления треков, а окно добавления в плейлист теперь показывает обложки и число треков."),
             note("Добавлены сортировка «Сначала старые», галочки текущего выбора в списках, автооткрытие ссылок из поиска и подписи числа треков у плейлистов в коллекции."),
-            heading("В прошлых версиях"),
             note("Обновлены экраны «Статистика», «Занятое место», «Устройства» и «Подмена» — карточки, сводные плитки, нумерация любимых треков и очистка статистики в панели сверху."),
             note("Убраны подвисания на главной при прокрутке и переключении вкладок, сглажен градиент без полос в плеере и шапках страниц."),
             note("В плеере появились кольца буферизации и прогресса загрузки, активная подсветка таймера сна, компактные уведомления вместо системных тостов, исправлен скачок клавиатуры в поле зеркала LRCLIB и выровнены мелочи в коллекции, поиске и мини-плеере."),
@@ -4286,8 +4367,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
                         "Статистика копится на этом устройстве: послушайте что-нибудь, и здесь появятся любимые треки и исполнители.")
                 })
             } else {
-                val minutes = data.duration / 60_000
-                val listenedText = if (minutes >= 60) "${minutes / 60} ч ${minutes % 60} мин" else "$minutes мин"
+                val listenedText = durationSummary(data.duration)
                 val playsWord = plural(data.count, "прослушивание", "прослушивания", "прослушиваний").substringAfter(' ')
                 val artistsText = "${data.artists.size}${if (data.artists.size >= 12) "+" else ""}"
                 add(Row.Layout {
