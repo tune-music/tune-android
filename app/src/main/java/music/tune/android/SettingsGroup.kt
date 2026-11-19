@@ -29,14 +29,18 @@ internal class SettingsGroup(private val ui: TuneUi, title: String, footer: Stri
     }
 
     fun line(title: String, value: String = "", icon: Symbol? = null, color: Int = ui.palette.text,
-             chevron: Boolean = false, enabled: Boolean = true, click: (() -> Unit)? = null) = add(lineView().apply {
+             chevron: Boolean = false, checked: Boolean = false, enabled: Boolean = true, click: (() -> Unit)? = null) = add(lineView().apply {
         icon?.let { addView(IconView(ui.context, it, color), LinearLayout.LayoutParams(ui.dp(24), ui.dp(24)).apply {
             marginEnd = ui.dp(10)
         }) }
         addView(ui.text(title, 16, if (enabled) color else ui.palette.muted), ui.weight())
         if (value.isNotBlank()) addView(ui.text(value, 15, ui.palette.muted).apply {
+            fontFeatureSettings = "tnum"
             setPadding(ui.dp(8), 0, 0, 0)
         })
+        if (checked) addView(IconView(ui.context, Symbol.CHECK, ui.palette.accentText).apply {
+            iconSize = 16
+        }, LinearLayout.LayoutParams(ui.dp(20), ui.dp(20)).apply { marginStart = ui.dp(6) })
         if (chevron) addView(IconView(ui.context, Symbol.BACK, ui.palette.muted).apply {
             rotation = 180f
             iconSize = 13

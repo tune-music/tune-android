@@ -68,7 +68,7 @@ private enum class Screen(val label: String) {
     HISTORY("История"), DOWNLOADS("Скачанные треки"), ALBUMS("Альбомы"), ARTISTS("Исполнители"),
     SETTINGS("Настройки"), DETAILS(""), ARTIST_TRACKS("Все треки"), SHELF(""), CLIPS("Клипы"), CONCERTS("Концерты"),
     WAVE_ROOMS("Моя волна на двоих"), STATIONS("Все волны"), KIDS("Детям"), STATS("Статистика"), DEVICES("Устройства"),
-    PODCASTS("Подкасты"), BOOKS("Аудиокниги"), HIDDEN_ARTISTS("Скрытые исполнители"), STORAGE("Хранилище"),
+    PODCASTS("Подкасты"), BOOKS("Аудиокниги"), HIDDEN_ARTISTS("Скрытые исполнители"), STORAGE("Занятое место"),
     REPLACEMENT("Подмена"), ARTIST_COLLECTION("У вас в коллекции"), ARTIST_WAVE("Слушали в Волне"),
     CHANGES("Что нового"), ERROR_LOG("Журнал ошибок")
 }
@@ -221,6 +221,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
     private var mediaPickerPlaylist: Card? = null
     private var coverPickerTarget: ReplacementTarget? = null
     private var statsDays: Int? = 30
+    private var statsClearButton: IconView? = null
     private var reduceAi: Boolean? = null
     private var updateCheck: Job? = null
     private var lastUpdateCheck = 0L
@@ -752,6 +753,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
     private fun render() {
         saveSearchPosition()
         saveTrackPage()
+        val previousScreen = displayedRoute?.screen
         val current = route
         displayedRoute = current
         restorePosition = current.position
@@ -779,8 +781,9 @@ class MainActivity : ComponentActivity(), Player.Listener {
         detailToolbar = null
         detailTone = null
         detailChrome = Color.TRANSPARENT
+        statsClearButton = null
         loginView = null
-        if (displayedRoute?.screen == Screen.SETTINGS) {
+        if (previousScreen == Screen.SETTINGS) {
             lyricsMirrorField?.let { field -> saveLyricsMirror(field, quiet = true) }
             hideKeyboard()
         }
@@ -939,6 +942,15 @@ class MainActivity : ComponentActivity(), Player.Listener {
                 addView(ui.icon(Symbol.SEARCH, "Поиск в списке", click = ::showTrackFilter))
                 addView(menuButton { anchor -> trackListMenu(anchor = anchor) })
             }
+            Screen.STATS -> addView(ui.icon(Symbol.TRASH, "Очистить статистику") {
+                confirm("Очистить статистику?", "Очистить", "Она хранится только на этом устройстве, вернуть её не получится.") {
+                    action { userId?.let { store.listening.clear(it) }; stats() }
+                }
+            }.apply {
+                isEnabled = false
+                alpha = .38f
+                statsClearButton = this
+            })
             else -> Unit
         }
     }
@@ -2515,10 +2527,12 @@ class MainActivity : ComponentActivity(), Player.Listener {
         row.addView(View(this), LinearLayout.LayoutParams(ui.dp(width), 1))
     }
 
-    private fun trackRows(tracks: List<Track>, context: PlayContext, playlist: Card? = null) = tracks.mapIndexed { index, track ->
-        Row.Music(track, { playTracks(tracks, index, context) }, { anchor -> trackMenu(track, playlist, anchor = anchor) },
-            reorderIndex = index.takeIf { reordering && playlist != null && tracks.size > 1 })
-    }
+    private fun trackRows(tracks: List<Track>, context: PlayContext, playlist: Card? = null, numbered: Boolean = false) =
+        tracks.mapIndexed { index, track ->
+            Row.Music(track, { playTracks(tracks, index, context) }, { anchor -> trackMenu(track, playlist, anchor = anchor) },
+                number = (index + 1).takeIf { numbered },
+                reorderIndex = index.takeIf { reordering && playlist != null && tracks.size > 1 })
+        }
 
     private fun setReordering(enabled: Boolean) {
         val page = details ?: return
@@ -2592,13 +2606,15 @@ class MainActivity : ComponentActivity(), Player.Listener {
         }
     }
 
-    private fun trackCount(count: Int, episodes: Boolean = false): String {
-        val noun = if (count % 100 in 11..14) 2 else when (count % 10) {
-            1 -> 0; in 2..4 -> 1; else -> 2
+    private fun plural(count: Int, one: String, few: String, many: String): String {
+        val noun = if (count % 100 in 11..14) many else when (count % 10) {
+            1 -> one; in 2..4 -> few; else -> many
         }
-        val forms = if (episodes) listOf("выпуск", "выпуска", "выпусков") else listOf("трек", "трека", "треков")
-        return "$count ${forms[noun]}"
+        return "$count $noun"
     }
+
+    private fun trackCount(count: Int, episodes: Boolean = false): String =
+        if (episodes) plural(count, "выпуск", "выпуска", "выпусков") else plural(count, "трек", "трека", "треков")
 
     private fun shortcut(symbol: Symbol, label: String, sub: String? = null, subtitleTag: String? = null, action: () -> Unit) = Row.Layout {
         ui.row().apply {
@@ -3058,8 +3074,8 @@ class MainActivity : ComponentActivity(), Player.Listener {
     internal fun choose(title: String, labels: List<String>, selected: Int = -1, action: (Int) -> Unit) =
         tuneChoices(title, labels, selected, dark = playerPanel != null, action = action)
 
-    private fun confirm(title: String, label: String, action: () -> Unit) {
-        tuneConfirm(title, label, destructive = label in setOf("Удалить", "Очистить", "Выйти"), action = action)
+    private fun confirm(title: String, label: String, message: String = "", action: () -> Unit) {
+        tuneConfirm(title, label, message, destructive = label in setOf("Удалить", "Очистить", "Выйти", "Сбросить"), action = action)
     }
 
     private fun createPlaylist() = input("Новый плейлист", "", "Название") { title ->
@@ -3707,9 +3723,10 @@ class MainActivity : ComponentActivity(), Player.Listener {
     private fun changes() {
         rows(listOf(
             heading("Tune ${BuildConfig.VERSION_NAME}"),
+            note("Обновлены экраны «Статистика», «Занятое место», «Устройства» и «Подмена» — карточки, сводные плитки, нумерация любимых треков и очистка статистики в панели сверху."),
+            heading("В прошлых версиях"),
             note("Убраны подвисания на главной при прокрутке и переключении вкладок, сглажен градиент без полос в плеере и шапках страниц."),
             note("В плеере появились кольца буферизации и прогресса загрузки, активная подсветка таймера сна, компактные уведомления вместо системных тостов, исправлен скачок клавиатуры в поле зеркала LRCLIB и выровнены мелочи в коллекции, поиске и мини-плеере."),
-            heading("В прошлых версиях"),
             note("Полноэкранный плеер и клипы растянуты на весь экран без чёрных полос. Обновлены значки разделов, плавный скролл текста песни, перелистывание обложек свайпом и кроссфейд между треками."),
             note("Исправлены цвета волн на главной, разделены подкасты и выпуски в поиске, сохраняются фильтры в списках и продолжается очередь загрузок после потери сети."),
             note("Tune работает в портретной ориентации. Верхняя панель плеера остаётся видимой при прокрутке, и свайп вниз с неё сворачивает плеер."),
@@ -3796,7 +3813,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
                 if (Build.VERSION.SDK_INT >= 29) {
                     textCursorDrawable = ui.shape(ui.palette.accentText, 1).apply { setSize(ui.dp(2), ui.dp(18)) }
                 }
-                hint = "Зеркало LRCLIB, например lrclib.example.com"
+                hint = "Зеркало, например lrclib.example.com"
                 contentDescription = "Зеркало LRCLIB"
                 inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
                 imeOptions = EditorInfo.IME_ACTION_DONE
@@ -3895,53 +3912,95 @@ class MainActivity : ComponentActivity(), Player.Listener {
     private fun replacement(target: ReplacementTarget) {
         val uid = store.requireUser().uid
         val value = store.overrides.read(uid, target.kind, target.id)
+        val hasAudio = target.track?.let(store.files::hasReplacement) == true
+        val modified = value != MetadataOverride() || hasAudio
+        val destructive = if (ui.palette.light) 0xffba2828.toInt() else 0xffff6861.toInt()
         rows(buildList {
-            add(heading(value.title.ifBlank { target.title }))
-            add(shortcut(Symbol.EDIT, "Название", value.title.takeIf(String::isNotBlank)) {
-                input("Название", value.title, target.title) { saveReplacement(target, value.copy(title = it)) }
+            add(Row.Layout {
+                settingsGroupView(
+                    "Название и исполнители",
+                    "Пустые поля сохраняют данные каталога. Подмены действуют в Tune на этом устройстве."
+                ) {
+                    line("Название", value.title.ifBlank { target.title }, chevron = true) {
+                        input("Название", value.title, target.title) { saveReplacement(target, value.copy(title = it)) }
+                    }
+                    if (target.kind == "track") {
+                        line("Исполнитель", value.artist.ifBlank { target.track?.artistText.orEmpty() }, chevron = true) {
+                            input("Исполнитель", value.artist, target.track?.artistText.orEmpty()) { saveReplacement(target, value.copy(artist = it)) }
+                        }
+                    }
+                }
             })
-            if (target.kind == "track") add(shortcut(Symbol.MIC_MUSIC, "Исполнитель", value.artist.takeIf(String::isNotBlank)) {
-                input("Исполнитель", value.artist, target.track?.artistText.orEmpty()) { saveReplacement(target, value.copy(artist = it)) }
-            })
-            add(shortcut(Symbol.PHOTO, "Выбрать обложку") { coverPickerTarget = target; localCoverDocument.launch("image/*") })
-            add(shortcut(Symbol.LINK, "Ссылка на обложку") {
-                input("Ссылка на обложку", value.cover.takeIf { it.startsWith("https://") }.orEmpty(), "https://") { link ->
-                    val uri = Uri.parse(link)
-                    if (uri.scheme == "https" && !uri.host.isNullOrBlank()) saveReplacement(target, value.copy(cover = link))
-                    else toast("Нужна ссылка HTTPS")
+            add(Row.Layout {
+                settingsGroupView("Обложка") {
+                    line("Ссылка на обложку", value.cover.takeIf { it.startsWith("https://") }.orEmpty(), Symbol.LINK, chevron = true) {
+                        input("Ссылка на обложку", value.cover.takeIf { it.startsWith("https://") }.orEmpty(), "https://") { link ->
+                            val uri = Uri.parse(link)
+                            if (uri.scheme == "https" && !uri.host.isNullOrBlank()) saveReplacement(target, value.copy(cover = link))
+                            else toast("Нужна ссылка HTTPS")
+                        }
+                    }
+                    line("Выбрать изображение", icon = Symbol.PHOTO, chevron = true) {
+                        coverPickerTarget = target
+                        localCoverDocument.launch("image/*")
+                    }
                 }
             })
             target.track?.let { track ->
-                add(shortcut(Symbol.WAVE, "Выбрать аудиофайл", if (store.files.hasReplacement(track)) "Файл выбран" else null) {
-                    documentTrack = track
-                    importAudio.launch(arrayOf("audio/*"))
+                add(Row.Layout {
+                    settingsGroupView("Аудио") {
+                        line(if (hasAudio) "Заменить аудиофайл" else "Выбрать аудиофайл", if (hasAudio) "Файл выбран" else "",
+                            Symbol.WAVE, chevron = true) {
+                            documentTrack = track
+                            importAudio.launch(arrayOf("audio/*"))
+                        }
+                    }
                 })
             }
             if (target.kind != "track") {
-                add(shortcut(Symbol.QUEUE, if (target.kind == "album") "Порядок треков" else "Добавить треки") {
-                    input("Треки", value.tracks.joinToString(", "), "Ссылки или номера треков") {
-                        val ids = MetadataOverrides.ids(it, "track")
-                        if (ids.isEmpty()) toast("Треки не распознаны") else saveReplacement(target, value.copy(tracks = ids))
+                add(Row.Layout {
+                    settingsGroupView(
+                        if (target.kind == "album") "Порядок треков" else "Добавить на страницу исполнителя",
+                        if (target.kind == "album") "Ссылки или номера треков в нужном порядке."
+                        else "Добавленные треки и альбомы поднимутся в начало списков."
+                    ) {
+                        line(if (target.kind == "album") "Порядок треков" else "Добавить треки",
+                            value.tracks.size.takeIf { it > 0 }?.toString().orEmpty(), Symbol.QUEUE, chevron = true) {
+                            input("Треки", value.tracks.joinToString(", "), "Ссылки или номера треков") {
+                                val ids = MetadataOverrides.ids(it, "track")
+                                if (ids.isEmpty()) toast("Треки не распознаны") else saveReplacement(target, value.copy(tracks = ids))
+                            }
+                        }
+                        if (target.kind == "artist") {
+                            line("Добавить альбомы", value.albums.size.takeIf { it > 0 }?.toString().orEmpty(),
+                                Symbol.LIBRARY, chevron = true) {
+                                input("Альбомы", value.albums.joinToString(", "), "Ссылки или номера альбомов") {
+                                    val ids = MetadataOverrides.ids(it, "album")
+                                    if (ids.isEmpty()) toast("Альбомы не распознаны") else saveReplacement(target, value.copy(albums = ids))
+                                }
+                            }
+                        }
                     }
                 })
             }
-            if (target.kind == "artist") add(shortcut(Symbol.LIBRARY, "Добавить альбомы") {
-                input("Альбомы", value.albums.joinToString(", "), "Ссылки или номера альбомов") {
-                    val ids = MetadataOverrides.ids(it, "album")
-                    if (ids.isEmpty()) toast("Альбомы не распознаны") else saveReplacement(target, value.copy(albums = ids))
-                }
-            })
-            if (target.kind != "artist") add(settingSwitch("Использовать FckCensor", "", value.usePlugin) {
-                saveReplacement(target, value.copy(usePlugin = it))
-            })
-            add(shortcut(Symbol.CLOSE, "Сбросить подмену") {
-                confirm("Сбросить подмену?", "Сбросить") {
-                    action {
-                        target.track?.takeIf(store.files::hasReplacement)?.let { store.files.removeReplacement(it) }
-                        saveReplacement(target, null)
+            if (target.kind != "artist" || modified) {
+                add(Row.Layout {
+                    settingsGroupView {
+                        if (target.kind != "artist") toggle("Применять данные FckCensor", value.usePlugin) {
+                            saveReplacement(target, value.copy(usePlugin = it))
+                        }
+                        if (modified) line("Сбросить подмену", color = destructive) {
+                            confirm("Сбросить подмену?", "Сбросить") {
+                                action {
+                                    target.track?.takeIf(store.files::hasReplacement)?.let { store.files.removeReplacement(it) }
+                                    saveReplacement(target, null)
+                                }
+                            }
+                        }
                     }
-                }
-            })
+                })
+            }
+            add(Row.Layout { ui.space(20) })
         }, keepScroll = true)
     }
 
@@ -3966,18 +4025,57 @@ class MainActivity : ComponentActivity(), Player.Listener {
 
     private fun storage(): Unit = loadRows {
         val usage = store.files.diskUsage()
-        val totals = usage.groupBy { (track, _) -> track.artists.firstOrNull()?.title ?: "Неизвестный исполнитель" }
-            .entries.sortedByDescending { group -> group.value.sumOf { it.second } }
+        if (usage.isEmpty()) {
+            return@loadRows listOf(Row.Layout {
+                ui.pagePlaceholder(Symbol.DOWNLOAD_CIRCLE, "Пока ничего не скачано",
+                    "Здесь будет видно, чья музыка занимает больше всего места.")
+            })
+        }
+        val totals = usage.groupBy { (track, _) ->
+            track.artists.firstOrNull()?.title?.takeIf(String::isNotBlank) ?: track.artistText.ifBlank { "Без исполнителя" }
+        }.entries.map { (artist, entries) ->
+            Triple(artist, entries, entries.sumOf { it.second })
+        }.sortedWith(compareByDescending<Triple<String, List<Pair<Track, Long>>, Long>> { it.third }.thenBy { it.first })
+        val totalBytes = usage.sumOf { it.second }
         buildList {
-            add(heading(android.text.format.Formatter.formatFileSize(this@MainActivity, usage.sumOf { it.second })))
-            add(note("Скачано: ${trackCount(usage.size)}"))
-            if (totals.isNotEmpty()) add(heading("По исполнителям"))
-            totals.forEach { (artist, entries) ->
-                add(shortcut(Symbol.DOWNLOAD, artist, android.text.format.Formatter.formatFileSize(this@MainActivity, entries.sumOf { it.second })) {
-                    choose(artist, listOf("Удалить загрузки исполнителя")) {
-                        confirm("Удалить загрузки исполнителя «$artist»?", "Удалить") {
-                            action { entries.forEach { store.files.remove(it.first) }; storage() }
-                        }
+            add(Row.Layout {
+                ui.column().apply {
+                    setPadding(ui.dp(16), ui.dp(10), ui.dp(16), ui.dp(14))
+                    addView(ui.text(fileSize(totalBytes), 30, bold = true).apply { fontFeatureSettings = "tnum" })
+                    addView(ui.space(4))
+                    addView(ui.line("${trackCount(usage.size)} · ${plural(totals.size, "исполнитель", "исполнителя", "исполнителей")}",
+                        14, ui.palette.muted))
+                }
+            })
+            totals.forEach { (artist, entries, bytes) ->
+                val sizeLabel = fileSize(bytes)
+                val removeArtist = {
+                    confirm("Удалить скачанное?", "Удалить", "$artist: ${trackCount(entries.size)}, $sizeLabel") {
+                        action { entries.forEach { store.files.remove(it.first) }; storage() }
+                    }
+                }
+                add(Row.Layout {
+                    ui.row().apply {
+                        minimumHeight = ui.dp(60)
+                        setPadding(ui.dp(16), ui.dp(6), ui.dp(10), ui.dp(6))
+                        background = ui.touch()
+                        isFocusable = true
+                        addView(ui.art(entries.firstOrNull()?.first?.cover, 120, corner = 8),
+                            LinearLayout.LayoutParams(ui.dp(46), ui.dp(46)))
+                        addView(ui.column().apply {
+                            setPadding(ui.dp(12), 0, ui.dp(8), 0)
+                            addView(ui.line(artist, 16, bold = true))
+                            addView(ui.space(3))
+                            addView(ui.line(trackCount(entries.size), 14, ui.palette.muted))
+                        }, ui.weight())
+                        addView(ui.line(sizeLabel, 15, ui.palette.muted).apply {
+                            fontFeatureSettings = "tnum"
+                            setPadding(ui.dp(4), 0, ui.dp(4), 0)
+                        })
+                        addView(ui.icon(Symbol.TRASH, "Удалить скачанное: $artist", ui.palette.muted, click = removeArtist).apply {
+                            iconSize = 17
+                        }, LinearLayout.LayoutParams(ui.dp(36), ui.dp(40)))
+                        setOnClickListener { removeArtist() }
                     }
                 })
             }
@@ -3988,90 +4086,136 @@ class MainActivity : ComponentActivity(), Player.Listener {
         val sync = store.ynison
         val state = sync.state.value
         val connected = sync.connection.value == Ynison.CONNECTED
+        val here = sync.deviceId
+        val remotes = state.devices.filterNot { it.id == here }
+        val otherDevices = remotes.filterNot { it.kind.contains("SPEAKER") || it.kind.contains("STATION") }
+        val speakers = remotes.filter { it.kind.contains("SPEAKER") || it.kind.contains("STATION") }
         rows(buildList {
-            add(settingSwitch("Синхронизация устройств", "Продолжайте слушать на другом устройстве", sync.enabled) {
-                sync.enable(it)
-                devices()
+            add(Row.Layout {
+                settingsGroupView(footer = "Переносите очередь, текущий трек и позицию между устройствами одного аккаунта Яндекса.") {
+                    toggle("Синхронизация устройств", sync.enabled) {
+                        sync.enable(it)
+                        devices()
+                    }
+                }
             })
             if (sync.enabled) {
-                add(note(sync.connection.value))
-                if (!connected) add(shortcut(Symbol.REPEAT, "Подключиться снова") { sync.reconnect() })
-                else {
-                    add(heading("Где играет музыка"))
-                    val here = sync.deviceId
-                    val devices = listOf(YnisonDevice(here, "Это устройство", "PHONE")) + state.devices.filterNot { it.id == here }
-                    devices.forEach { device ->
-                        val active = state.active == device.id
-                        val subtitle = when {
-                            active -> state.playback.current?.title ?: "Активное устройство"
-                            device.kind.contains("SPEAKER") || device.kind.contains("STATION") -> "Яндекс Станция"
-                            else -> null
+                if (!connected) {
+                    add(Row.Layout {
+                        settingsGroupView {
+                            line(sync.connection.value, color = ui.palette.muted)
+                            if (store.offline) line("Для подключения устройств нужен интернет", icon = Symbol.WIFI_OFF, color = ui.palette.muted)
+                            else line("Повторить подключение", icon = Symbol.REPEAT, color = ui.palette.accentText) { sync.reconnect() }
                         }
-                        add(shortcut(if (active) Symbol.CHECK else Symbol.OUTPUT, device.name, subtitle) {
-                            if (!active) action { sync.transfer(device.id) }
+                    })
+                } else {
+                    if (remotes.isEmpty()) {
+                        add(Row.Layout {
+                            settingsGroupView(footer = "Включите музыку на другом устройстве или Станции, подключённой к тому же аккаунту.") {
+                                line("Других устройств в сети пока нет", color = ui.palette.muted)
+                            }
                         })
                     }
-                    if (state.active != null && state.active != here && state.playback.current != null) {
+                    add(Row.Layout {
+                        settingsGroupView("Воспроизведение") {
+                            val thisDevice = YnisonDevice(here, "Это устройство", "PHONE")
+                            (listOf(thisDevice) + otherDevices).forEach { device ->
+                                val active = state.active == device.id
+                                line(device.name, icon = Symbol.OUTPUT, checked = active, enabled = !active) {
+                                    action { sync.transfer(device.id) }
+                                }
+                            }
+                        }
+                    })
+                    if (speakers.isNotEmpty()) {
                         add(Row.Layout {
-                            horizontal(listOf(
-                                ui.chip("Предыдущий") { sync.control(offset = -1) },
-                                ui.chip(if (state.playback.paused) "Воспроизвести" else "Пауза") { sync.control(paused = !state.playback.paused) },
-                                ui.chip("Следующий") { sync.control(offset = 1) },
-                            ))
+                            settingsGroupView("Колонки") {
+                                speakers.forEach { device ->
+                                    val active = state.active == device.id
+                                    line(device.name, icon = Symbol.SPEAKER, checked = active, enabled = !active) {
+                                        action { sync.transfer(device.id) }
+                                    }
+                                }
+                            }
+                        })
+                    }
+                    val activeRemote = state.active?.takeIf { it != here }?.let { active -> remotes.firstOrNull { it.id == active } }
+                    val song = state.playback.current
+                    if (activeRemote != null && song != null) {
+                        add(Row.Layout {
+                            settingsGroupView(activeRemote.name) {
+                                line(song.title.ifBlank { "Текущий трек" })
+                                line(if (state.playback.paused) "Продолжить" else "Пауза",
+                                    icon = if (state.playback.paused) Symbol.PLAY else Symbol.PAUSE) {
+                                    sync.control(paused = !state.playback.paused)
+                                }
+                                line("Предыдущий трек", icon = Symbol.PREVIOUS) { sync.control(offset = -1) }
+                                line("Следующий трек", icon = Symbol.NEXT) { sync.control(offset = 1) }
+                            }
                         })
                     }
                 }
             }
+            add(Row.Layout { ui.space(20) })
         }, keepScroll = true)
     }
 
     private fun stats(): Unit = loadRows {
         val uid = store.requireUser().uid
         val data = store.listening.summary(uid, statsDays)
+        val hasAny = data.count > 0 || (statsDays != null && store.listening.summary(uid, null).count > 0)
+        statsClearButton?.apply {
+            isEnabled = hasAny
+            alpha = if (hasAny) 1f else .38f
+        }
         val periods = listOf(7 to "7 дней", 30 to "30 дней", null to "Всё время")
+        fun statTile(value: String, caption: String) = ui.column().apply {
+            gravity = Gravity.CENTER_HORIZONTAL
+            background = ui.shape(ui.palette.panel, 16)
+            setPadding(ui.dp(6), ui.dp(16), ui.dp(6), ui.dp(16))
+            addView(ui.line(value, 22, bold = true).apply {
+                gravity = Gravity.CENTER
+                fontFeatureSettings = "tnum"
+                setAutoSizeTextTypeUniformWithConfiguration(13, 22, 1, android.util.TypedValue.COMPLEX_UNIT_SP)
+            }, ui.full())
+            addView(ui.space(4))
+            addView(ui.line(caption, 13, ui.palette.muted).apply {
+                gravity = Gravity.CENTER
+                setAutoSizeTextTypeUniformWithConfiguration(10, 13, 1, android.util.TypedValue.COMPLEX_UNIT_SP)
+            }, ui.full())
+        }
         buildList {
             add(Row.Layout { horizontal(periods.map { (days, label) -> ui.chip(label, statsDays == days) {
                 statsDays = days
                 stats()
             } }) })
             if (data.count == 0) {
-                add(note("Здесь появятся треки, которые вы слушали в Tune. Учитываются прослушивания от 20 секунд."))
+                add(Row.Layout {
+                    ui.pagePlaceholder(Symbol.STATS, "Пока нечего показать",
+                        "Статистика копится на этом устройстве: послушайте что-нибудь, и здесь появятся любимые треки и исполнители.")
+                })
             } else {
                 val minutes = data.duration / 60_000
-                add(heading(if (minutes >= 60) "${minutes / 60} ч ${minutes % 60} мин" else "$minutes мин"))
-                add(note("Прослушиваний: ${data.count}"))
+                val listenedText = if (minutes >= 60) "${minutes / 60} ч ${minutes % 60} мин" else "$minutes мин"
+                val playsWord = plural(data.count, "прослушивание", "прослушивания", "прослушиваний").substringAfter(' ')
+                val artistsText = "${data.artists.size}${if (data.artists.size >= 12) "+" else ""}"
+                add(Row.Layout {
+                    ui.row().apply {
+                        setPadding(ui.dp(16), ui.dp(8), ui.dp(16), ui.dp(12))
+                        addView(statTile(listenedText, "слушали"), LinearLayout.LayoutParams(0, -2, 1f))
+                        gap(this, 10)
+                        addView(statTile(data.count.toString(), playsWord), LinearLayout.LayoutParams(0, -2, 1f))
+                        gap(this, 10)
+                        addView(statTile(artistsText, "исполнителей"), LinearLayout.LayoutParams(0, -2, 1f))
+                    }
+                })
                 add(heading("Любимые треки"))
-                addAll(trackRows(data.songs.map { it.first }, PlayContext(name = "Статистика")))
+                addAll(trackRows(data.songs.map { it.first }, PlayContext(name = "Любимые треки"), numbered = true))
                 if (data.artists.isNotEmpty()) {
                     add(heading("Любимые исполнители"))
-                    add(shelfRow(data.artists.map { (artist, count) -> artist.copy(subtitle = "Прослушиваний: $count") }))
+                    add(shelfRow(data.artists.map { (artist, count) -> artist.copy(subtitle = plural(count, "раз", "раза", "раз")) }))
                 }
-                add(shortcut(Symbol.CLOSE, "Очистить статистику") {
-                    confirm("Очистить историю статистики?", "Очистить") { action { store.listening.clear(uid); stats() } }
-                })
             }
-        }
-    }
-
-    private fun settingSwitch(title: String, sub: String, checked: Boolean, change: (Boolean) -> Unit) = Row.Layout {
-        ui.row().apply {
-            setPadding(ui.dp(16), ui.dp(8), ui.dp(16), ui.dp(8))
-            minimumHeight = ui.dp(58)
-            val toggle = android.widget.Switch(this@MainActivity).apply {
-                isChecked = checked
-                contentDescription = title
-                val onOff = arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf())
-                thumbTintList = ColorStateList(onOff, intArrayOf(ui.palette.accent, ui.palette.muted))
-                trackTintList = ColorStateList(onOff, intArrayOf(0x73facc15, 0xff404040.toInt()))
-                setOnCheckedChangeListener { _, value -> change(value) }
-            }
-            addView(ui.column().apply {
-                addView(ui.text(title, 15, bold = true))
-                if (sub.isNotBlank()) { addView(ui.space(4)); addView(ui.text(sub, 12, ui.palette.muted)) }
-            }, ui.weight())
-            addView(toggle)
-            background = ui.touch()
-            setOnClickListener { toggle.toggle() }
         }
     }
 
