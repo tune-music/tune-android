@@ -4,6 +4,7 @@
         <item name="android:windowExitAnimation">@anim/tune_sheet_exit</item>
     </style>
     <string name="app_name">Tune</string>
+    <string name="shortcut_target_package" translatable="false">music.tune.android</string>
     <string name="shortcut_wave">Моя волна</string>
     <string name="shortcut_search">Поиск</string>
     <string name="shortcut_likes">Мне нравится</string>

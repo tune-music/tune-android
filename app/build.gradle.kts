@@ -5,11 +5,18 @@ plugins {
 
 val updateFeedUrl = providers.gradleProperty("tuneUpdateFeedUrl")
     .orElse("https://github.com/tune-music/tune-android/releases/latest/download/update.json").get()
-if (updateFeedUrl.isNotEmpty()) {
-    val url = uri(updateFeedUrl)
-    require(url.scheme == "https" && url.host != null && url.userInfo == null && url.fragment == null) {
-        "tuneUpdateFeedUrl must be an HTTPS URL without credentials or a fragment"
+val devFeedUrl = providers.gradleProperty("tuneDevUpdateFeedUrl").getOrElse("")
+val devVersion = providers.gradleProperty("tuneDevBuildNumber").getOrElse("1").toInt()
+require(devVersion in 1..2_100_000_000)
+
+fun encodedFeedUrl(value: String): String {
+    if (value.isNotEmpty()) {
+        val url = uri(value)
+        require(url.scheme == "https" && url.host != null && url.userInfo == null && url.fragment == null) {
+            "The update feed must be an HTTPS URL without credentials or a fragment"
+        }
     }
+    return "\"$value\""
 }
 
 android {
@@ -23,7 +30,18 @@ android {
         targetSdk = 35
         versionCode = 20
         versionName = "0.2.18"
-        buildConfigField("String", "UPDATE_FEED_URL", "\"$updateFeedUrl\"")
+        buildConfigField("String", "UPDATE_FEED_URL", encodedFeedUrl(updateFeedUrl))
+    }
+
+    buildTypes {
+        create("dev") {
+            initWith(getByName("release"))
+            applicationIdSuffix = ".dev"
+            versionNameSuffix = "-dev.$devVersion"
+            resValue("string", "app_name", "Tune Dev")
+            resValue("string", "shortcut_target_package", "music.tune.android.dev")
+            buildConfigField("String", "UPDATE_FEED_URL", encodedFeedUrl(devFeedUrl))
+        }
     }
 
     compileOptions {
@@ -32,6 +50,12 @@ android {
     }
 
     buildFeatures { buildConfig = true }
+}
+
+androidComponents {
+    onVariants(selector().withBuildType("dev")) { variant ->
+        variant.outputs.forEach { it.versionCode.set(devVersion) }
+    }
 }
 
 kotlin { jvmToolchain(17) }

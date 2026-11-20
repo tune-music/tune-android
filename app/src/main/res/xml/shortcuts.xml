@@ -1,17 +1,17 @@
 <shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
     <shortcut android:shortcutId="wave" android:enabled="true" android:icon="@drawable/tune_icon"
         android:shortcutShortLabel="@string/shortcut_wave">
-        <intent android:action="music.tune.android.SHORTCUT_WAVE" android:targetPackage="music.tune.android"
+        <intent android:action="music.tune.android.SHORTCUT_WAVE" android:targetPackage="@string/shortcut_target_package"
             android:targetClass="music.tune.android.MainActivity" />
     </shortcut>
     <shortcut android:shortcutId="search" android:enabled="true" android:icon="@drawable/tune_icon"
         android:shortcutShortLabel="@string/shortcut_search">
-        <intent android:action="music.tune.android.SHORTCUT_SEARCH" android:targetPackage="music.tune.android"
+        <intent android:action="music.tune.android.SHORTCUT_SEARCH" android:targetPackage="@string/shortcut_target_package"
             android:targetClass="music.tune.android.MainActivity" />
     </shortcut>
     <shortcut android:shortcutId="likes" android:enabled="true" android:icon="@drawable/tune_icon"
         android:shortcutShortLabel="@string/shortcut_likes">
-        <intent android:action="music.tune.android.SHORTCUT_LIKES" android:targetPackage="music.tune.android"
+        <intent android:action="music.tune.android.SHORTCUT_LIKES" android:targetPackage="@string/shortcut_target_package"
             android:targetClass="music.tune.android.MainActivity" />
     </shortcut>
 </shortcuts>

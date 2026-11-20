@@ -1,0 +1,100 @@
+name: Tune Dev
+
+on:
+  push:
+    branches: [dev]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-dev
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      DEV_BASE_URL: https://github.com/${{ github.repository }}/releases/download/dev
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Build and test Tune Dev
+        run: |
+          sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
+          bash gradlew :app:assembleDev :app:testDevUnitTest :app:lintDev \
+            "-PtuneDevBuildNumber=$GITHUB_RUN_NUMBER" "-PtuneDevUpdateFeedUrl=$DEV_BASE_URL/update.json"
+      - name: Sign and verify Dev APK
+        if: vars.TUNE_DEV_PUBLIC == 'true'
+        env:
+          KEYSTORE_B64: ${{ secrets.TUNE_DEV_KEYSTORE_B64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.TUNE_DEV_KEYSTORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          : "${KEYSTORE_B64:?Missing Tune Dev keystore}"
+          : "${KEYSTORE_PASSWORD:?Missing Tune Dev keystore password}"
+          umask 077
+          key=$(mktemp)
+          trap 'rm -f "$key"' EXIT
+          printf '%s' "$KEYSTORE_B64" | base64 --decode > "$key"
+          tools="$ANDROID_HOME/build-tools/35.0.0"
+          mkdir -p dist
+          apk="dist/Tune-Android-Dev-$GITHUB_RUN_NUMBER.apk"
+          "$tools/apksigner" sign --ks "$key" --ks-key-alias tune-dev \
+            --ks-pass env:KEYSTORE_PASSWORD --out "$apk" app/build/outputs/apk/dev/app-dev-unsigned.apk
+          "$tools/apksigner" verify "$apk"
+          "$tools/aapt" dump badging "$apk" > apk-info.txt
+          python3 - <<'PY'
+          import json, os, re
+          from pathlib import Path
+
+          info = Path('apk-info.txt').read_text(encoding='utf-8')
+          package, code, version = re.search(r"^package: name='([^']+)' versionCode='([^']+)' versionName='([^']+)'", info).groups()
+          run = os.environ['GITHUB_RUN_NUMBER']
+          assert package == 'music.tune.android.dev' and code == run and version.endswith(f'-dev.{run}')
+          feed = dict(packageName=package, versionCode=int(code), versionName=version,
+                      apkUrl=f"{os.environ['DEV_BASE_URL']}/Tune-Android-Dev-{run}.apk",
+                      notes=f"Тестовая сборка {os.environ['GITHUB_SHA'][:7]}")
+          Path('dist/update.json').write_text(json.dumps(feed, ensure_ascii=False), encoding='utf-8')
+          PY
+      - uses: actions/upload-artifact@v4
+        if: vars.TUNE_DEV_PUBLIC == 'true'
+        with:
+          name: tune-android-dev
+          path: |
+            dist/Tune-Android-Dev-*.apk
+            dist/update.json
+          if-no-files-found: error
+
+  publish:
+    if: vars.TUNE_DEV_PUBLIC == 'true'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: tune-android-dev
+          path: dist
+      - name: Publish Dev prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          apk="dist/Tune-Android-Dev-$GITHUB_RUN_NUMBER.apk"
+          if state=$(gh release view dev --json isPrerelease,isDraft --jq '.isPrerelease and (.isDraft | not)'); then
+            test "$state" = true
+            gh release upload dev "$apk" --clobber
+            gh release upload dev dist/update.json --clobber
+          else
+            gh release create dev "$apk" dist/update.json --target "$GITHUB_SHA" \
+              --prerelease --latest=false --title 'Tune Android Dev' --notes 'Отдельный тестовый канал Tune.'
+          fi
