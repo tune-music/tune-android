@@ -4,6 +4,8 @@
 
 [Скачать последнюю версию](https://github.com/tune-music/tune-android/releases/latest)
 
+**Dev:** [Скачать тестовый APK](https://github.com/tune-music/tune-android/releases/tag/dev). Устанавливается рядом со стабильной Tune и обновляется отдельно.
+
 ## Сборка
 
 Установите JDK 17, Android SDK Platform 35 и Build Tools 35.0.0. Откройте проект в Android Studio или укажите путь к SDK через `ANDROID_HOME`.
