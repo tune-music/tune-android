@@ -20,12 +20,17 @@ import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
 import android.text.TextUtils
 import android.view.Gravity
+import android.view.HapticFeedbackConstants
+import android.view.MotionEvent
 import android.view.View
+import android.view.ViewConfiguration
 import android.view.animation.DecelerateInterpolator
 import android.view.animation.OvershootInterpolator
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.ListView
+import android.widget.ProgressBar
 import android.widget.TextView
 import coil.dispose
 import coil.load
@@ -836,5 +841,112 @@ internal class ProgressRingView(context: Context, trackColor: Int, progressColor
         if (oval.isEmpty) return
         canvas.drawArc(oval, 0f, 360f, false, trackPaint)
         canvas.drawArc(oval, -90f, progress.coerceIn(.04f, 1f) * 360f, false, fillPaint)
+    }
+}
+
+internal class TuneRefreshLayout(
+    ui: TuneUi,
+    private val list: ListView,
+    private val canRefresh: () -> Boolean = { true },
+    private val onRefresh: () -> Unit,
+) : FrameLayout(ui.context) {
+    private val slop = ViewConfiguration.get(ui.context).scaledTouchSlop.toFloat()
+    private val threshold = ui.dp(64).toFloat()
+    private val resting = ui.dp(56).toFloat()
+    private val maxPull = ui.dp(108).toFloat()
+    private val pillOffset = ui.dp(44).toFloat()
+    private val pill = FrameLayout(ui.context).apply {
+        background = ui.shape(ui.palette.panel, 19)
+        elevation = ui.dp(4).toFloat()
+        visibility = View.GONE
+        alpha = 0f
+        addView(ProgressBar(ui.context).apply {
+            indeterminateTintList = ColorStateList.valueOf(ui.palette.accentText)
+        }, LayoutParams(ui.dp(20), ui.dp(20), Gravity.CENTER))
+    }
+    private var startX = 0f
+    private var startY = 0f
+    private var pulling = false
+    private var primed = false
+    private var refreshing = false
+
+    init {
+        addView(list, LayoutParams(-1, -1))
+        addView(pill, LayoutParams(ui.dp(38), ui.dp(38), Gravity.CENTER_HORIZONTAL or Gravity.TOP))
+    }
+
+    fun setRefreshing(active: Boolean) {
+        if (refreshing == active) return
+        refreshing = active
+        if (!active) reset()
+    }
+
+    override fun onInterceptTouchEvent(event: MotionEvent): Boolean {
+        if (refreshing || !canRefresh() || list.canScrollVertically(-1)) return false
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                startX = event.x
+                startY = event.y
+                pulling = false
+                primed = false
+            }
+            MotionEvent.ACTION_MOVE -> {
+                val dx = event.x - startX
+                val dy = event.y - startY
+                if (dy > slop && dy > kotlin.math.abs(dx) * 1.4f && !list.canScrollVertically(-1)) {
+                    pulling = true
+                    startY = event.y
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    @android.annotation.SuppressLint("ClickableViewAccessibility")
+    override fun onTouchEvent(event: MotionEvent): Boolean {
+        if (!pulling) return super.onTouchEvent(event)
+        when (event.actionMasked) {
+            MotionEvent.ACTION_MOVE -> {
+                val pull = ((event.y - startY) * .45f).coerceIn(0f, maxPull)
+                val progress = (pull / threshold).coerceIn(0f, 1f)
+                list.animate().cancel()
+                pill.animate().cancel()
+                list.translationY = pull
+                pill.visibility = if (pull > 2f) View.VISIBLE else View.GONE
+                pill.translationY = (pull - pillOffset).coerceAtLeast(0f)
+                pill.alpha = progress
+                val scale = .75f + .25f * progress
+                pill.scaleX = scale
+                pill.scaleY = scale
+                val ready = pull >= threshold
+                if (ready && !primed) {
+                    primed = true
+                    performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                } else if (!ready) {
+                    primed = false
+                }
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                pulling = false
+                if (event.actionMasked == MotionEvent.ACTION_UP && primed) {
+                    refreshing = true
+                    list.animate().translationY(resting).setDuration(180).start()
+                    pill.animate().translationY(resting - pillOffset).alpha(1f).scaleX(1f).scaleY(1f).setDuration(180).start()
+                    onRefresh()
+                } else {
+                    reset()
+                }
+            }
+        }
+        return true
+    }
+
+    private fun reset() {
+        primed = false
+        list.animate().translationY(0f).setDuration(200).start()
+        pill.animate().translationY(-pillOffset).alpha(0f).scaleX(.75f).scaleY(.75f).setDuration(180)
+            .withEndAction { if (!pulling && !refreshing) pill.visibility = View.GONE }
+            .start()
     }
 }

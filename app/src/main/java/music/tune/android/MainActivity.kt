@@ -198,6 +198,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
     private var detailTone: Int? = null
     private var detailChrome = Color.TRANSPARENT
     private var list: ListView? = null
+    private var refreshLayout: TuneRefreshLayout? = null
     private var adapter: PageAdapter? = null
     private var settingsScroll: ScrollView? = null
     private var settingsBody: LinearLayout? = null
@@ -744,10 +745,22 @@ class MainActivity : ComponentActivity(), Player.Listener {
         render()
     }
 
+    private fun hasNetwork(): Boolean = getSystemService(android.net.ConnectivityManager::class.java)?.let { cm ->
+        cm.getNetworkCapabilities(cm.activeNetwork)?.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET) == true
+    } == true
+
     private fun push(screen: Screen, card: Card? = null) {
         hideKeyboard()
         closePlayer()
-        stack.addLast(Route(screen, card))
+        val offlineTrackList = (store.offline || !hasNetwork()) && (
+            screen == Screen.LIKES ||
+                screen == Screen.HISTORY ||
+                (screen == Screen.DETAILS && card?.kind != Kind.ARTIST) ||
+                screen == Screen.ARTIST_TRACKS ||
+                screen == Screen.ARTIST_COLLECTION ||
+                screen == Screen.ARTIST_WAVE
+            )
+        stack.addLast(Route(screen, card).apply { downloadedOnly = offlineTrackList })
         render()
     }
 
@@ -793,6 +806,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
         lyricsMirrorField = null
         pendingSettingsRefresh = false
         list?.adapter = null
+        refreshLayout = null
         root.removeAllViews()
         root.setBackgroundColor(ui.palette.background)
         content = ui.column()
@@ -848,12 +862,19 @@ class MainActivity : ComponentActivity(), Player.Listener {
             }
             list = pageList
             adapter = pageAdapter
-            content.addView(pageList, LinearLayout.LayoutParams(-1, 0, 1f))
+            val pageContainer: View = if (current.screen in REFRESHABLE_SCREENS) {
+                TuneRefreshLayout(ui, pageList, { !reordering && !selecting }, ::refreshCurrentPage).also {
+                    refreshLayout = it
+                }
+            } else {
+                pageList
+            }
+            content.addView(pageContainer, LinearLayout.LayoutParams(-1, 0, 1f))
             if (animateTabFade) {
                 animateTabFade = false
                 if (ValueAnimator.areAnimatorsEnabled()) {
-                    pageList.alpha = 0f
-                    pageList.animate().alpha(1f).setDuration(180).setInterpolator(DecelerateInterpolator()).start()
+                    pageContainer.alpha = 0f
+                    pageContainer.animate().alpha(1f).setDuration(180).setInterpolator(DecelerateInterpolator()).start()
                 }
             }
         }
@@ -1203,8 +1224,18 @@ class MainActivity : ComponentActivity(), Player.Listener {
                 else if (recent.isEmpty() && discovery.isEmpty()) add(Row.Layout { emptySearch() })
             })
             showDiscovery()
-            if (discovery.isEmpty() && !store.offline && userId != null) pageJob = action(onError = {}) {
-                discovery = store.online { stations() }.filter { it.title == "Жанры" }
+            if ((discovery.isEmpty() || home == null) && userId != null) pageJob = action(onError = {}) {
+                if (home == null) {
+                    home = store.cachedHome()
+                    showDiscovery()
+                    if (!store.offline) {
+                        val loaded = store.home()
+                        if (loaded.hasContent) home = loaded
+                    }
+                }
+                if (discovery.isEmpty() && !store.offline) {
+                    discovery = store.online { stations() }.filter { it.title == "Жанры" }
+                }
                 showDiscovery()
             }
             return
@@ -1472,6 +1503,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
         if (homeLoaded && !force) return
         pageJob?.cancel()
         pageJob = action(onError = {
+            refreshLayout?.setRefreshing(false)
             homeError = it
             showHome(keepScroll = true)
         }) {
@@ -1489,6 +1521,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
                 homeError = null
             } finally {
                 loadingHome = false
+                refreshLayout?.setRefreshing(false)
             }
             showHome(keepScroll = true)
         }
@@ -2079,6 +2112,16 @@ class MainActivity : ComponentActivity(), Player.Listener {
                             }
                             addView(ui.text("${trackCount(page.tracks.size)} · ${durationSummary(page.tracks.sumOf { it.duration })}",
                                 13, ui.palette.muted))
+                            if (page.tracks.any { it.alternate }) {
+                                addView(ui.space(6))
+                                addView(ui.row().apply {
+                                    gravity = Gravity.CENTER_VERTICAL
+                                    addView(IconView(this@MainActivity, Symbol.UNLOCK, ui.palette.muted).apply { iconSize = 13 },
+                                        LinearLayout.LayoutParams(ui.dp(14), ui.dp(14)))
+                                    addView(ui.space(6))
+                                    addView(ui.text("Есть треки без цензуры", 13, ui.palette.muted))
+                                })
+                            }
                         }
                     })
                 } else addAll(trackRows(displayed, context, owned))
@@ -2281,13 +2324,17 @@ class MainActivity : ComponentActivity(), Player.Listener {
             if (running.isNotEmpty()) {
                 val paused = store.files.paused.value
                 val active = running.any { it.error == null }
+                val failed = running.filter { it.error != null }
                 val label = when {
                     !active -> "Не удалось скачать"
                     paused -> "На паузе"
                     else -> store.files.networkWait.value?.label ?: "Скачивание"
                 }
-                add(if (active) section(label, if (paused) "Продолжить" else "Пауза") { store.files.setPaused(!paused) }
-                    else heading(label))
+                add(when {
+                    active -> section(label, if (paused) "Продолжить" else "Пауза") { store.files.setPaused(!paused) }
+                    failed.isNotEmpty() -> section(label, "Повторить все") { action { store.files.enqueue(failed.map { it.track }) } }
+                    else -> heading(label)
+                })
                 running.forEach { state ->
                     add(Row.Layout {
                         val latest = store.files.status.value[state.track.id] ?: state
@@ -2297,7 +2344,10 @@ class MainActivity : ComponentActivity(), Player.Listener {
                         }.make().apply { tag = state.track.id }
                     })
                 }
-                if (running.any { it.error == null }) add(shortcut(Symbol.CLOSE, "Отменить загрузки") { store.files.cancelDownloads() })
+                if (active && failed.isNotEmpty()) add(shortcut(Symbol.REPEAT, "Повторить ошибки") {
+                    action { store.files.enqueue(failed.map { it.track }) }
+                })
+                if (active) add(shortcut(Symbol.CLOSE, "Отменить загрузки") { store.files.cancelDownloads() })
             }
             if (saved.isEmpty() && running.isEmpty()) add(Row.Layout {
                 ui.pagePlaceholder(Symbol.DOWNLOAD_CIRCLE, "Пока ничего не скачано",
@@ -2433,6 +2483,16 @@ class MainActivity : ComponentActivity(), Player.Listener {
         val options = buildList {
             if (all.isNotEmpty() && route.screen != Screen.DOWNLOADS) add(MenuAction("Скачать всё", Symbol.DOWNLOAD) {
                 action { store.files.enqueue(all); toast("Загрузки добавлены") }
+            })
+            if (store.files.status.value.values.any { it.error == null }) add(MenuAction("Отменить загрузки", Symbol.CLOSE) {
+                store.files.cancelDownloads()
+                toast("Загрузки отменены")
+            })
+            if (all.isNotEmpty()) add(MenuAction("Экспортировать списком", Symbol.SHARE) {
+                getSystemService(android.content.ClipboardManager::class.java)
+                    .setPrimaryClip(android.content.ClipData.newPlainText(route.card?.title ?: route.screen.label,
+                        all.joinToString("\n") { "${it.artistText} — ${it.title}" }))
+                toast("Список скопирован")
             })
             if (route.screen == Screen.LIKES) add(MenuAction(if (store.autoDownload()) "Выключить автоскачивание" else "Скачивать новые лайки", Symbol.REPEAT) {
                 store.setAutoDownload(enabled = !store.autoDownload())
@@ -3027,6 +3087,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
         }
         val showCached: ((List<Row>) -> Unit)? = if (listHasContent) null else ::display
         pageJob = action(onError = { error ->
+            refreshLayout?.setRefreshing(false)
             if (listHasContent) toast(error)
             else rows(listOf(Row.Layout {
                 ui.pagePlaceholder(Symbol.WIFI_OFF, "Не удалось загрузить", error) { load() }
@@ -3041,8 +3102,32 @@ class MainActivity : ComponentActivity(), Player.Listener {
                     display(block(showCached))
                 } finally {
                     skeleton?.cancel()
+                    refreshLayout?.setRefreshing(false)
                 }
             }
+        }
+    }
+
+    private fun refreshCurrentPage() {
+        val current = route
+        when {
+            current.screen == Screen.HOME -> homePage(force = true)
+            current.screen == Screen.LIBRARY -> {
+                pageJob?.cancel()
+                pageJob = action(onError = {
+                    refreshLayout?.setRefreshing(false)
+                    toast(it)
+                }) {
+                    try {
+                        store.refreshAccount()
+                        library()
+                    } finally {
+                        refreshLayout?.setRefreshing(false)
+                    }
+                }
+            }
+            current.screen in REFRESHABLE_SCREENS -> load(current)
+            else -> refreshLayout?.setRefreshing(false)
         }
     }
 
@@ -4932,6 +5017,13 @@ class MainActivity : ComponentActivity(), Player.Listener {
         private val ID = Regex("[0-9]+")
         private val COLLECTION_REFRESH_PAGES = setOf(Screen.DETAILS, Screen.LIKES, Screen.DISLIKES,
             Screen.HISTORY, Screen.ALBUMS, Screen.ARTISTS, Screen.PODCASTS, Screen.BOOKS)
+        private val REFRESHABLE_SCREENS = setOf(
+            Screen.HOME, Screen.LIBRARY, Screen.CONCERTS, Screen.HIDDEN_ARTISTS,
+            Screen.LIKES, Screen.DISLIKES, Screen.HISTORY,
+            Screen.DETAILS, Screen.ARTIST_TRACKS, Screen.ARTIST_COLLECTION, Screen.ARTIST_WAVE,
+            Screen.STATIONS, Screen.WAVE_ROOMS, Screen.CLIPS, Screen.KIDS,
+            Screen.ALBUMS, Screen.ARTISTS, Screen.PODCASTS, Screen.BOOKS
+        )
         private val FAVORITE = View.generateViewId()
         private val DETAIL_HEADER_TITLE = View.generateViewId()
         private val CONCERT_CITY_BUTTON = View.generateViewId()
