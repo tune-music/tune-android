@@ -1,0 +1,112 @@
+name: Tune Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v4
+        with:
+          packages: 'platforms;android-35 build-tools;35.0.0'
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Build and test Tune Release
+        run: bash gradlew :app:assembleRelease :app:testReleaseUnitTest :app:lintRelease
+      - name: Sign and verify Release APK
+        env:
+          KEYSTORE_B64: ${{ secrets.TUNE_RELEASE_KEYSTORE_B64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.TUNE_RELEASE_KEYSTORE_PASSWORD }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          : "${KEYSTORE_B64:?Missing Tune Release keystore}"
+          : "${KEYSTORE_PASSWORD:?Missing Tune Release keystore password}"
+          umask 077
+          key=$(mktemp)
+          trap 'rm -f "$key"' EXIT
+          printf '%s' "$KEYSTORE_B64" | base64 --decode > "$key"
+          tools="${ANDROID_HOME:-$ANDROID_SDK_ROOT}/build-tools/35.0.0"
+          mkdir -p dist
+          raw_unsigned="app/build/outputs/apk/release/app-release-unsigned.apk"
+          aligned=$(mktemp)
+          trap 'rm -f "$key" "$aligned"' EXIT
+          "$tools/zipalign" -f -p 4 "$raw_unsigned" "$aligned"
+
+          # Берём versionName из APK, чтобы имя файла совпадало с build.gradle.kts.
+          "$tools/aapt" dump badging "$aligned" > apk-info.txt
+          version=$(python3 - <<'PY'
+          import re
+          from pathlib import Path
+          info = Path('apk-info.txt').read_text(encoding='utf-8')
+          print(re.search(r"versionName='([^']+)'", info).group(1))
+          PY
+          )
+          apk="dist/Tune-Android-${version}.apk"
+          "$tools/apksigner" sign --ks "$key" --ks-key-alias androiddebugkey \
+            --ks-pass env:KEYSTORE_PASSWORD --out "$apk" "$aligned"
+          "$tools/apksigner" verify "$apk"
+          "$tools/aapt" dump badging "$apk" > apk-info.txt
+
+          tag_notes=$(git tag -l --format='%(contents)' "$TAG" || true)
+          export TAG_NOTES="$tag_notes"
+          python3 - <<'PY'
+          import json, os, re
+          from pathlib import Path
+
+          info = Path('apk-info.txt').read_text(encoding='utf-8')
+          package, code, version = re.search(r"^package: name='([^']+)' versionCode='([^']+)' versionName='([^']+)'", info).groups()
+          tag = os.environ['TAG']
+          repo = os.environ['REPO']
+          assert package == 'music.tune.android', f'Unexpected package: {package}'
+          notes = os.environ.get('TAG_NOTES', '').strip() or f'Релиз {version}'
+          feed = {
+              'packageName': package,
+              'versionCode': int(code),
+              'versionName': version,
+              'apkUrl': f'https://github.com/{repo}/releases/download/{tag}/Tune-Android-{version}.apk',
+              'notes': notes,
+          }
+          Path('dist/update.json').write_text(json.dumps(feed, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+          PY
+          cat dist/update.json
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          apk=$(ls dist/Tune-Android-*.apk | head -n 1)
+          version=${apk#dist/Tune-Android-}
+          version=${version%.apk}
+          notes=$(git tag -l --format='%(contents)' "$TAG" || true)
+          if [ -z "$notes" ]; then notes="Релиз $version"; fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$apk" dist/update.json --clobber
+          else
+            gh release create "$TAG" "$apk" dist/update.json \
+              --title "Tune Android $version" \
+              --notes "$notes" \
+              --latest \
+              --target "$GITHUB_SHA"
+          fi
