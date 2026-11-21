@@ -7,15 +7,38 @@ import androidx.media3.common.audio.BaseAudioProcessor
 import androidx.media3.common.util.UnstableApi
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.cos
+import kotlin.math.exp
 import kotlin.math.pow
 import kotlin.math.roundToInt
 import kotlin.math.sin
 import kotlin.math.sqrt
+import kotlin.math.tanh
 
-internal data class PcmTuning(val gains: List<Float> = emptyList(), val preamp: Float = 1f, val reverb: Float = 0f) {
-    val active = preamp != 1f || reverb > 0f || gains.any { it != 0f }
+internal enum class EightDMode(val id: Int, val title: String, val description: String) {
+    FIXED(0, "Фиксированный", "Равномерное перемещение между каналами с заданным периодом."),
+    ENERGY(1, "По динамике трека", "На громких участках и припевах звук движется быстрее, на тихих — плавнее."),
+    BEATS(2, "Под биты", "Удары баса и бочки ускоряют и перебрасывают звук между каналами.");
+
+    companion object {
+        fun fromId(id: Int) = entries.firstOrNull { it.id == id } ?: FIXED
+    }
+}
+
+internal data class PcmTuning(
+    val gains: List<Float> = emptyList(),
+    val preamp: Float = 1f,
+    val reverb: Float = 0f,
+    val eightD: Boolean = false,
+    val eightDMode: EightDMode = EightDMode.FIXED,
+    val eightDPeriod: Float = 8f,
+    val eightDSmoothness: Float = .85f,
+    val eightDDepth: Float = .85f,
+    val eightDSensitivity: Float = .65f,
+) {
+    val active = preamp != 1f || reverb > 0f || eightD || gains.any { it != 0f }
 }
 
 @OptIn(UnstableApi::class)
@@ -62,6 +85,7 @@ internal class SoundDsp(private val rate: Int, private val channels: Int) {
     private var current = PcmTuning()
     private var filters = emptyArray<EqualizerBand>()
     private var hall: Array<HallReverb>? = null
+    private var spatial: Spatial8D? = null
     private var gain = 1f
     private val inputScale = .015f * minOf(1f, 2f / channels)
 
@@ -77,8 +101,11 @@ internal class SoundDsp(private val rate: Int, private val channels: Int) {
         }
         val boost = filters.maxOfOrNull { it.level }?.coerceAtLeast(0f) ?: 0f
         gain = tuning.preamp * 10f.pow(-boost / 20f)
-        if (tuning.reverb <= 0f) hall = null
+        val effectiveReverb = if (tuning.eightD) maxOf(tuning.reverb, .16f * tuning.eightDDepth) else tuning.reverb
+        if (effectiveReverb <= 0f) hall = null
         else if (hall == null) hall = Array(channels) { HallReverb(rate, it) }
+        if (!tuning.eightD || channels < 2) spatial = null
+        else if (spatial == null) spatial = Spatial8D(rate.toFloat())
         current = tuning
     }
 
@@ -90,12 +117,168 @@ internal class SoundDsp(private val rate: Int, private val channels: Int) {
             frame[channel] = sample * gain
             mono += frame[channel]
         }
+        spatial?.process(frame, current)
         val reverbs = hall
-        val mix = current.reverb
+        val mix = if (current.eightD) maxOf(current.reverb, .16f * current.eightDDepth) else current.reverb
         for (channel in frame.indices) {
             val sample = if (reverbs == null) frame[channel] else
                 frame[channel] * (1f - mix * .4f) + reverbs[channel].process(mono * inputScale) * mix * .8f
             frame[channel] = sample.coerceIn(-1f, 1f)
+        }
+    }
+}
+
+internal class Spatial8D(sampleRate: Float) {
+    private val rate = sampleRate.coerceAtLeast(8000f)
+    private val delayMask: Int
+    private val delayL: FloatArray
+    private val delayR: FloatArray
+    private var writeIndex = 0
+
+    private var phase = 0f
+    private var lowpassState = 0f
+    private var fastBassEnv = 0f
+    private var slowBassEnv = .01f
+    private var fastEnergyEnv = 0f
+    private var slowEnergyEnv = .02f
+    private var beatBoost = 0f
+    private var beatCooldown = 0
+    private var direction = 1f
+
+    private var shadeL = 0f
+    private var shadeR = 0f
+
+    private val bassAlpha: Float
+    private val fastBassAttack: Float
+    private val fastBassRelease: Float
+    private val slowBassAlpha: Float
+    private val fastEnergyAlpha: Float
+    private val slowEnergyAlpha: Float
+    private val beatDecay: Float
+    private val minBeatGap: Int
+    private val maxItdSamples: Float
+    private val baseShadeAlpha: Float
+
+    init {
+        var size = 64
+        val needed = (rate * .002f).toInt() + 5
+        while (size < needed) size = size shl 1
+        delayMask = size - 1
+        delayL = FloatArray(size)
+        delayR = FloatArray(size)
+
+        val twoPi = (2.0 * PI).toFloat()
+        bassAlpha = minOf(.5f, twoPi * 130f / rate)
+        fastBassAttack = 1f - exp(-1f / (rate * .004f))
+        fastBassRelease = 1f - exp(-1f / (rate * .045f))
+        slowBassAlpha = 1f - exp(-1f / (rate * .38f))
+        fastEnergyAlpha = 1f - exp(-1f / (rate * .12f))
+        slowEnergyAlpha = 1f - exp(-1f / (rate * 2.2f))
+        beatDecay = exp(-1f / (rate * .14f))
+        minBeatGap = (rate * .2f).toInt()
+        maxItdSamples = rate * .00048f
+        baseShadeAlpha = minOf(.85f, twoPi * 3400f / rate)
+    }
+
+    fun process(frame: FloatArray, tuning: PcmTuning) {
+        if (frame.size < 2) return
+        val left = frame[0]
+        val right = frame[1]
+        val mid = (left + right) * .5f
+        val side = (left - right) * .5f
+
+        val absMid = abs(mid)
+        fastEnergyEnv += (absMid - fastEnergyEnv) * fastEnergyAlpha
+        slowEnergyEnv += (absMid - slowEnergyEnv) * slowEnergyAlpha
+
+        lowpassState += (mid - lowpassState) * bassAlpha
+        val bass = abs(lowpassState)
+        val bassCoeff = if (bass > fastBassEnv) fastBassAttack else fastBassRelease
+        fastBassEnv += (bass - fastBassEnv) * bassCoeff
+        slowBassEnv += (bass - slowBassEnv) * slowBassAlpha
+
+        if (beatCooldown > 0) beatCooldown -= 1
+        beatBoost *= beatDecay
+
+        val sensitivity = tuning.eightDSensitivity.coerceIn(.1f, 1f)
+        var speedMultiplier = 1f
+
+        when (tuning.eightDMode) {
+            EightDMode.FIXED -> direction = 1f
+            EightDMode.ENERGY -> {
+                direction = 1f
+                val ratio = fastEnergyEnv / maxOf(.008f, slowEnergyEnv)
+                val delta = (ratio - 1f) * (1.2f + sensitivity * 2.2f)
+                speedMultiplier = (1f + delta).coerceIn(.35f, 3.4f)
+            }
+            EightDMode.BEATS -> {
+                val threshold = 1.95f - sensitivity * .72f
+                if (beatCooldown == 0 && fastBassEnv > .018f && fastBassEnv > slowBassEnv * threshold) {
+                    val strength = minOf(1f, (fastBassEnv / maxOf(.008f, slowBassEnv) - threshold) * 1.4f)
+                    beatBoost = minOf(4.5f, beatBoost + 1.6f + strength * (1.5f + sensitivity * 2f))
+                    if (strength > .55f && sensitivity > .45f) {
+                        phase += direction * (.28f + .35f * sensitivity)
+                    }
+                    beatCooldown = minBeatGap
+                }
+                speedMultiplier = .65f + beatBoost
+            }
+        }
+
+        val twoPi = (2.0 * PI).toFloat()
+        val period = tuning.eightDPeriod.coerceIn(2f, 20f)
+        val angularStep = (twoPi / (period * rate)) * speedMultiplier * direction
+        phase += angularStep
+        if (phase >= twoPi) phase -= twoPi
+        else if (phase < 0f) phase += twoPi
+
+        val depth = tuning.eightDDepth.coerceIn(0f, 1f)
+        val pan = shapedPan(phase, tuning.eightDSmoothness, depth)
+        val frontBack = cos(phase)
+
+        val stereoKeep = .35f * (1f - depth * .65f)
+        val sourceL = mid + side * stereoKeep
+        val sourceR = mid - side * stereoKeep
+
+        delayL[writeIndex] = sourceL
+        delayR[writeIndex] = sourceR
+        val delayedL = readDelay(delayL, maxOf(0f, pan) * maxItdSamples)
+        val delayedR = readDelay(delayR, maxOf(0f, -pan) * maxItdSamples)
+        writeIndex = (writeIndex + 1) and delayMask
+
+        val rearShadow = maxOf(0f, -frontBack) * .25f * depth
+        val shadowL = minOf(.75f, maxOf(0f, pan) * .55f + rearShadow)
+        val shadowR = minOf(.75f, maxOf(0f, -pan) * .55f + rearShadow)
+
+        shadeL += (delayedL - shadeL) * baseShadeAlpha
+        shadeR += (delayedR - shadeR) * baseShadeAlpha
+
+        val filteredL = delayedL * (1f - shadowL) + shadeL * shadowL
+        val filteredR = delayedR * (1f - shadowR) + shadeR * shadowR
+
+        val angle = (pan + 1f) * (PI.toFloat() * .25f)
+        val gainL = cos(angle)
+        val gainR = sin(angle)
+
+        val cross = .12f * (1f - depth * .4f)
+        frame[0] = filteredL * (gainL + cross * gainR)
+        frame[1] = filteredR * (gainR + cross * gainL)
+    }
+
+    private fun readDelay(buffer: FloatArray, offset: Float): Float {
+        val whole = offset.toInt()
+        val frac = offset - whole
+        val i0 = (writeIndex - whole) and delayMask
+        val i1 = (i0 - 1) and delayMask
+        return buffer[i0] * (1f - frac) + buffer[i1] * frac
+    }
+
+    companion object {
+        fun shapedPan(phase: Float, smoothness: Float, depth: Float): Float {
+            val raw = sin(phase)
+            val sharpness = 1f + (1f - smoothness.coerceIn(0f, 1f)) * 8f
+            val shaped = if (sharpness <= 1.001f) raw else tanh(raw * sharpness) / tanh(sharpness)
+            return shaped * depth.coerceIn(0f, 1f)
         }
     }
 }

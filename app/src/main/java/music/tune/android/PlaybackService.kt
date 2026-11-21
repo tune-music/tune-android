@@ -130,6 +130,8 @@ class PlaybackService : MediaLibraryService(), Player.Listener {
     private val settingsListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
         when {
             key == "equalizer" || key == "eqEnabled" || key == "preamp" || key == "reverb" ||
+                key == "eightD" || key == "eightDMode" || key == "eightDPeriod" ||
+                key == "eightDSmoothness" || key == "eightDDepth" || key == "eightDSensitivity" ||
                 key?.startsWith("eqStep:") == true || key?.startsWith("eqBand:") == true ->
                 effects = SoundSettings.tuning(store.preferences)
             key == "normalize" -> volume(QueueItems.track(player.currentMediaItem))

@@ -69,6 +69,39 @@ internal class SoundSheet(private val activity: MainActivity) {
                 prefs.edit().putInt("reverb", it).apply()
             })
         }.view, ui.full())
+        val eightD = prefs.getBoolean("eightD", false)
+        val eightDMode = EightDMode.fromId(prefs.getInt("eightDMode", 0))
+        rows.addView(SettingsGroup(ui, "", if (eightD) eightDMode.description else "").apply {
+            toggle("8D звук", eightD) {
+                prefs.edit().putBoolean("eightD", it).apply()
+                render()
+            }
+            if (eightD) {
+                line("Режим", eightDMode.title, chevron = true) {
+                    val modes = EightDMode.entries
+                    activity.tuneChoices("Режим 8D", modes.map { it.title }, modes.indexOf(eightDMode), dark = true) { choice ->
+                        prefs.edit().putInt("eightDMode", modes[choice].id).apply()
+                        render()
+                    }
+                }
+                val periodTitle = if (eightDMode == EightDMode.FIXED) "Период" else "База"
+                val periodSteps = (prefs.getFloat("eightDPeriod", 8f).coerceIn(2f, 20f) * 2).roundToInt()
+                add(slider(periodTitle, periodSteps, 4, 40, { "${periodText(it)} с" }, live = true) {
+                    prefs.edit().putFloat("eightDPeriod", it / 2f).apply()
+                })
+                add(slider("Плавность", prefs.getInt("eightDSmoothness", 85), 0, 100, { "$it%" }, live = true) {
+                    prefs.edit().putInt("eightDSmoothness", it).apply()
+                })
+                add(slider("Ширина", prefs.getInt("eightDDepth", 85), 0, 100, { "$it%" }, live = true) {
+                    prefs.edit().putInt("eightDDepth", it).apply()
+                })
+                if (eightDMode != EightDMode.FIXED) {
+                    add(slider("Отклик", prefs.getInt("eightDSensitivity", 65), 10, 100, { "$it%" }, live = true) {
+                        prefs.edit().putInt("eightDSensitivity", it).apply()
+                    })
+                }
+            }
+        }.view, ui.full())
         rows.addView(SettingsGroup(ui, "", "").apply {
             val enabled = SoundSettings.enabled(prefs)
             toggle("Эквалайзер", enabled) {
@@ -120,6 +153,8 @@ internal class SoundSheet(private val activity: MainActivity) {
         reset = SettingsGroup(ui, "", "").apply {
             line("Сбросить настройки звука", color = ui.palette.accentText) {
                 val edit = prefs.edit().remove("speed").remove("pitchWithSpeed").remove("reverb")
+                    .remove("eightD").remove("eightDMode").remove("eightDPeriod")
+                    .remove("eightDSmoothness").remove("eightDDepth").remove("eightDSensitivity")
                     .remove("eqEnabled").remove("equalizer").remove("preamp").remove("eqPreset")
                 SoundSettings.bands.indices.forEach { edit.remove("eqBand:$it").remove("eqStep:$it") }
                 edit.apply()
@@ -186,6 +221,10 @@ internal class SoundSheet(private val activity: MainActivity) {
     private fun speedText(value: Int) = NumberFormat.getNumberInstance(Locale.forLanguageTag("ru")).apply {
         maximumFractionDigits = 2
     }.format(value / 20f)
+
+    private fun periodText(value: Int) = NumberFormat.getNumberInstance(Locale.forLanguageTag("ru")).apply {
+        maximumFractionDigits = 1
+    }.format(value / 2f)
 
     private fun gainText(value: Int): String {
         val number = NumberFormat.getNumberInstance(Locale.forLanguageTag("ru")).apply {

@@ -72,5 +72,24 @@ class SoundProcessorTest {
         assertEquals(-1f, frame[1], .001f)
     }
 
+    @Test
+    fun spatial8DRotatesStereoChannelsAndSupportsSmoothness() {
+        val smooth = Spatial8D.shapedPan(PI.toFloat() * .25f, smoothness = 1f, depth = 1f)
+        val sharp = Spatial8D.shapedPan(PI.toFloat() * .25f, smoothness = 0f, depth = 1f)
+        assertTrue(sharp > smooth)
+        assertEquals(0f, Spatial8D.shapedPan(PI.toFloat() * .5f, smoothness = 1f, depth = 0f), .0001f)
+
+        val dsp = SoundDsp(44100, 2).apply {
+            update(PcmTuning(eightD = true, eightDMode = EightDMode.FIXED, eightDPeriod = 2f, eightDSmoothness = 1f, eightDDepth = 1f))
+        }
+        val diff = mutableListOf<Float>()
+        repeat(44100 * 2) {
+            val frame = floatArrayOf(.5f, .5f)
+            dsp.process(frame)
+            if (it % 4410 == 0) diff.add(frame[0] - frame[1])
+        }
+        assertTrue(diff.any { it > .15f } && diff.any { it < -.15f })
+    }
+
     private fun pcm(samples: Int) = ByteBuffer.allocateDirect(samples * 2).order(ByteOrder.nativeOrder())
 }
