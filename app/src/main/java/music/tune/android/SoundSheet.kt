@@ -168,7 +168,7 @@ internal class SoundSheet(private val activity: MainActivity) {
                 thumbOffset = ui.dp(10)
                 splitTrack = false
                 progress = (level - min).coerceIn(0, this.max)
-                setPadding(ui.dp(7), 0, ui.dp(7), 0)
+                setPadding(ui.dp(11), 0, ui.dp(11), 0)
                 var dragging = false
                 fun commit(position: Int) { save(min + position); updateReset() }
                 setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
