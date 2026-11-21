@@ -46,7 +46,13 @@ internal object SoundSettings {
         return PcmTuning(
             gains = if (active) gains(prefs).map { it / 2f } else emptyList(),
             preamp = if (active) prefs.getInt("preamp", 100).coerceIn(50, 150) / 100f else 1f,
-            reverb = prefs.getInt("reverb", 0).coerceIn(0, 100) / 100f
+            reverb = prefs.getInt("reverb", 0).coerceIn(0, 100) / 100f,
+            eightD = prefs.getBoolean("eightD", false),
+            eightDMode = EightDMode.fromId(prefs.getInt("eightDMode", 0)),
+            eightDPeriod = prefs.getFloat("eightDPeriod", 8f).coerceIn(2f, 20f),
+            eightDSmoothness = prefs.getInt("eightDSmoothness", 85).coerceIn(0, 100) / 100f,
+            eightDDepth = prefs.getInt("eightDDepth", 85).coerceIn(0, 100) / 100f,
+            eightDSensitivity = prefs.getInt("eightDSensitivity", 65).coerceIn(10, 100) / 100f,
         )
     }
 
