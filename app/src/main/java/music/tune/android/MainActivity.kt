@@ -2155,8 +2155,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
                                 addView(ui.row().apply {
                                     gravity = Gravity.CENTER_VERTICAL
                                     addView(IconView(this@MainActivity, Symbol.UNLOCK, ui.palette.muted).apply { iconSize = 13 },
-                                        LinearLayout.LayoutParams(ui.dp(14), ui.dp(14)))
-                                    addView(ui.space(6))
+                                        LinearLayout.LayoutParams(ui.dp(14), ui.dp(14)).apply { marginEnd = ui.dp(6) })
                                     addView(ui.text("Есть треки без цензуры", 13, ui.palette.muted))
                                 })
                             }
