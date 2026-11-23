@@ -435,6 +435,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
                 launch { store.waveExtras.wheel.collect { waveHead?.bindWheel() } }
                 launch { store.ynison.state.collect { if (route.screen == Screen.DEVICES && userId != null) devices() } }
                 launch { store.ynison.connection.collect { if (route.screen == Screen.DEVICES && userId != null) devices() } }
+                launch { store.ynison.detail.collect { if (route.screen == Screen.DEVICES && userId != null) devices() } }
                 launch { store.files.revision.collect {
                     if (route.screen == Screen.DOWNLOADS && userId != null) downloads()
                     if (route.screen == Screen.SETTINGS && userId != null) refreshSettingsStorage()
@@ -2979,7 +2980,9 @@ class MainActivity : ComponentActivity(), Player.Listener {
                 }, ui.full())
                 if (card.subtitle.isNotBlank() && (card.kind != Kind.ARTIST || card.subtitle != "Исполнитель")) {
                     addView(ui.space(4))
-                    addView(ui.line(card.subtitle, 13, ui.palette.muted))
+                    addView(ui.line(card.subtitle, 13, ui.palette.muted).apply {
+                        if (card.kind == Kind.ARTIST) gravity = Gravity.CENTER_HORIZONTAL
+                    }, ui.full())
                 }
                 layoutParams = LinearLayout.LayoutParams(ui.dp(148), -2)
                 setOnClickListener { openCard(card) }
@@ -3044,11 +3047,17 @@ class MainActivity : ComponentActivity(), Player.Listener {
                     val artist = card.kind == Kind.ARTIST
                     addView(ui.column().apply {
                         background = ui.touch()
+                        if (artist) gravity = Gravity.CENTER_HORIZONTAL
                         addView(ui.art(card.cover, 500, artist, 14), LinearLayout.LayoutParams(ui.dp(width), ui.dp(width)))
                         addView(ui.space(8))
-                        addView(ui.line(card.title, 15, bold = true))
-                        if (card.subtitle.isNotBlank()) {
-                            addView(ui.space(4)); addView(ui.line(card.subtitle, 12, ui.palette.muted))
+                        addView(ui.line(card.title, 15, bold = true).apply {
+                            if (artist) gravity = Gravity.CENTER_HORIZONTAL
+                        }, ui.full())
+                        if (card.subtitle.isNotBlank() && (!artist || card.subtitle != "Исполнитель")) {
+                            addView(ui.space(4))
+                            addView(ui.line(card.subtitle, 12, ui.palette.muted).apply {
+                                if (artist) gravity = Gravity.CENTER_HORIZONTAL
+                            }, ui.full())
                         }
                         setOnClickListener { openCard(card) }
                         setOnLongClickListener { cardMenu(card, it); true }
@@ -4042,6 +4051,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
 
     internal fun openDevices() {
         if (controller == null && controllerFuture == null) connectPlayer()
+        store.ynison.ensureConnected()
         push(Screen.DEVICES)
     }
 
@@ -4399,6 +4409,9 @@ class MainActivity : ComponentActivity(), Player.Listener {
                     add(Row.Layout {
                         settingsGroupView {
                             line(sync.connection.value, color = ui.palette.muted)
+                            sync.detail.value?.takeIf(String::isNotBlank)?.let {
+                                line(it, color = ui.palette.muted)
+                            }
                             if (store.offline) line("Для подключения устройств нужен интернет", icon = Symbol.WIFI_OFF, color = ui.palette.muted)
                             else line("Повторить подключение", icon = Symbol.REPEAT, color = ui.palette.accentText) { sync.reconnect() }
                         }
