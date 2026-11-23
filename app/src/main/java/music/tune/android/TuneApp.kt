@@ -547,6 +547,12 @@ internal class MusicStore(val context: Context) {
             { it.arr("cards").objects().mapNotNull(Card::fromCache) }, onCached) { online { likedCards(uid, kind) } }
     }
 
+    suspend fun topArtists(onCached: ((List<Card>) -> Unit)? = null): List<Card> {
+        requireUser()
+        return cached("collection:top-artists", { JSONObject().put("cards", JSONArray(it.map(Card::cached))) },
+            { it.arr("cards").objects().mapNotNull(Card::fromCache) }, onCached) { online { topArtists() } }
+    }
+
     suspend fun cachedSearch(query: String, type: String): SearchResults? {
         val key = SearchCache.Key(requireUser().uid, query, type, alternateEnabled)
         return withContext(Dispatchers.IO) { searchCache.read(key) }

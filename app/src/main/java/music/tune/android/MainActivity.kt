@@ -52,6 +52,7 @@ import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
@@ -2024,14 +2025,40 @@ class MainActivity : ComponentActivity(), Player.Listener {
     private fun collection(screen: Screen) = loadRows(
         loading = { listOf(Row.Layout { ui.loadingGrid(circle = screen == Screen.ARTISTS) }) }
     ) { showCached ->
-        val kind = if (screen == Screen.ARTISTS) Kind.ARTIST else Kind.ALBUM
-        val cards = store.collection(kind, onCached = showCached?.let { display ->
-            { cached -> if (cached.isNotEmpty()) display(collectionRows(screen, cached)) }
-        })
-        collectionRows(screen, cards)
+        if (screen == Screen.ARTISTS) {
+            var cachedTop = emptyList<Card>()
+            var cachedLiked = emptyList<Card>()
+            fun publishCached() {
+                if (cachedTop.isNotEmpty() || cachedLiked.isNotEmpty()) {
+                    showCached?.invoke(collectionRows(screen, cachedLiked, cachedTop))
+                }
+            }
+            coroutineScope {
+                val topDeferred = async {
+                    try {
+                        store.topArtists(onCached = showCached?.let {
+                            { cached -> cachedTop = cached; publishCached() }
+                        })
+                    } catch (_: java.io.IOException) {
+                        emptyList()
+                    }
+                }
+                val likedDeferred = async {
+                    store.collection(Kind.ARTIST, onCached = showCached?.let {
+                        { cached -> cachedLiked = cached; publishCached() }
+                    })
+                }
+                collectionRows(screen, likedDeferred.await(), topDeferred.await())
+            }
+        } else {
+            val cards = store.collection(Kind.ALBUM, onCached = showCached?.let { display ->
+                { cached -> if (cached.isNotEmpty()) display(collectionRows(screen, cached)) }
+            })
+            collectionRows(screen, cards)
+        }
     }
 
-    private fun collectionRows(screen: Screen, cards: List<Card>): List<Row> {
+    private fun collectionRows(screen: Screen, cards: List<Card>, topArtists: List<Card> = emptyList()): List<Row> {
         val filtered = cards.filter { card ->
             when (screen) {
                 Screen.PODCASTS -> card.releaseType == "podcast"
@@ -2045,6 +2072,16 @@ class MainActivity : ComponentActivity(), Player.Listener {
             1 -> filtered.sortedWith(compareBy(collator) { it.title })
             2 -> filtered.sortedWith(compareBy(collator) { it.subtitle })
             else -> filtered
+        }
+        if (screen == Screen.ARTISTS && topArtists.isNotEmpty()) {
+            return buildList {
+                add(section("Ваш топ месяца"))
+                addAll(gridRows(topArtists))
+                if (ordered.isNotEmpty()) {
+                    add(section("Вам нравятся"))
+                    addAll(gridRows(ordered))
+                }
+            }
         }
         return gridRows(ordered).ifEmpty { listOf(note("В коллекции пока пусто")) }
     }
@@ -4004,6 +4041,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
     }
 
     internal fun openDevices() {
+        if (controller == null && controllerFuture == null) connectPlayer()
         push(Screen.DEVICES)
     }
 

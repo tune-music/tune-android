@@ -21,7 +21,6 @@ import okhttp3.WebSocketListener
 import okio.ByteString
 import org.json.JSONArray
 import org.json.JSONObject
-import java.net.URLEncoder
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 import kotlin.math.abs
@@ -65,9 +64,25 @@ internal data class YnisonState(
 )
 
 internal object YnisonProtocol {
+    const val ORIGIN = "https://music.yandex.ru"
     const val ROUTER = "ynison.music.yandex.ru"
     const val REDIRECT = "/redirector.YnisonRedirectService/GetRedirectToYnison"
     const val HUB = "/ynison_state.YnisonStateService/PutYnisonState"
+    private const val HEX_DIGITS = "0123456789ABCDEF"
+
+    private fun encodeURIComponent(text: String): String = buildString {
+        for (byte in text.toByteArray(Charsets.UTF_8)) {
+            val code = byte.toInt() and 0xFF
+            val ch = code.toChar()
+            if (ch in 'A'..'Z' || ch in 'a'..'z' || ch in '0'..'9' || ch in "-_.!~*'()") {
+                append(ch)
+            } else {
+                append('%')
+                append(HEX_DIGITS[code ushr 4])
+                append(HEX_DIGITS[code and 0x0F])
+            }
+        }
+    }
 
     fun url(host: String, path: String): String {
         val normalized = host.lowercase(java.util.Locale.ROOT)
@@ -80,8 +95,10 @@ internal object YnisonProtocol {
 
     fun protocols(token: String, id: String, extra: JSONObject): String {
         val info = JSONObject().put("app_name", "Desktop").put("app_version", "5.120.0").put("type", 1)
-        val params = extra.put("Ynison-Device-Id", id).put("Ynison-Device-Info", info.toString()).put("authorization", "OAuth $token")
-        val value = URLEncoder.encode(params.toString(), "UTF-8").replace("+", "%20")
+        val params = extra.put("Ynison-Device-Id", id)
+            .put("Ynison-Device-Info", info.toString().replace("\\/", "/"))
+            .put("authorization", "OAuth $token")
+        val value = encodeURIComponent(params.toString().replace("\\/", "/"))
         return "Bearer, v2, $value"
     }
 
@@ -217,7 +234,8 @@ internal class Ynison(private val store: MusicStore) {
                 } catch (error: Exception) {
                     if (error is CancellationException && !isActive) throw error
                     if (turn != generation) break
-                    retry = (error as? Retry)?.seconds ?: (retry * 2).coerceAtMost(60)
+                    val wasConnected = _connection.value == CONNECTED
+                    retry = (error as? Retry)?.seconds ?: if (wasConnected) 2L else (retry * 2).coerceAtMost(60)
                     _connection.value = "Повторное подключение…"
                     delay(retry * 1_000)
                 }
@@ -262,6 +280,7 @@ internal class Ynison(private val store: MusicStore) {
 
     private fun open(host: String, path: String, token: String, extras: JSONObject = JSONObject()): Socket {
         val request = Request.Builder().url(YnisonProtocol.url(host, path))
+            .header("Origin", YnisonProtocol.ORIGIN)
             .header("Sec-WebSocket-Protocol", YnisonProtocol.protocols(token, deviceId, extras)).build()
         return Socket(client, request)
     }
