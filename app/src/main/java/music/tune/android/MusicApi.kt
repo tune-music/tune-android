@@ -204,6 +204,9 @@ internal class MusicApi(
 
     fun topArtists(): List<Card> = parseTopArtists(get("personal/top/artists/month").objectValue(), ::artistCard)
 
+    fun artistCover(id: String): String? =
+        artistCard(get("artists/${segment(id)}/brief-info").objectValue().obj("artist"))?.cover
+
     fun setCardLiked(uid: String, card: Card, add: Boolean) {
         val users = "users/${segment(uid)}/likes"
         when (card.kind) {

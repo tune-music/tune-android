@@ -1062,7 +1062,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
                 addView(item, LinearLayout.LayoutParams(0, ui.dp(48), 1f))
             }
         }
-        content.addView(navigation, ui.full(54).apply { setMargins(ui.dp(20), 0, ui.dp(20), ui.dp(5)) })
+        content.addView(navigation, ui.full(54).apply { setMargins(ui.dp(10), 0, ui.dp(10), ui.dp(5)) })
     }
 
     private fun searchBar(): View = ui.row().apply {
@@ -4470,7 +4470,9 @@ class MainActivity : ComponentActivity(), Player.Listener {
 
     private fun stats(): Unit = loadRows {
         val uid = store.requireUser().uid
-        val data = store.listening.summary(uid, statsDays)
+        val period = statsDays
+        val data = store.listening.summary(uid, period)
+        val cachedCovers = store.cachedArtistCovers(data.artists.map { it.first.id }.filter(String::isNotBlank))
         val hasAny = data.count > 0 || (statsDays != null && store.listening.summary(uid, null).count > 0)
         statsClearButton?.apply {
             isEnabled = hasAny
@@ -4520,7 +4522,18 @@ class MainActivity : ComponentActivity(), Player.Listener {
                 addAll(trackRows(data.songs.map { it.first }, PlayContext(name = "Любимые треки"), numbered = true))
                 if (data.artists.isNotEmpty()) {
                     add(heading("Любимые исполнители"))
-                    add(shelfRow(data.artists.map { (artist, count) -> artist.copy(subtitle = plural(count, "раз", "раза", "раз")) }))
+                    val missing = data.artists.map { it.first.id }.filter { it.isNotBlank() && cachedCovers[it] == null }
+                    if (missing.isNotEmpty() && !store.offline) {
+                        action(onError = {}) {
+                            val added = store.loadMissingArtistCovers(missing)
+                            if (added.isNotEmpty() && userId == uid && route.screen == Screen.STATS && statsDays == period) {
+                                stats()
+                            }
+                        }
+                    }
+                    add(shelfRow(data.artists.map { (artist, count) ->
+                        artist.copy(cover = cachedCovers[artist.id] ?: artist.cover, subtitle = plural(count, "раз", "раза", "раз"))
+                    }))
                 }
             }
         }

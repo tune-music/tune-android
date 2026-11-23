@@ -25,4 +25,27 @@ class TopArtistsTest {
             parsed.map { it.subtitle }
         )
     }
+
+    @Test
+    fun prefersSoloTrackCoverOverFeatureCoverInListeningSummary() {
+        val feat = Track(
+            id = "1",
+            title = "Фит",
+            artists = listOf(Card(Kind.ARTIST, "a1", "Артист 1"), Card(Kind.ARTIST, "a2", "Артист 2")),
+            cover = "feat-cover",
+            duration = 120_000,
+        )
+        val solo = Track(
+            id = "2",
+            title = "Соло",
+            artists = listOf(Card(Kind.ARTIST, "a1", "Артист 1")),
+            cover = "solo-cover",
+            duration = 120_000,
+        )
+
+        val summary = summarizeListening(sequenceOf(feat to 120_000L, feat to 120_000L, solo to 120_000L))
+        val byId = summary.artists.associate { it.first.id to it.first.cover }
+        assertEquals("solo-cover", byId["a1"])
+        assertEquals("feat-cover", byId["a2"])
+    }
 }

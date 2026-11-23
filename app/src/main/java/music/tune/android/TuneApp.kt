@@ -78,6 +78,8 @@ internal class MusicStore(val context: Context) {
     val uploads = UserUploads(this)
     val externalLyrics = ExternalLyrics(this)
     private val searchCache = SearchCache(context.cacheDir)
+    private val artistCoverCache = java.util.concurrent.ConcurrentHashMap<String, String>()
+    @Volatile private var artistCoverCacheLoaded = false
     @Volatile private var token: String? = preferences.getString("activeAccount", null)?.let(vault::read) ?: vault.read()
 
     init {
@@ -551,6 +553,45 @@ internal class MusicStore(val context: Context) {
         requireUser()
         return cached("collection:top-artists", { JSONObject().put("cards", JSONArray(it.map(Card::cached))) },
             { it.arr("cards").objects().mapNotNull(Card::fromCache) }, onCached) { online { topArtists() } }
+    }
+
+    private fun artistCoverFile() = AtomicFile(File(context.cacheDir, "artist-covers.json"))
+
+    private suspend fun ensureArtistCoverCache() {
+        if (artistCoverCacheLoaded) return
+        val loaded = readCache(artistCoverFile()) { raw -> JSONObject(raw) }
+        if (loaded != null) {
+            for (key in loaded.keys()) {
+                val value = loaded.optString(key)
+                if (value.isNotBlank()) artistCoverCache.putIfAbsent(key, value)
+            }
+        }
+        artistCoverCacheLoaded = true
+    }
+
+    suspend fun cachedArtistCovers(ids: List<String>): Map<String, String> {
+        ensureArtistCoverCache()
+        return ids.mapNotNull { id -> artistCoverCache[id]?.let { id to it } }.toMap()
+    }
+
+    suspend fun loadMissingArtistCovers(ids: List<String>): Map<String, String> {
+        ensureArtistCoverCache()
+        val missing = ids.filter { it.isNotBlank() && artistCoverCache[it] == null }.distinct()
+        if (missing.isEmpty() || offline) return emptyMap()
+        val fetched = coroutineScope {
+            missing.map { id ->
+                async {
+                    val cover = optional { online { artistCover(id) } }
+                    if (!cover.isNullOrBlank()) id to cover else null
+                }
+            }.awaitAll().filterNotNull().toMap()
+        }
+        if (fetched.isNotEmpty()) {
+            artistCoverCache.putAll(fetched)
+            val snapshot = JSONObject(artistCoverCache.toMap())
+            withContext(Dispatchers.IO) { optional { artistCoverFile().writeText(snapshot.toString()) } }
+        }
+        return fetched
     }
 
     suspend fun cachedSearch(query: String, type: String): SearchResults? {
