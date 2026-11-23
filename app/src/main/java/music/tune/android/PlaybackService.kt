@@ -180,6 +180,7 @@ class PlaybackService : MediaLibraryService(), Player.Listener {
         store.preferences.registerOnSharedPreferenceChangeListener(settingsListener)
         optional { connectivity.registerDefaultNetworkCallback(networkCallback) }
         speed()
+        store.ynison.bind(player, store.profile.value?.uid)
         scope.launch {
             store.profile.collectLatest { user ->
                 if (activeUser == user?.uid) return@collectLatest

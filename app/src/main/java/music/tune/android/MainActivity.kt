@@ -52,6 +52,7 @@ import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
@@ -434,6 +435,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
                 launch { store.waveExtras.wheel.collect { waveHead?.bindWheel() } }
                 launch { store.ynison.state.collect { if (route.screen == Screen.DEVICES && userId != null) devices() } }
                 launch { store.ynison.connection.collect { if (route.screen == Screen.DEVICES && userId != null) devices() } }
+                launch { store.ynison.detail.collect { if (route.screen == Screen.DEVICES && userId != null) devices() } }
                 launch { store.files.revision.collect {
                     if (route.screen == Screen.DOWNLOADS && userId != null) downloads()
                     if (route.screen == Screen.SETTINGS && userId != null) refreshSettingsStorage()
@@ -1060,7 +1062,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
                 addView(item, LinearLayout.LayoutParams(0, ui.dp(48), 1f))
             }
         }
-        content.addView(navigation, ui.full(54).apply { setMargins(ui.dp(20), 0, ui.dp(20), ui.dp(5)) })
+        content.addView(navigation, ui.full(54).apply { setMargins(ui.dp(10), 0, ui.dp(10), ui.dp(5)) })
     }
 
     private fun searchBar(): View = ui.row().apply {
@@ -2024,14 +2026,40 @@ class MainActivity : ComponentActivity(), Player.Listener {
     private fun collection(screen: Screen) = loadRows(
         loading = { listOf(Row.Layout { ui.loadingGrid(circle = screen == Screen.ARTISTS) }) }
     ) { showCached ->
-        val kind = if (screen == Screen.ARTISTS) Kind.ARTIST else Kind.ALBUM
-        val cards = store.collection(kind, onCached = showCached?.let { display ->
-            { cached -> if (cached.isNotEmpty()) display(collectionRows(screen, cached)) }
-        })
-        collectionRows(screen, cards)
+        if (screen == Screen.ARTISTS) {
+            var cachedTop = emptyList<Card>()
+            var cachedLiked = emptyList<Card>()
+            fun publishCached() {
+                if (cachedTop.isNotEmpty() || cachedLiked.isNotEmpty()) {
+                    showCached?.invoke(collectionRows(screen, cachedLiked, cachedTop))
+                }
+            }
+            coroutineScope {
+                val topDeferred = async {
+                    try {
+                        store.topArtists(onCached = showCached?.let {
+                            { cached -> cachedTop = cached; publishCached() }
+                        })
+                    } catch (_: java.io.IOException) {
+                        emptyList()
+                    }
+                }
+                val likedDeferred = async {
+                    store.collection(Kind.ARTIST, onCached = showCached?.let {
+                        { cached -> cachedLiked = cached; publishCached() }
+                    })
+                }
+                collectionRows(screen, likedDeferred.await(), topDeferred.await())
+            }
+        } else {
+            val cards = store.collection(Kind.ALBUM, onCached = showCached?.let { display ->
+                { cached -> if (cached.isNotEmpty()) display(collectionRows(screen, cached)) }
+            })
+            collectionRows(screen, cards)
+        }
     }
 
-    private fun collectionRows(screen: Screen, cards: List<Card>): List<Row> {
+    private fun collectionRows(screen: Screen, cards: List<Card>, topArtists: List<Card> = emptyList()): List<Row> {
         val filtered = cards.filter { card ->
             when (screen) {
                 Screen.PODCASTS -> card.releaseType == "podcast"
@@ -2045,6 +2073,16 @@ class MainActivity : ComponentActivity(), Player.Listener {
             1 -> filtered.sortedWith(compareBy(collator) { it.title })
             2 -> filtered.sortedWith(compareBy(collator) { it.subtitle })
             else -> filtered
+        }
+        if (screen == Screen.ARTISTS && topArtists.isNotEmpty()) {
+            return buildList {
+                add(section("Ваш топ месяца"))
+                addAll(gridRows(topArtists))
+                if (ordered.isNotEmpty()) {
+                    add(section("Вам нравятся"))
+                    addAll(gridRows(ordered))
+                }
+            }
         }
         return gridRows(ordered).ifEmpty { listOf(note("В коллекции пока пусто")) }
     }
@@ -2117,8 +2155,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
                                 addView(ui.row().apply {
                                     gravity = Gravity.CENTER_VERTICAL
                                     addView(IconView(this@MainActivity, Symbol.UNLOCK, ui.palette.muted).apply { iconSize = 13 },
-                                        LinearLayout.LayoutParams(ui.dp(14), ui.dp(14)))
-                                    addView(ui.space(6))
+                                        LinearLayout.LayoutParams(ui.dp(14), ui.dp(14)).apply { marginEnd = ui.dp(6) })
                                     addView(ui.text("Есть треки без цензуры", 13, ui.palette.muted))
                                 })
                             }
@@ -2942,7 +2979,9 @@ class MainActivity : ComponentActivity(), Player.Listener {
                 }, ui.full())
                 if (card.subtitle.isNotBlank() && (card.kind != Kind.ARTIST || card.subtitle != "Исполнитель")) {
                     addView(ui.space(4))
-                    addView(ui.line(card.subtitle, 13, ui.palette.muted))
+                    addView(ui.line(card.subtitle, 13, ui.palette.muted).apply {
+                        if (card.kind == Kind.ARTIST) gravity = Gravity.CENTER_HORIZONTAL
+                    }, ui.full())
                 }
                 layoutParams = LinearLayout.LayoutParams(ui.dp(148), -2)
                 setOnClickListener { openCard(card) }
@@ -3007,11 +3046,17 @@ class MainActivity : ComponentActivity(), Player.Listener {
                     val artist = card.kind == Kind.ARTIST
                     addView(ui.column().apply {
                         background = ui.touch()
+                        if (artist) gravity = Gravity.CENTER_HORIZONTAL
                         addView(ui.art(card.cover, 500, artist, 14), LinearLayout.LayoutParams(ui.dp(width), ui.dp(width)))
                         addView(ui.space(8))
-                        addView(ui.line(card.title, 15, bold = true))
-                        if (card.subtitle.isNotBlank()) {
-                            addView(ui.space(4)); addView(ui.line(card.subtitle, 12, ui.palette.muted))
+                        addView(ui.line(card.title, 15, bold = true).apply {
+                            if (artist) gravity = Gravity.CENTER_HORIZONTAL
+                        }, ui.full())
+                        if (card.subtitle.isNotBlank() && (!artist || card.subtitle != "Исполнитель")) {
+                            addView(ui.space(4))
+                            addView(ui.line(card.subtitle, 12, ui.palette.muted).apply {
+                                if (artist) gravity = Gravity.CENTER_HORIZONTAL
+                            }, ui.full())
                         }
                         setOnClickListener { openCard(card) }
                         setOnLongClickListener { cardMenu(card, it); true }
@@ -3977,8 +4022,9 @@ class MainActivity : ComponentActivity(), Player.Listener {
     private fun changes() {
         rows(listOf(
             heading("Tune ${BuildConfig.VERSION_NAME}"),
-            note("На страницах альбомов появились подпись лейбла и общая длительность, биография исполнителя сворачивается в 3 строки с кнопкой «Читать дальше», имя артиста в шапке альбома кликабельно, а в «Лучшем результате» поиска видны живые столбцы воспроизведения."),
+            note("Исправлена синхронизация устройств (Ynison), в коллекции исполнителей появился «Ваш топ месяца», поправлены обложки артистов в статистике, выравнивание подписей, ширина нижней панели без трека и строка о треках без цензуры в альбомах."),
             heading("В прошлых версиях"),
+            note("На страницах альбомов появились подпись лейбла и общая длительность, биография исполнителя сворачивается в 3 строки с кнопкой «Читать дальше», имя артиста в шапке альбома кликабельно, а в «Лучшем результате» поиска видны живые столбцы воспроизведения."),
             note("В «Очереди» плеера добавлен режим «Изменить» для перестановки и удаления треков, а окно добавления в плейлист теперь показывает обложки и число треков."),
             note("Добавлены сортировка «Сначала старые», галочки текущего выбора в списках, автооткрытие ссылок из поиска и подписи числа треков у плейлистов в коллекции."),
             note("Обновлены экраны «Статистика», «Занятое место», «Устройства» и «Подмена» — карточки, сводные плитки, нумерация любимых треков и очистка статистики в панели сверху."),
@@ -4004,6 +4050,8 @@ class MainActivity : ComponentActivity(), Player.Listener {
     }
 
     internal fun openDevices() {
+        if (controller == null && controllerFuture == null) connectPlayer()
+        store.ynison.ensureConnected()
         push(Screen.DEVICES)
     }
 
@@ -4361,6 +4409,9 @@ class MainActivity : ComponentActivity(), Player.Listener {
                     add(Row.Layout {
                         settingsGroupView {
                             line(sync.connection.value, color = ui.palette.muted)
+                            sync.detail.value?.takeIf(String::isNotBlank)?.let {
+                                line(it, color = ui.palette.muted)
+                            }
                             if (store.offline) line("Для подключения устройств нужен интернет", icon = Symbol.WIFI_OFF, color = ui.palette.muted)
                             else line("Повторить подключение", icon = Symbol.REPEAT, color = ui.palette.accentText) { sync.reconnect() }
                         }
@@ -4419,7 +4470,9 @@ class MainActivity : ComponentActivity(), Player.Listener {
 
     private fun stats(): Unit = loadRows {
         val uid = store.requireUser().uid
-        val data = store.listening.summary(uid, statsDays)
+        val period = statsDays
+        val data = store.listening.summary(uid, period)
+        val cachedCovers = store.cachedArtistCovers(data.artists.map { it.first.id }.filter(String::isNotBlank))
         val hasAny = data.count > 0 || (statsDays != null && store.listening.summary(uid, null).count > 0)
         statsClearButton?.apply {
             isEnabled = hasAny
@@ -4469,7 +4522,18 @@ class MainActivity : ComponentActivity(), Player.Listener {
                 addAll(trackRows(data.songs.map { it.first }, PlayContext(name = "Любимые треки"), numbered = true))
                 if (data.artists.isNotEmpty()) {
                     add(heading("Любимые исполнители"))
-                    add(shelfRow(data.artists.map { (artist, count) -> artist.copy(subtitle = plural(count, "раз", "раза", "раз")) }))
+                    val missing = data.artists.map { it.first.id }.filter { it.isNotBlank() && cachedCovers[it] == null }
+                    if (missing.isNotEmpty() && !store.offline) {
+                        action(onError = {}) {
+                            val added = store.loadMissingArtistCovers(missing)
+                            if (added.isNotEmpty() && userId == uid && route.screen == Screen.STATS && statsDays == period) {
+                                stats()
+                            }
+                        }
+                    }
+                    add(shelfRow(data.artists.map { (artist, count) ->
+                        artist.copy(cover = cachedCovers[artist.id] ?: artist.cover, subtitle = plural(count, "раз", "раза", "раз"))
+                    }))
                 }
             }
         }

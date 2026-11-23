@@ -21,7 +21,6 @@ import okhttp3.WebSocketListener
 import okio.ByteString
 import org.json.JSONArray
 import org.json.JSONObject
-import java.net.URLEncoder
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 import kotlin.math.abs
@@ -65,9 +64,25 @@ internal data class YnisonState(
 )
 
 internal object YnisonProtocol {
+    const val ORIGIN = "https://music.yandex.ru"
     const val ROUTER = "ynison.music.yandex.ru"
     const val REDIRECT = "/redirector.YnisonRedirectService/GetRedirectToYnison"
     const val HUB = "/ynison_state.YnisonStateService/PutYnisonState"
+    private const val HEX_DIGITS = "0123456789ABCDEF"
+
+    private fun encodeURIComponent(text: String): String = buildString {
+        for (byte in text.toByteArray(Charsets.UTF_8)) {
+            val code = byte.toInt() and 0xFF
+            val ch = code.toChar()
+            if (ch in 'A'..'Z' || ch in 'a'..'z' || ch in '0'..'9' || ch in "-_.!~*'()") {
+                append(ch)
+            } else {
+                append('%')
+                append(HEX_DIGITS[code ushr 4])
+                append(HEX_DIGITS[code and 0x0F])
+            }
+        }
+    }
 
     fun url(host: String, path: String): String {
         val normalized = host.lowercase(java.util.Locale.ROOT)
@@ -80,8 +95,10 @@ internal object YnisonProtocol {
 
     fun protocols(token: String, id: String, extra: JSONObject): String {
         val info = JSONObject().put("app_name", "Desktop").put("app_version", "5.120.0").put("type", 1)
-        val params = extra.put("Ynison-Device-Id", id).put("Ynison-Device-Info", info.toString()).put("authorization", "OAuth $token")
-        val value = URLEncoder.encode(params.toString(), "UTF-8").replace("+", "%20")
+        val params = extra.put("Ynison-Device-Id", id)
+            .put("Ynison-Device-Info", info.toString().replace("\\/", "/"))
+            .put("authorization", "OAuth $token")
+        val value = encodeURIComponent(params.toString().replace("\\/", "/"))
         return "Bearer, v2, $value"
     }
 
@@ -158,6 +175,8 @@ internal class Ynison(private val store: MusicStore) {
     val state = _state.asStateFlow()
     private val _connection = MutableStateFlow("Выключена")
     val connection = _connection.asStateFlow()
+    private val _detail = MutableStateFlow<String?>(null)
+    val detail = _detail.asStateFlow()
     private val client = OkHttpClient.Builder().followRedirects(false).followSslRedirects(false)
         .pingInterval(25, TimeUnit.SECONDS).build()
     private var runner: Job? = null
@@ -192,6 +211,10 @@ internal class Ynison(private val store: MusicStore) {
         reconnect()
     }
 
+    fun ensureConnected() {
+        if (enabled && runner?.isActive != true) reconnect()
+    }
+
     fun reconnect() {
         generation++
         runner?.cancel()
@@ -205,10 +228,19 @@ internal class Ynison(private val store: MusicStore) {
         val token = store.ynisonToken()
         if (!enabled || uid == null || token == null || bound == null) {
             _connection.value = if (enabled) "Нет подключения" else "Выключена"
+            _detail.value = when {
+                !enabled -> null
+                store.offline -> "Включён офлайн-режим"
+                bound == null -> "Плеер ещё не подключён"
+                uid == null -> "Аккаунт не загружен"
+                token == null -> "Нет токена авторизации"
+                else -> null
+            }
             return
         }
         val turn = generation
         _connection.value = "Подключение…"
+        _detail.value = null
         runner = store.scope.launch {
             var retry = 2L
             while (isActive && turn == generation) {
@@ -217,15 +249,17 @@ internal class Ynison(private val store: MusicStore) {
                 } catch (error: Exception) {
                     if (error is CancellationException && !isActive) throw error
                     if (turn != generation) break
-                    retry = (error as? Retry)?.seconds ?: (retry * 2).coerceAtMost(60)
+                    val wasConnected = _connection.value == CONNECTED
+                    retry = (error as? Retry)?.seconds ?: if (wasConnected) 2L else (retry * 2).coerceAtMost(60)
                     _connection.value = "Повторное подключение…"
+                    _detail.value = (error as? Retry)?.reason ?: error.message ?: error::class.java.simpleName
                     delay(retry * 1_000)
                 }
             }
         }
     }
 
-    private class Retry(val seconds: Long?) : Exception()
+    private class Retry(val seconds: Long?, val reason: String? = null) : Exception(reason)
 
     private class Socket(client: OkHttpClient, request: Request) : AutoCloseable {
         private val channel = Channel<String>(capacity = 16)
@@ -238,19 +272,33 @@ internal class Ynison(private val store: MusicStore) {
                 if (text.length > 4 * 1024 * 1024 || channel.trySend(text).isFailure) webSocket.cancel()
             }
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                val code = response?.code
                 response?.close()
-                channel.close(Retry(null))
+                val detail = listOfNotNull(code?.let { "HTTP $it" }, t.message?.takeIf(String::isNotBlank))
+                    .joinToString(": ").ifBlank { t::class.java.simpleName }
+                channel.close(Retry(null, detail))
             }
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
                 webSocket.close(code, null)
-                channel.close(Retry(null))
+                val suffix = reason.takeIf(String::isNotBlank)?.let { ": $it" }.orEmpty()
+                channel.close(Retry(null, "Закрыто ($code$suffix)"))
+            }
+            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                val suffix = reason.takeIf(String::isNotBlank)?.let { ": $it" }.orEmpty()
+                channel.close(Retry(null, "Закрыто ($code$suffix)"))
             }
         })
 
         suspend fun receive(): JSONObject {
             val value = JSONObject(channel.receive())
-            if (value.optJSONObject("error") != null) throw Retry(value.obj("error").obj("details")
-                .optLong("ynison-go-away-for-seconds").takeIf { it > 0 }?.coerceAtMost(3600))
+            val error = value.optJSONObject("error")
+            if (error != null) {
+                val delay = error.obj("details").optLong("ynison-go-away-for-seconds").takeIf { it > 0 }?.coerceAtMost(3600)
+                val code = error.text("http_code") ?: error.text("grpc_code")
+                val msg = error.text("message") ?: "Ошибка Ynison"
+                val reason = if (code != null) "$msg ($code)" else msg
+                throw Retry(delay, reason)
+            }
             return value
         }
 
@@ -262,6 +310,7 @@ internal class Ynison(private val store: MusicStore) {
 
     private fun open(host: String, path: String, token: String, extras: JSONObject = JSONObject()): Socket {
         val request = Request.Builder().url(YnisonProtocol.url(host, path))
+            .header("Origin", YnisonProtocol.ORIGIN)
             .header("Sec-WebSocket-Protocol", YnisonProtocol.protocols(token, deviceId, extras)).build()
         return Socket(client, request)
     }
@@ -345,6 +394,7 @@ internal class Ynison(private val store: MusicStore) {
         val incoming = YnisonProtocol.state(value) ?: return
         val player = bound ?: return
         _connection.value = CONNECTED
+        _detail.value = null
         val previous = state.value
         if (incoming == previous) return
         received = SystemClock.elapsedRealtime()
