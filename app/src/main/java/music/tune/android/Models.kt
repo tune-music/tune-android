@@ -281,6 +281,23 @@ internal data class LyricsText(
 }
 internal data class Stream(val urls: List<String>, val key: String? = null, val codec: String = "mp3")
 internal data class PlayContext(val kind: String = "various", val item: String? = null, val name: String = "", val wave: String? = null)
+internal data class TrackFilter(val id: String, val name: String, val trackIds: Set<String>)
+
+internal fun selectTrackFilters(raw: List<TrackFilter>, catalogIds: Set<String>): List<TrackFilter> {
+    if (catalogIds.size < 4) return emptyList()
+    val minTracks = when {
+        catalogIds.size >= 40 -> 8
+        catalogIds.size >= 16 -> 3
+        else -> 2
+    }
+    val selected = raw.mapNotNull { filter ->
+        if (filter.id == "all" || filter.id.isBlank() || filter.name.isBlank()) return@mapNotNull null
+        val matched = filter.trackIds.intersect(catalogIds)
+        if (matched.size < minTracks || matched.size >= catalogIds.size) return@mapNotNull null
+        TrackFilter(filter.id, filter.name, matched)
+    }.take(7)
+    return if (selected.size >= 2) selected else emptyList()
+}
 
 internal fun coverUrl(cover: String?, size: Int): String? {
     if (cover.isNullOrBlank()) return null
