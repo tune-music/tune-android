@@ -140,6 +140,9 @@ internal class MusicApi(
         post("account/settings", "aiContentReductionEnabled" to value.toString())
     }
 
+    internal fun rawTracks(ids: List<String>): List<JSONObject> =
+        if (ids.isEmpty()) emptyList() else form("tracks", "track-ids" to ids.joinToString(",")).objectList()
+
     fun tracks(ids: List<String>): List<Track> = ids.chunked(100).flatMap { chunk ->
         val found = form("tracks", "track-ids" to chunk.joinToString(",")).objectList()
             .mapNotNull { track(it) }.associateBy { it.id }
@@ -436,10 +439,26 @@ internal class MusicApi(
         .arr("suggestions").items().mapNotNull(Any?::asId)
 
     fun search(text: String, type: String, page: Int): SearchResults {
+        val includeTracks = page == 0 && type != "podcast" && (type.contains(',') || type == "track")
+        val includeAlbums = page == 0 && type != "podcast" && (type.contains(',') || type == "album")
+        if (includeTracks || includeAlbums) versions.ensureRestored(network = true, ::rawTracks)
+        val localTracks = if (includeTracks) {
+            versions.search(text).filter { metadata("track", it.id).usePlugin }.map(::overrideTrack)
+        } else emptyList()
+        val localAlbums = if (includeAlbums) {
+            versions.searchAlbums(text).filter { it.text("id")?.let { id -> metadata("album", id).usePlugin } ?: true }.mapNotNull(::album)
+        } else emptyList()
         val filter = if (type == "podcast") arrayOf("filter" to "podcast") else emptyArray()
         val types = if (type == "podcast") "album,artist,playlist,track,wave,podcast,podcast_episode" else type
-        val value = get("search/instant/mixed", "text" to text, "type" to types, "page" to page.toString(),
-            "pageSize" to "36", *filter).objectValue()
+        val value = try {
+            get("search/instant/mixed", "text" to text, "type" to types, "page" to page.toString(),
+                "pageSize" to "36", *filter).objectValue()
+        } catch (error: MusicError) {
+            if (error.status != 401 && (localTracks.isNotEmpty() || localAlbums.isNotEmpty())) {
+                return mergeSearchResults(text, emptyList(), emptyList(), null, false, localTracks, localAlbums)
+            }
+            throw error
+        }
         val tracks = mutableListOf<Track>()
         val cards = mutableListOf<Card>()
         var best: SearchBest? = null
@@ -463,12 +482,8 @@ internal class MusicApi(
                 if (best == null) best = SearchBest.Entry(card)
             }
         }
-        if (page == 0 && (type.contains(',') || type == "track")) {
-            tracks += versions.search(text).filter { metadata("track", it.id).usePlugin }.map(::overrideTrack)
-        }
-        if (page == 0 && (type.contains(',') || type == "album")) cards += versions.searchAlbums(text).mapNotNull(::album)
         val hasMore = if (value.has("lastPage")) !value.optBoolean("lastPage") && value.arr("results").length() > 0 else null
-        return SearchResults(tracks.distinctBy { it.id }, cards.distinctBy { it.key }, best, hasMore)
+        return mergeSearchResults(text, tracks, cards, best, hasMore, localTracks, localAlbums)
     }
 
     fun history(limit: Int = 200, includeSources: Boolean = limit > 20): List<Track> {
@@ -782,4 +797,55 @@ internal class MusicApi(
                 card.copy(subtitle = subtitle)
             }
     }
+}
+
+internal fun mergeSearchResults(
+    query: String,
+    remoteTracks: List<Track>,
+    remoteCards: List<Card>,
+    remoteBest: SearchBest?,
+    hasMore: Boolean?,
+    localTracks: List<Track>,
+    localAlbums: List<Card>,
+): SearchResults {
+    val remoteTrackIds = remoteTracks.mapTo(HashSet()) { it.id }
+    val remoteAlbumIds = remoteCards.asSequence().filter { it.kind == Kind.ALBUM && !it.isPodcast }.mapTo(HashSet()) { it.id }
+    val addedTracks = localTracks.filterNot { it.id in remoteTrackIds }
+    val addedAlbums = localAlbums.filterNot { it.id in remoteAlbumIds }
+    val tracks = (addedTracks + remoteTracks).distinctBy { it.id }
+    val cards = (addedAlbums + remoteCards).distinctBy { it.key }
+    val localBest = addedTracks.firstOrNull()?.let(SearchBest::Song) ?: addedAlbums.firstOrNull()?.let(SearchBest::Entry)
+    val best = when {
+        localBest == null -> remoteBest
+        remoteBest == null -> localBest
+        else -> {
+            val terms = AlternateVersions.searchTokens(query)
+            if (terms.isEmpty()) remoteBest
+            else {
+                val allowPrefix = terms.sumOf(String::length) >= 3
+                val remoteMatchesAll = terms.all { term ->
+                    AlternateVersions.matchesTerm(term, bestAllTokens(remoteBest), allowPrefix)
+                }
+                when {
+                    !remoteMatchesAll -> localBest
+                    bestExactTitle(localBest, terms) && !bestExactTitle(remoteBest, terms) -> localBest
+                    else -> remoteBest
+                }
+            }
+        }
+    }
+    return SearchResults(tracks, cards, best, hasMore)
+}
+
+private fun bestAllTokens(item: SearchBest): List<String> = when (item) {
+    is SearchBest.Song -> AlternateVersions.searchTokens(item.track.title) +
+        AlternateVersions.searchTokens(item.track.artistText) +
+        AlternateVersions.searchTokens(item.track.album?.title.orEmpty())
+    is SearchBest.Entry -> AlternateVersions.searchTokens(item.card.title) +
+        AlternateVersions.searchTokens(item.card.subtitle)
+}
+
+private fun bestExactTitle(item: SearchBest, terms: List<String>): Boolean = when (item) {
+    is SearchBest.Song -> AlternateVersions.searchTokens(item.track.title) == terms
+    is SearchBest.Entry -> AlternateVersions.searchTokens(item.card.title) == terms
 }

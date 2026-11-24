@@ -139,7 +139,14 @@ internal class MusicStore(val context: Context) {
     fun message(text: String) { _message.tryEmit(text) }
     fun setSleepState(state: SleepState) { _sleepTimer.value = state }
 
-    suspend fun refreshVersions(): Boolean = withContext(Dispatchers.IO) { versions.refresh(network = !offline) }
+    suspend fun refreshVersions(): Boolean = withContext(Dispatchers.IO) {
+        val ready = versions.refresh(network = !offline)
+        if (ready && !offline) token?.let { credential ->
+            val client = MusicApi(credential, versions)
+            versions.ensureRestored(network = true, client::rawTracks)
+        }
+        ready
+    }
 
     fun allowsAlternate(uid: String, id: String) = alternateEnabled && overrides.read(uid, "track", id).usePlugin
 
@@ -603,7 +610,8 @@ internal class MusicStore(val context: Context) {
         val key = SearchCache.Key(requireUser().uid, query, type, alternateEnabled)
         return online {
             search(query, type, page).also { results ->
-                if (page == 0 && type != "lyrics" && profile.value?.uid == key.account && alternateEnabled == key.uncensored) {
+                if (page == 0 && type != "lyrics" && profile.value?.uid == key.account && alternateEnabled == key.uncensored &&
+                    (!key.uncensored || versions.hasRestoredIndex())) {
                     searchCache.write(key, results)
                 }
             }
