@@ -762,16 +762,22 @@ internal class MusicApi(
             return Base64.getEncoder().encodeToString(hmac.doFinal(value.toByteArray()))
         }
 
+        internal fun formatListenTime(seconds: Double): String? {
+            if (!seconds.isFinite() || seconds <= 0.0) return null
+            val minutes = seconds / 60.0
+            if (minutes <= 45.0) {
+                val rounded = Math.round(minutes)
+                return if (rounded > 0L) "$rounded мин" else null
+            }
+            val halfHours = Math.round(minutes / 60.0 * 2.0)
+            return if (halfHours % 2L == 0L) "${halfHours / 2L} ч" else "${halfHours / 2L},5 ч"
+        }
+
         internal fun parseTopArtists(value: JSONObject, mapArtist: (JSONObject) -> Card? = Card::artist): List<Card> =
             value.arr("artists").objects().mapNotNull { item ->
                 val card = mapArtist(item.obj("artist")) ?: return@mapNotNull null
                 val place = item.obj("top").optLong("position").takeIf { it > 0L }?.let { "$it место" }
-                val minutes = item.optLong("listenTimeSeconds").coerceAtLeast(0L) / 60L
-                val time = when {
-                    minutes <= 0L -> null
-                    minutes < 60L -> "$minutes мин"
-                    else -> "${minutes / 60L} ч"
-                }
+                val time = formatListenTime(item.optDouble("listenTimeSeconds", 0.0))
                 val subtitle = listOfNotNull(place, time).joinToString(" · ")
                 card.copy(subtitle = subtitle)
             }
