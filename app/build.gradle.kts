@@ -21,8 +21,8 @@ android {
         applicationId = "music.tune.android"
         minSdk = 26
         targetSdk = 35
-        versionCode = 23
-        versionName = "0.2.21"
+        versionCode = 24
+        versionName = "0.2.22"
         buildConfigField("String", "UPDATE_FEED_URL", "\"$updateFeedUrl\"")
     }
 

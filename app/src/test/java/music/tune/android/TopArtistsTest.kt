@@ -12,16 +12,17 @@ class TopArtistsTest {
               "artists": [
                 {"artist": {"id": 5, "name": "Дора"}, "listenTimeSeconds": 13476, "top": {"position": 4, "progress": "up"}},
                 {"artist": {"id": 6, "name": "ЛСП"}, "listenTimeSeconds": 2700, "top": {"position": 2}},
-                {"artist": {"id": 7, "name": "Кино"}, "listenTimeSeconds": 30, "top": {"position": 5}},
-                {"artist": {"id": 8, "name": "Земфира"}, "listenTimeSeconds": 600}
+                {"artist": {"id": 7, "name": "Кино"}, "listenTimeSeconds": 20, "top": {"position": 5}},
+                {"artist": {"id": 8, "name": "Земфира"}, "listenTimeSeconds": 16200},
+                {"artist": {"id": 9, "name": "Сплин"}, "listenTimeSeconds": 13500, "top": {"position": 1}}
               ]
             }
         """.trimIndent())
 
         val parsed = MusicApi.parseTopArtists(payload)
-        assertEquals(listOf("Дора", "ЛСП", "Кино", "Земфира"), parsed.map { it.title })
+        assertEquals(listOf("Дора", "ЛСП", "Кино", "Земфира", "Сплин"), parsed.map { it.title })
         assertEquals(
-            listOf("4 место · 3 ч", "2 место · 45 мин", "5 место", "10 мин"),
+            listOf("4 место · 3,5 ч", "2 место · 45 мин", "5 место", "4,5 ч", "1 место · 4 ч"),
             parsed.map { it.subtitle }
         )
     }
