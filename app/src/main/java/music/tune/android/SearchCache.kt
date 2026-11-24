@@ -10,7 +10,7 @@ internal class SearchCache(cacheDir: File) {
     private val directory = File(cacheDir, "search")
 
     internal data class Key(val account: String, val query: String, val type: String, val uncensored: Boolean) {
-        fun fileName() = digest(JSONArray(listOf(account, query.lowercase(Locale.ROOT), type, uncensored)).toString()) + ".json"
+        fun fileName() = digest(JSONArray(listOf(account, query.lowercase(Locale.ROOT), type, if (uncensored) "v2" else false)).toString()) + ".json"
     }
 
     @Synchronized

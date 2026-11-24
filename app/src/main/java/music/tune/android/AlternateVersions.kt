@@ -11,23 +11,75 @@ import java.util.Locale
 
 internal class AlternateVersions(context: Context, private val enabled: () -> Boolean) {
     private val cache = AtomicFile(File(context.cacheDir, "alternate-versions.json"))
+    private val restoredCache = AtomicFile(File(context.cacheDir, "restored-tracks.json"))
     internal data class Catalog(
         val tracks: Map<String, JSONObject>,
         val albums: Map<String, JSONObject>,
         val audio: Map<String, String>,
         val artistInsertions: Map<String, Pair<List<String>, List<String>>>,
         val trackAlbums: Map<String, JSONObject>,
+        val byArtist: Map<String, Pair<List<String>, List<String>>> = emptyMap(),
+        val signature: String = "",
     )
 
     @Volatile private var catalog: Catalog? = null
     @Volatile private var preferredMirror = MIRRORS.first()
     @Volatile private var retryAfter = 0L
     private var refreshedAt = 0L
+    @Volatile private var restored: Map<String, Track>? = null
+    @Volatile private var restoredSignature: String? = null
+    @Volatile private var restoredAt = 0L
+    @Volatile private var restoredRetryAfter = 0L
 
     fun ensureLoaded(network: Boolean): Boolean {
         if (!enabled()) return false
         if (catalog != null) return true
         return refresh(network)
+    }
+
+    fun hasRestoredIndex(): Boolean =
+        !enabled() || (active()?.let { restored != null && restoredSignature == it.signature } == true)
+
+    @Synchronized
+    fun ensureRestored(network: Boolean, fetchRawTracks: ((List<String>) -> List<JSONObject>)? = null): Boolean {
+        if (!enabled()) return false
+        ensureLoaded(network)
+        val list = active() ?: return false
+        if ((restored == null || restoredSignature != list.signature) && restoredCache.baseFile.isFile) {
+            optional {
+                val saved = JSONObject(restoredCache.readFully().toString(Charsets.UTF_8))
+                if (saved.text("signature") == list.signature) {
+                    val parsed = saved.arr("tracks").objects().mapNotNull { Track.parse(it) }.associateBy { it.id }
+                    restored = parsed
+                    restoredSignature = list.signature
+                    restoredAt = saved.optLong("at", restoredCache.baseFile.lastModified())
+                }
+            }
+        }
+        val now = System.currentTimeMillis()
+        val fresh = restored != null && restoredSignature == list.signature && now - restoredAt in 0L until 86_400_000L
+        if (fresh || !network || fetchRawTracks == null || now < restoredRetryAfter) {
+            return restored != null && restoredSignature == list.signature
+        }
+        val ids = (list.audio.keys + list.tracks.keys).distinct()
+        val raw = try {
+            ids.chunked(250).flatMap(fetchRawTracks)
+        } catch (_: IOException) {
+            restoredRetryAfter = System.currentTimeMillis() + 60_000L
+            return restored != null && restoredSignature == list.signature
+        }
+        val resolved = resolveSearchableTracks(list, raw)
+        val updatedAt = System.currentTimeMillis()
+        restored = resolved
+        restoredSignature = list.signature
+        restoredAt = updatedAt
+        optional {
+            restoredCache.writeText(
+                JSONObject().put("signature", list.signature).put("at", updatedAt)
+                    .put("tracks", JSONArray(resolved.values.map(Track::stored))).toString()
+            )
+        }
+        return true
     }
 
     @Synchronized
@@ -82,13 +134,7 @@ internal class AlternateVersions(context: Context, private val enabled: () -> Bo
         val id = value.text("id") ?: return value
         val list = active() ?: return value
         val fields = (if (track) list.tracks else if (kind == Kind.ALBUM) list.albums else emptyMap())[id] ?: return value
-        val patched = JSONObject(value.toString())
-        fields.keys().forEach { key ->
-            if (key !in SKIP && !fields.isNull(key) && (key != "artists" || fields.arr(key).length() > 0)) {
-                patched.put(key, fields.get(key))
-            }
-        }
-        return patched
+        return applySpoof(value, fields)
     }
 
     fun albumTracks(id: String) = active()?.albums?.get(id)?.arr("volumes")?.items()?.filterIsInstance<JSONArray>()
@@ -96,40 +142,30 @@ internal class AlternateVersions(context: Context, private val enabled: () -> Bo
 
     fun catalogAlbum(id: String): JSONObject? = active()?.albums?.get(id)?.let { JSONObject(it.toString()).put("id", id) }
 
-    fun artistInsertions(id: String): Pair<List<String>, List<String>> =
-        active()?.artistInsertions?.get(id) ?: (emptyList<String>() to emptyList())
-
-    fun searchAlbums(query: String): List<JSONObject> {
-        val words = query.lowercase(Locale.ROOT).split(Regex("\\s+")).filter(String::isNotBlank)
-        if (words.isEmpty()) return emptyList()
-        return active()?.albums?.keys.orEmpty().asSequence().mapNotNull(::catalogAlbum).filter { album ->
-            val names = album.arr("artists").objects().mapNotNull { it.text("name") }.joinToString(" ")
-            val content = (album.text("title").orEmpty() + " " + names).lowercase(Locale.ROOT)
-            words.all { it in content }
-        }.take(15).toList()
+    fun artistInsertions(id: String): Pair<List<String>, List<String>> {
+        val list = active() ?: return emptyList<String>() to emptyList()
+        val extra = list.artistInsertions[id] ?: (emptyList<String>() to emptyList())
+        val catalog = list.byArtist[id] ?: (emptyList<String>() to emptyList())
+        val resolvedTracks = restored?.takeIf { restoredSignature == list.signature }?.values
+            ?.filter { it.originalAvailable == false && it.artists.any { artist -> artist.id == id } }
+            ?.map { it.id }.orEmpty()
+        return (extra.first + catalog.first + resolvedTracks).distinct() to (extra.second + catalog.second).distinct()
     }
+
+    fun searchAlbums(query: String): List<JSONObject> = active()?.let { searchCatalogAlbums(it, query) }.orEmpty()
 
     fun synthetic(id: String, album: Card? = null): Track? {
         val list = active() ?: return null
         if (id !in list.audio) return null
-        val fields = list.tracks[id] ?: return null
-        val value = JSONObject(fields.toString()).put("id", id)
-        list.trackAlbums[id]?.let { release ->
-            if (value.arr("albums").length() == 0) value.put("albums", JSONArray().put(release))
-            if (value.arr("artists").length() == 0) value.put("artists", release.arr("artists"))
-        }
-        return Track.parse(value, alternate = true)?.let {
-            it.copy(album = album ?: it.album, cover = it.cover ?: album?.cover, originalAvailable = false)
+        val resolved = restored?.takeIf { restoredSignature == list.signature }?.get(id)?.takeIf { it.alternate }
+        return (resolved ?: catalogSynthetic(id, list))?.let {
+            it.copy(album = album ?: it.album, cover = it.cover ?: album?.cover)
         }
     }
 
     fun search(query: String): List<Track> {
-        val words = query.lowercase(Locale.ROOT).split(Regex("\\s+")).filter(String::isNotBlank)
-        if (words.isEmpty()) return emptyList()
-        return active()?.audio?.keys.orEmpty().asSequence().mapNotNull { synthetic(it) }.filter { track ->
-            val text = "${track.title} ${track.artistText}".lowercase(Locale.ROOT)
-            words.all { it in text }
-        }.take(30).toList()
+        val list = active() ?: return emptyList()
+        return searchCatalogTracks(list, restored?.takeIf { restoredSignature == list.signature }, query)
     }
 
     companion object {
@@ -190,7 +226,160 @@ internal class AlternateVersions(context: Context, private val enabled: () -> Bo
                     if (cover != null && track.text("coverUri") == null) track.put("coverUri", cover)
                 }
             }
-            return Catalog(tracks, albums, audio, insertions, trackAlbums)
+            val artistTracks = linkedMapOf<String, MutableSet<String>>()
+            val artistAlbums = linkedMapOf<String, MutableSet<String>>()
+            fun artistIds(fields: JSONObject?): List<String> =
+                fields?.arr("artists")?.objects()?.mapNotNull { it.text("id")?.takeIf { id -> id.matches(ID) } }.orEmpty()
+            for ((albumId, album) in albums.toSortedMap()) {
+                for (artistId in artistIds(album)) artistAlbums.getOrPut(artistId, ::linkedSetOf).add(albumId)
+            }
+            for (trackId in (audio.keys + tracks.keys).toSortedSet()) {
+                val owners = artistIds(tracks[trackId]) + artistIds(trackAlbums[trackId])
+                for (artistId in owners) artistTracks.getOrPut(artistId, ::linkedSetOf).add(trackId)
+            }
+            val byArtist = (artistTracks.keys + artistAlbums.keys).associateWith { artistId ->
+                artistTracks[artistId]?.toList().orEmpty() to artistAlbums[artistId]?.toList().orEmpty()
+            }
+            val signature = digest(buildString {
+                append(audio.keys.sorted().joinToString(","))
+                append('|')
+                tracks.keys.sorted().forEach { id ->
+                    val entry = tracks.getValue(id)
+                    append(id).append(':').append(entry.text("title").orEmpty()).append(':')
+                    append(entry.arr("artists").objects().mapNotNull { it.text("name") }.joinToString(",")).append(';')
+                }
+                append('|')
+                append(albums.keys.sorted().joinToString(","))
+            })
+            return Catalog(tracks, albums, audio, insertions, trackAlbums, byArtist, signature)
+        }
+
+        private fun applySpoof(value: JSONObject, fields: JSONObject): JSONObject {
+            val patched = JSONObject(value.toString())
+            fields.keys().forEach { key ->
+                if (key !in SKIP && !fields.isNull(key) && (key != "artists" || fields.arr(key).length() > 0)) {
+                    patched.put(key, fields.get(key))
+                }
+            }
+            return patched
+        }
+
+        internal fun patchTrackObject(value: JSONObject, id: String, list: Catalog): JSONObject {
+            val patched = list.tracks[id]?.let { applySpoof(value, it) } ?: JSONObject(value.toString())
+            list.trackAlbums[id]?.let { release ->
+                if (patched.arr("albums").length() == 0) patched.put("albums", JSONArray().put(release))
+                if (patched.arr("artists").length() == 0 && release.arr("artists").length() > 0) {
+                    patched.put("artists", release.arr("artists"))
+                }
+            }
+            return patched
+        }
+
+        internal fun catalogSynthetic(id: String, list: Catalog, album: Card? = null): Track? {
+            if (id !in list.audio) return null
+            val fields = list.tracks[id] ?: return null
+            val value = patchTrackObject(JSONObject().put("id", id), id, list)
+            if (fields.text("title").isNullOrBlank()) return null
+            return Track.parse(value, alternate = true)?.let {
+                it.copy(album = album ?: it.album, cover = it.cover ?: album?.cover, originalAvailable = false)
+            }
+        }
+
+        internal fun resolveSearchableTracks(list: Catalog, rawTracks: List<JSONObject>): Map<String, Track> {
+            val rawById = LinkedHashMap<String, JSONObject>(rawTracks.size)
+            for (obj in rawTracks) {
+                val id = obj.text("id") ?: continue
+                rawById.putIfAbsent(id, obj)
+            }
+            val resolved = LinkedHashMap<String, Track>()
+            for (id in (list.audio.keys + list.tracks.keys).distinct()) {
+                val hasAudio = id in list.audio
+                val raw = rawById[id]
+                val track = if (raw != null) {
+                    val available = raw.optBoolean("available", true)
+                    val spoof = list.tracks[id]
+                    val hasSpoofedMeta = spoof != null && (!spoof.text("title").isNullOrBlank() || spoof.arr("artists").length() > 0)
+                    if (!((!available && hasAudio) || (hasSpoofedMeta && (available || hasAudio)))) continue
+                    val patched = patchTrackObject(raw, id, list)
+                    Track.parse(patched, alternate = hasAudio)?.copy(originalAvailable = available)
+                } else {
+                    catalogSynthetic(id, list)
+                }
+                if (track != null) resolved[id] = track
+            }
+            return resolved
+        }
+
+        internal fun searchTokens(text: String): List<String> =
+            text.lowercase(Locale.ROOT).replace('ё', 'е').split(NON_ALNUM).filter(String::isNotEmpty)
+
+        internal fun matchesTerm(term: String, tokens: List<String>, allowPrefix: Boolean): Boolean =
+            if (allowPrefix) tokens.any { it.startsWith(term) } else term in tokens
+
+        internal fun searchCatalogTracks(list: Catalog, restored: Map<String, Track>?, query: String): List<Track> {
+            val terms = searchTokens(query)
+            if (terms.isEmpty()) return emptyList()
+            val allowPrefix = terms.sumOf(String::length) >= 3
+            val candidates = LinkedHashMap<String, Track>()
+            restored?.forEach { (id, track) -> candidates[id] = track }
+            for (id in (list.audio.keys + list.tracks.keys)) {
+                if (id in candidates) continue
+                val fields = list.tracks[id] ?: continue
+                val hasAudio = id in list.audio
+                if (!hasAudio && fields.arr("artists").length() == 0) continue
+                val value = patchTrackObject(JSONObject().put("id", id), id, list)
+                val parsed = Track.parse(value, alternate = hasAudio)?.let {
+                    if (hasAudio) it.copy(originalAvailable = false) else it
+                } ?: continue
+                candidates[id] = parsed
+            }
+            data class Hit(val track: Track, val rank: Int)
+            val hits = ArrayList<Hit>()
+            for (track in candidates.values) {
+                val rawTitle = track.title.substringBefore(" (")
+                val rawTitleTokens = searchTokens(rawTitle)
+                val titleTokens = searchTokens(track.title)
+                val artistTokens = searchTokens(track.artistText)
+                val albumTokens = searchTokens(track.album?.title.orEmpty())
+                val allTokens = titleTokens + artistTokens + albumTokens
+                if (!terms.all { matchesTerm(it, allTokens, allowPrefix) }) continue
+                val rank = when {
+                    rawTitleTokens == terms || titleTokens == terms -> 0
+                    terms.all { matchesTerm(it, titleTokens, allowPrefix) } -> 1
+                    terms.any { matchesTerm(it, titleTokens, allowPrefix) } &&
+                        terms.any { matchesTerm(it, artistTokens, allowPrefix) } -> 2
+                    artistTokens == terms -> 3
+                    else -> 4
+                }
+                hits += Hit(track, rank)
+            }
+            return hits.sortedWith(
+                compareBy<Hit> { it.rank }.thenBy { it.track.title.lowercase(Locale.ROOT) }.thenBy { it.track.id }
+            ).take(30).map { it.track }
+        }
+
+        internal fun searchCatalogAlbums(list: Catalog, query: String): List<JSONObject> {
+            val terms = searchTokens(query)
+            if (terms.isEmpty()) return emptyList()
+            val allowPrefix = terms.sumOf(String::length) >= 3
+            data class Hit(val album: JSONObject, val rank: Int, val title: String, val id: String)
+            val hits = ArrayList<Hit>()
+            for ((id, fields) in list.albums) {
+                val title = fields.text("title")?.takeIf(String::isNotBlank) ?: continue
+                val titleTokens = searchTokens(title)
+                val artistNames = fields.arr("artists").objects().mapNotNull { it.text("name") }.joinToString(" ")
+                val artistTokens = searchTokens(artistNames)
+                val allTokens = titleTokens + artistTokens
+                if (!terms.all { matchesTerm(it, allTokens, allowPrefix) }) continue
+                val rank = when {
+                    titleTokens == terms -> 0
+                    terms.all { matchesTerm(it, titleTokens, allowPrefix) } -> 1
+                    else -> 2
+                }
+                hits += Hit(JSONObject(fields.toString()).put("id", id), rank, title.lowercase(Locale.ROOT), id)
+            }
+            return hits.sortedWith(compareBy<Hit> { it.rank }.thenBy { it.title }.thenBy { it.id })
+                .take(15).map { it.album }
         }
 
         private fun httpsAddress(raw: String): String? {
@@ -231,6 +420,7 @@ internal class AlternateVersions(context: Context, private val enabled: () -> Bo
             ?: value.asId())?.takeIf { it.matches(ID) }
 
         private val ID = Regex("[0-9]+")
+        private val NON_ALNUM = Regex("[^\\p{L}\\p{N}]+")
         private val SKIP = setOf("id", "audio", "insert", "volumes", "__fckCensor", "noAuto")
         private val MIRRORS = listOf("https://raw.githubusercontent.com/Hazzz895/FckCensorData/refs/heads/main/",
             "https://cdn.jsdelivr.net/gh/Hazzz895/FckCensorData@main/")
