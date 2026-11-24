@@ -81,6 +81,7 @@ private class Route(val screen: Screen, var card: Card? = null, val shelf: Shelf
     var order = TrackOrder.ORIGINAL
     var downloadedOnly = false
     var filterVisible = false
+    var chipId: String? = null
 }
 private data class TrackListPosition(val index: Int, val offset: Int, val trackId: String?)
 private data class TrackList(val tracks: List<Track>, val context: PlayContext, val art: Symbol? = null)
@@ -189,6 +190,11 @@ class MainActivity : ComponentActivity(), Player.Listener {
     private var trackFilter = ""
     private var trackOrder = TrackOrder.ORIGINAL
     private var onlyDownloaded = false
+    private var trackChips: List<TrackFilter> = emptyList()
+    private var selectedTrackChip: String? = null
+    private var trackChipsKey: String? = null
+    private var trackChipsJob: Job? = null
+    private val trackChipsCache = mutableMapOf<String, List<TrackFilter>>()
     private var filterField: EditText? = null
     private var filterBar: View? = null
     private var selecting = false
@@ -786,6 +792,11 @@ class MainActivity : ComponentActivity(), Player.Listener {
         trackFilter = current.filter
         trackOrder = current.order
         onlyDownloaded = current.downloadedOnly
+        trackChipsJob?.cancel()
+        trackChipsJob = null
+        trackChips = emptyList()
+        trackChipsKey = null
+        selectedTrackChip = current.chipId
         filterField = null
         filterBar = null
         selecting = false
@@ -1475,7 +1486,9 @@ class MainActivity : ComponentActivity(), Player.Listener {
             Screen.DETAILS -> current.card?.let(::loadDetails)
             Screen.ARTIST_TRACKS -> current.card?.let { card ->
                 loadRows {
-                    trackList = TrackList(store.online { artistTracks(card.id) }, PlayContext("artist", card.id, card.title))
+                    val tracks = store.online { artistTracks(card.id) }
+                    loadTrackChips("artist-tracks:${card.id}", tracks)
+                    trackList = TrackList(tracks, PlayContext("artist", card.id, card.title))
                     listRows(requireNotNull(trackList))
                 }
             }
@@ -1982,6 +1995,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
         fun trackRowsForPage(tracks: List<Track>): List<Row> {
             val data = TrackList(tracks, context, symbol)
             trackList = data
+            if (screen == Screen.LIKES) loadTrackChips("likes", tracks)
             return listRows(data)
         }
         loadRows(loading = {
@@ -2104,10 +2118,16 @@ class MainActivity : ComponentActivity(), Player.Listener {
         val page = store.details(card, onCached = showCached?.let { display ->
             { cached ->
                 details = cached
+                if (card.kind == Kind.PLAYLIST || (card.kind == Kind.ALBUM && !card.isPodcast) || card.kind == Kind.ARTIST) {
+                    loadTrackChips("details:${card.key}", cached.tracks)
+                }
                 display(detailRows(cached))
             }
         })
         details = page
+        if (card.kind == Kind.PLAYLIST || (card.kind == Kind.ALBUM && !card.isPodcast) || card.kind == Kind.ARTIST) {
+            loadTrackChips("details:${card.key}", page.tracks)
+        }
         detailRows(page)
     }
 
@@ -2117,6 +2137,10 @@ class MainActivity : ComponentActivity(), Player.Listener {
         val displayed = if (page.card.kind == Kind.ARTIST) page.tracks else visibleTracks(page.tracks)
         return buildList {
             add(Row.Layout(cache = true) { pageHeader(page, context) })
+            if ((page.card.kind == Kind.PLAYLIST || (page.card.kind == Kind.ALBUM && !page.card.isPodcast)) &&
+                trackChips.isNotEmpty() && !reordering) {
+                add(trackChipsRow())
+            }
             page.latestRelease?.let {
                 add(heading("Последний релиз"))
                 add(shelfRow(listOf(it)))
@@ -2125,11 +2149,18 @@ class MainActivity : ComponentActivity(), Player.Listener {
                 val owned = page.card.takeIf { it.kind == Kind.PLAYLIST && it.owner == userId }
                 if (page.card.kind == Kind.ARTIST) {
                     add(section("Популярные треки", "Все") { push(Screen.ARTIST_TRACKS, page.card) })
-                    addAll(trackRows(page.tracks, context).take(5))
+                    if (trackChips.isNotEmpty()) add(trackChipsRow())
+                    val chipIds = activeChipTracks()
+                    if (chipIds != null) {
+                        val filtered = page.tracks.filter { it.id in chipIds }
+                        addAll(trackRows(filtered, context))
+                    } else {
+                        addAll(trackRows(page.tracks, context).take(5))
+                    }
                 } else if (page.card.isPodcast) {
                     add(heading("Выпуски"))
                     addAll(trackRows(displayed, context))
-                } else if (page.card.kind == Kind.ALBUM && trackFilter.isBlank() && !onlyDownloaded && trackOrder == TrackOrder.ORIGINAL) {
+                } else if (page.card.kind == Kind.ALBUM && trackFilter.isBlank() && !onlyDownloaded && trackOrder == TrackOrder.ORIGINAL && selectedTrackChip == null) {
                     val disks = page.disks.takeIf { it.sum() == page.tracks.size } ?: listOf(page.tracks.size)
                     var start = 0
                     disks.forEachIndexed { disk, count ->
@@ -2312,10 +2343,10 @@ class MainActivity : ComponentActivity(), Player.Listener {
                 addView(roundIcon(if (liked) Symbol.HEART_FILLED else Symbol.HEART, if (liked) "Убрать из коллекции" else "В коллекцию",
                     if (liked) ui.palette.accent else ui.palette.text) { action { store.save(card) } })
                 gap(this, 14)
-                addView(playPill(page.tracks, readyContext))
+                addView(playPill({ activeChipTracks()?.let { ids -> page.tracks.filter { it.id in ids } } ?: page.tracks }, readyContext))
                 gap(this, 14)
                 addView(roundIcon(Symbol.WAVE, "Волна исполнителя") { startWave(listOf("artist:${card.id}"), card.title) })
-            } else addTrackControls(this, page.tracks, readyContext)
+            } else addTrackControls(this, page.tracks, readyContext) { visibleTracks(page.tracks) }
         }, ui.full())
     }
 
@@ -2422,6 +2453,9 @@ class MainActivity : ComponentActivity(), Player.Listener {
 
     private fun listRows(data: TrackList): List<Row> = buildList {
         add(Row.Layout { listHeader(data.tracks, data.context, data.art) })
+        if (trackChips.isNotEmpty() && route.screen in setOf(Screen.LIKES, Screen.ARTIST_TRACKS)) {
+            add(trackChipsRow())
+        }
         val visible = visibleTracks(data.tracks)
         if (visible.isEmpty()) add(Row.Layout {
             if (data.tracks.isEmpty()) ui.pagePlaceholder(Symbol.QUEUE, "Здесь пока пусто")
@@ -2451,10 +2485,71 @@ class MainActivity : ComponentActivity(), Player.Listener {
         return date.format(format)
     }
 
+    private fun activeChipTracks(): Set<String>? =
+        selectedTrackChip?.let { id -> trackChips.firstOrNull { it.id == id }?.trackIds }
+
+    private fun loadTrackChips(key: String, tracks: List<Track>) {
+        val ids = tracks.asSequence().map { it.id }.filter { it.isNotBlank() && it.all(Char::isDigit) }.distinct().toList()
+        val cacheKey = "$key:${ids.size}:${ids.firstOrNull().orEmpty()}:${ids.lastOrNull().orEmpty()}"
+        if (trackChipsKey == cacheKey) return
+        trackChipsKey = cacheKey
+        trackChipsJob?.cancel()
+        if (ids.size < 4) {
+            trackChips = emptyList()
+            selectedTrackChip = null
+            return
+        }
+        trackChipsCache[cacheKey]?.let { cached ->
+            trackChips = cached
+            if (selectedTrackChip != null && cached.none { it.id == selectedTrackChip }) selectedTrackChip = null
+            return
+        }
+        if (store.offline || !hasNetwork()) return
+        trackChipsJob = lifecycleScope.launch {
+            val loaded = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                optional { store.online { trackFilters(ids) } }
+            } ?: return@launch
+            if (trackChipsKey != cacheKey) return@launch
+            trackChipsCache[cacheKey] = loaded
+            trackChips = loaded
+            if (selectedTrackChip != null && loaded.none { it.id == selectedTrackChip }) selectedTrackChip = null
+            if (loaded.isNotEmpty() || selectedTrackChip != null) updateTrackFilter()
+        }
+    }
+
+    private fun trackChipsRow(): Row.Layout = Row.Layout {
+        val current = selectedTrackChip
+        val buttons = mutableListOf<View>()
+        buttons += ui.chip("Всё", active = current == null) {
+            if (selectedTrackChip != null) {
+                selectedTrackChip = null
+                updateTrackFilter()
+            }
+        }
+        trackChips.forEach { filter ->
+            buttons += ui.chip(filter.name, active = current == filter.id) {
+                selectedTrackChip = if (selectedTrackChip == filter.id) null else filter.id
+                updateTrackFilter()
+            }
+        }
+        val activeIndex = if (current == null) 0 else (trackChips.indexOfFirst { it.id == current } + 1).coerceAtLeast(0)
+        horizontal(buttons).apply {
+            setPadding(0, ui.dp(2), 0, ui.dp(4))
+            addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+                val chip = buttons.getOrNull(activeIndex) ?: return@addOnLayoutChangeListener
+                if (chip.right > scrollX + width || chip.left < scrollX) {
+                    scrollTo((chip.left - ui.dp(16)).coerceAtLeast(0), 0)
+                }
+            }
+        }
+    }
+
     private fun visibleTracks(tracks: List<Track>): List<Track> {
         val query = trackFilter.trim()
+        val chipTracks = activeChipTracks()
         val filtered = tracks.filter { track ->
             (!onlyDownloaded || store.files.has(track)) &&
+                (chipTracks == null || track.id in chipTracks) &&
                 (query.isEmpty() || track.title.contains(query, ignoreCase = true) || track.artistText.contains(query, ignoreCase = true))
         }
         val order = java.text.Collator.getInstance(Locale.forLanguageTag("ru"))
@@ -2633,21 +2728,28 @@ class MainActivity : ComponentActivity(), Player.Listener {
         addView(ui.space(14))
         addView(if (loading) ui.loadingTrackControls() else ui.row().apply {
             gravity = Gravity.CENTER
-            addTrackControls(this, tracks, context, downloaded = symbol == Symbol.DOWNLOAD)
+            addTrackControls(this, tracks, context, downloaded = symbol == Symbol.DOWNLOAD) { visibleTracks(tracks) }
         }, ui.full())
     }
 
-    private fun addTrackControls(row: LinearLayout, tracks: List<Track>, context: PlayContext, downloaded: Boolean = false) {
+    private fun addTrackControls(
+        row: LinearLayout,
+        tracks: List<Track>,
+        context: PlayContext,
+        downloaded: Boolean = false,
+        playTracks: () -> List<Track> = { tracks }
+    ) {
         row.addView(roundIcon(if (downloaded) Symbol.TRASH else Symbol.DOWNLOAD, if (downloaded) "Удалить загрузки" else "Скачать треки") {
             if (downloaded) confirm("Удалить скачанные треки?", "Удалить") { action { tracks.forEach { store.files.remove(it) } } }
             else action { store.files.enqueue(tracks); toast("Загрузки добавлены") }
         }.apply { isEnabled = tracks.isNotEmpty(); alpha = if (isEnabled) 1f else .4f })
         gap(row, 14)
-        row.addView(playPill(tracks, context))
+        row.addView(playPill(playTracks, context))
         gap(row, 14)
         row.addView(roundIcon(Symbol.SHUFFLE, "Перемешать") {
-            val playable = tracks.indices.filter { !tracks[it].unavailable || store.files.hasReplacement(tracks[it]) || store.files.has(tracks[it]) }
-            playable.randomOrNull()?.let { playTracks(tracks, it, context, shuffle = true) } ?: toast("Нет доступных треков")
+            val current = playTracks().ifEmpty { tracks }
+            val playable = current.indices.filter { !current[it].unavailable || store.files.hasReplacement(current[it]) || store.files.has(current[it]) }
+            playable.randomOrNull()?.let { playTracks(current, it, context, shuffle = true) } ?: toast("Нет доступных треков")
         }.apply { isEnabled = tracks.isNotEmpty(); alpha = if (isEnabled) 1f else .4f })
     }
 
@@ -2659,7 +2761,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
         update()
     }
 
-    private fun playPill(tracks: List<Track>, context: PlayContext): View = ui.row().apply {
+    private fun playPill(tracks: () -> List<Track>, context: PlayContext): View = ui.row().apply {
             fun isActive(): Boolean {
                 val now = QueueItems.context(controller?.currentMediaItem)
                 return currentTrack() != null && now.kind == context.kind && now.item == context.item &&
@@ -2701,12 +2803,13 @@ class MainActivity : ComponentActivity(), Player.Listener {
             }
             setOnClickListener {
                 if (isActive()) toggle() else {
-                    val start = tracks.indexOfFirst { !it.unavailable || store.files.hasReplacement(it) || store.files.has(it) }
-                    if (start >= 0) playTracks(tracks, start, context, shuffle = false) else toast("Нет доступных треков")
+                    val current = tracks()
+                    val start = current.indexOfFirst { !it.unavailable || store.files.hasReplacement(it) || store.files.has(it) }
+                    if (start >= 0) playTracks(current, start, context, shuffle = false) else toast("Нет доступных треков")
                 }
             }
             isFocusable = true
-            isEnabled = tracks.isNotEmpty()
+            isEnabled = tracks().isNotEmpty()
             alpha = if (isEnabled) 1f else .5f
     }
 
@@ -2736,6 +2839,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
             if (selecting) endSelection()
             trackOrder = TrackOrder.ORIGINAL
             onlyDownloaded = false
+            selectedTrackChip = null
             if (filterBar != null) hideTrackFilter()
             trackFilter = ""
         } else {
@@ -3098,6 +3202,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
         displayed.order = trackOrder
         displayed.downloadedOnly = onlyDownloaded
         displayed.filterVisible = filterBar != null
+        displayed.chipId = selectedTrackChip
         if (pageHasRows) displayed.position = listPosition()
     }
 

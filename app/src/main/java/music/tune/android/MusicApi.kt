@@ -422,6 +422,19 @@ internal class MusicApi(
         return ((optional { tracks(inserted.distinct()) }.orEmpty()) + standard).distinctBy { it.id }
     }
 
+    fun trackFilters(ids: List<String>): List<TrackFilter> {
+        val catalogIds = ids.asSequence().filter { it.isNotBlank() && it.all(Char::isDigit) }.distinct().toList()
+        if (catalogIds.size < 4) return emptyList()
+        val value = json("filters/tracks", JSONObject().put("trackIds", JSONArray(catalogIds))).objectValue()
+        val parsed = value.arr("filters").objects().mapNotNull { filter ->
+            val id = filter.text("id") ?: return@mapNotNull null
+            val name = filter.text("name") ?: return@mapNotNull null
+            val trackIds = filter.arr("tracks").items().mapNotNull { it.asId() }.toSet()
+            TrackFilter(id, name, trackIds)
+        }
+        return selectTrackFilters(parsed, catalogIds.toSet())
+    }
+
     fun artistFamiliar(id: String, wave: Boolean): List<Track> {
         val block = if (wave) "wave" else "collection"
         val response = get("artists/${segment(id)}/familiar-you",
