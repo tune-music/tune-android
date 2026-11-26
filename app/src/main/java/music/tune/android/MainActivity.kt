@@ -500,15 +500,25 @@ class MainActivity : ComponentActivity(), Player.Listener {
         accept(intent)
     }
 
-    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
-        val handled = super.dispatchKeyEvent(event)
-        if (event.keyCode == KeyEvent.KEYCODE_VOLUME_UP ||
-            event.keyCode == KeyEvent.KEYCODE_VOLUME_DOWN ||
-            event.keyCode == KeyEvent.KEYCODE_VOLUME_MUTE
+    private fun syncWaveVolumeKey(keyCode: Int) {
+        if (keyCode == KeyEvent.KEYCODE_VOLUME_UP ||
+            keyCode == KeyEvent.KEYCODE_VOLUME_DOWN ||
+            keyCode == KeyEvent.KEYCODE_VOLUME_MUTE
         ) {
             homeWaveBackdrop?.refreshVolume()
             if (::root.isInitialized) root.post { homeWaveBackdrop?.refreshVolume() }
         }
+    }
+
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        val handled = super.onKeyDown(keyCode, event)
+        syncWaveVolumeKey(keyCode)
+        return handled
+    }
+
+    override fun onKeyUp(keyCode: Int, event: KeyEvent?): Boolean {
+        val handled = super.onKeyUp(keyCode, event)
+        syncWaveVolumeKey(keyCode)
         return handled
     }
 

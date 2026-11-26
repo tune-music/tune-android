@@ -275,7 +275,7 @@ internal class WaveBackdrop(
                     context,
                     volumeReceiver,
                     IntentFilter("android.media.VOLUME_CHANGED_ACTION"),
-                    ContextCompat.RECEIVER_EXPORTED,
+                    ContextCompat.RECEIVER_NOT_EXPORTED,
                 )
                 volumeReceiverRegistered = true
             }
