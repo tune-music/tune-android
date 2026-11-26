@@ -2,12 +2,15 @@ package music.tune.android
 
 import android.annotation.SuppressLint
 import android.database.ContentObserver
+import android.graphics.BlurMaskFilter
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.LinearGradient
 import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.Path
+import android.graphics.PorterDuff
+import android.graphics.PorterDuffXfermode
 import android.graphics.RadialGradient
 import android.graphics.Rect
 import android.graphics.Shader
@@ -18,6 +21,7 @@ import android.os.SystemClock
 import android.provider.Settings
 import android.view.View
 import androidx.core.graphics.ColorUtils
+import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.exp
 import kotlin.math.max
@@ -101,7 +105,7 @@ private class WavePalette(
         private fun hsbToRgb(hueDeg: Float, s: Float, b: Float): WaveRgb {
             val h = ((hueDeg % 360f) + 360f) % 360f / 60f
             val c = b * s
-            val x = c * (1f - kotlin.math.abs(h % 2f - 1f))
+            val x = c * (1f - abs(h % 2f - 1f))
             val m = b - c
             val r1: Float
             val g1: Float
@@ -128,20 +132,47 @@ internal class WaveBackdrop(
     private val audio = activity.getSystemService(AudioManager::class.java)
     private val visibleBounds = Rect()
     private val density = resources.displayMetrics.density
+    private val addMode = if (light) null else PorterDuffXfermode(PorterDuff.Mode.ADD)
 
-    private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.DITHER_FLAG)
-    private val strokePaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.DITHER_FLAG).apply {
+    private val blobPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.DITHER_FLAG).apply {
+        xfermode = addMode
+    }
+    private val contourFillPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.DITHER_FLAG).apply {
+        style = Paint.Style.FILL
+        xfermode = addMode
+        maskFilter = BlurMaskFilter((if (light) 12f else 18f) * density, BlurMaskFilter.Blur.NORMAL)
+    }
+    private val contourStrokePaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.DITHER_FLAG).apply {
         style = Paint.Style.STROKE
         strokeCap = Paint.Cap.ROUND
         strokeJoin = Paint.Join.ROUND
+        xfermode = addMode
+        maskFilter = BlurMaskFilter((if (light) 12f else 18f) * density, BlurMaskFilter.Blur.NORMAL)
     }
+    private val ribbonGlowPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.DITHER_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.ROUND
+        xfermode = addMode
+        maskFilter = BlurMaskFilter(3f * density, BlurMaskFilter.Blur.NORMAL)
+    }
+    private val ribbonCorePaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.DITHER_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.ROUND
+        xfermode = addMode
+    }
+    private val sparkPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.DITHER_FLAG).apply {
+        xfermode = addMode
+    }
+
     private val path = Path()
     private val matrix = Matrix()
+    private val ptsX = FloatArray(CONTOUR_STEPS)
+    private val ptsY = FloatArray(CONTOUR_STEPS)
 
     private val blobShaders = arrayOfNulls<RadialGradient>(3)
     private val sparkShaders = arrayOfNulls<RadialGradient>(2)
     private val ribbonShaders = arrayOfNulls<LinearGradient>(3)
-    private var shaderColors = IntArray(4)
+    private val shaderColors = IntArray(4)
     private var shadersValid = false
 
     private var phase = 0.0
@@ -179,8 +210,7 @@ internal class WaveBackdrop(
 
     fun setWave(hex: String?, key: String) {
         if (waveHex != hex || lastWaveKey != key) {
-            val changedKey = lastWaveKey != key
-            if (changedKey && lastWaveKey.isNotEmpty()) {
+            if (lastWaveKey != key && lastWaveKey.isNotEmpty()) {
                 surge = min(1f, surge + 0.5f)
             }
             val initial = lastWaveKey.isEmpty()
@@ -197,7 +227,7 @@ internal class WaveBackdrop(
 
     fun refreshVolume() {
         val next = readSystemVolume()
-        if (kotlin.math.abs(next - systemVolume) > 0.005f) {
+        if (abs(next - systemVolume) > 0.005f) {
             systemVolume = next
             invalidate()
         }
@@ -274,7 +304,7 @@ internal class WaveBackdrop(
                 intArrayOf(
                     base,
                     ColorUtils.setAlphaComponent(base, if (light) 184 else 158),
-                    ColorUtils.setAlphaComponent(base, if (light) 86 else 62),
+                    ColorUtils.setAlphaComponent(base, if (light) 87 else 61),
                     ColorUtils.setAlphaComponent(base, if (light) 23 else 13),
                     Color.TRANSPARENT,
                 ),
@@ -383,36 +413,36 @@ internal class WaveBackdrop(
         val power = (0.24f + 0.34f * en) + (0.22f + 0.32f * en) * act + 0.28f * sonic + 0.16f * surge
         val cx = w * 0.5f
         val cy = h * 0.48f
-        val maxSpread = min(w * 0.50f, h * 0.40f)
+        val maxSpread = min(w * 0.52f, h * 0.42f)
 
-        // 1. Atmospheric breathing glow blobs with zero rectangular borders.
+        // 1. Дышащее атмосферное свечение без резких границ
         for (i in blobShaders.indices) {
             val angle = time * BLOB_SPEEDS[i] + i * 2.1
-            val orbitX = maxSpread * (0.18f + 0.12f * en + 0.05f * sonic)
-            val orbitY = maxSpread * (0.09f + 0.07f * en + 0.03f * kick)
+            val orbitX = maxSpread * (0.20f + 0.14f * en + 0.06f * sonic)
+            val orbitY = maxSpread * (0.10f + 0.08f * en + 0.04f * kick)
             val bx = cx + cos(angle).toFloat() * orbitX
             val by = cy + sin(angle * 1.25).toFloat() * orbitY
-            val radius = maxSpread * (0.72f + 0.16f * en + 0.07f * kick + 0.05f * surge + 0.06f * sin(angle + 1.0).toFloat())
+            val radius = maxSpread * (0.72f + 0.18f * en + 0.08f * kick + 0.06f * surge + 0.07f * sin(angle + 1.0).toFloat())
             val shader = blobShaders[i] ?: continue
             matrix.setScale(radius, radius)
             matrix.postTranslate(bx, by)
             shader.setLocalMatrix(matrix)
-            fillPaint.shader = shader
-            fillPaint.alpha = (((if (light) 0.44f else 0.40f) * power).coerceIn(0f, 1f) * 255f).toInt()
-            canvas.drawCircle(bx, by, radius, fillPaint)
+            blobPaint.shader = shader
+            blobPaint.alpha = (((if (light) 0.48f else 0.40f) * power).coerceIn(0f, 1f) * 255f).toInt()
+            canvas.drawCircle(bx, by, radius, blobPaint)
         }
-        fillPaint.shader = null
+        blobPaint.shader = null
 
-        // 2. Soft polar-harmonic organic contours.
+        // 2. Размытые органические контуры волны (полярные гармоники)
         val primaryColor = shaderColors[0]
         val secondaryColor = shaderColors[1]
         val contourAmp = 0.04f + 0.05f * act + 0.11f * kick + 0.06f * surge
         drawContour(canvas, cx, cy, w, h, maxSpread, en, kick, time, 0.41f, 0.20f, 1.0, 0.0, primaryColor,
-            (if (light) 0.42f else 0.38f) * power, contourAmp)
+            (if (light) 0.46f else 0.40f) * power, contourAmp)
         drawContour(canvas, cx, cy, w, h, maxSpread, en, kick, time, 0.34f, 0.16f, -0.82, 1.9, secondaryColor,
-            (if (light) 0.35f else 0.32f) * power, contourAmp)
+            (if (light) 0.38f else 0.34f) * power, contourAmp)
 
-        // 3. Silk acoustic ribbons fading smoothly toward edges.
+        // 3. Шёлковые акустические нити с плавным затуханием к краям
         val ribbonAmp = (4.5f + 4.5f * en + 12f * sonic + 14f * kick + 8f * surge) * density
         val leftX = w * 0.06f
         val spanX = w * 0.88f
@@ -422,21 +452,21 @@ internal class WaveBackdrop(
             matrix.setScale(spanX, 1f)
             matrix.postTranslate(leftX, 0f)
             shader.setLocalMatrix(matrix)
-            strokePaint.shader = shader
 
-            val glowAlpha = ((if (light) 0.36f else 0.40f) * power).coerceIn(0f, 1f)
-            strokePaint.alpha = (glowAlpha * 255f).toInt()
-            strokePaint.strokeWidth = RIBBON_WIDTH[i] * 3.4f * density
-            canvas.drawPath(path, strokePaint)
+            ribbonGlowPaint.shader = shader
+            ribbonGlowPaint.alpha = (((if (light) 0.44f else 0.48f) * power).coerceIn(0f, 1f) * 255f).toInt()
+            ribbonGlowPaint.strokeWidth = RIBBON_WIDTH[i] * 3.2f * density
+            canvas.drawPath(path, ribbonGlowPaint)
 
-            val coreAlpha = ((if (light) 0.78f else 0.66f) * power).coerceIn(0f, 1f)
-            strokePaint.alpha = (coreAlpha * 255f).toInt()
-            strokePaint.strokeWidth = RIBBON_WIDTH[i] * (if (light) 1.25f else 1f) * density
-            canvas.drawPath(path, strokePaint)
+            ribbonCorePaint.shader = shader
+            ribbonCorePaint.alpha = (((if (light) 0.82f else 0.68f) * power).coerceIn(0f, 1f) * 255f).toInt()
+            ribbonCorePaint.strokeWidth = RIBBON_WIDTH[i] * (if (light) 1.25f else 1f) * density
+            canvas.drawPath(path, ribbonCorePaint)
         }
-        strokePaint.shader = null
+        ribbonGlowPaint.shader = null
+        ribbonCorePaint.shader = null
 
-        // 4. Soft orbiting sparks around center.
+        // 4. Мягкие тёплые искры вокруг центра
         for (i in 0 until 10) {
             val seed = i * 1.6180339
             val angle = time * (0.28 + (i % 3) * 0.14) + seed * 3.1
@@ -449,11 +479,11 @@ internal class WaveBackdrop(
             matrix.setScale(radius, radius)
             matrix.postTranslate(px, py)
             shader.setLocalMatrix(matrix)
-            fillPaint.shader = shader
-            fillPaint.alpha = (((if (light) 0.58f else 0.52f) * power * pulse).coerceIn(0f, 1f) * 255f).toInt()
-            canvas.drawCircle(px, py, radius, fillPaint)
+            sparkPaint.shader = shader
+            sparkPaint.alpha = (((if (light) 0.58f else 0.52f) * power * pulse).coerceIn(0f, 1f) * 255f).toInt()
+            canvas.drawCircle(px, py, radius, sparkPaint)
         }
-        fillPaint.shader = null
+        sparkPaint.shader = null
 
         if (animated) postInvalidateOnAnimation()
     }
@@ -477,52 +507,54 @@ internal class WaveBackdrop(
         amp: Float,
     ) {
         val scale = 0.84f + 0.14f * en + 0.10f * kick + 0.08f * surge
-        val rx = min(w * rxFactor, maxSpread * 1.08f) * scale
-        val ry = min(h * ryFactor, maxSpread * 0.58f) * scale
-        val steps = 48
-        path.rewind()
+        val rx = min(w * rxFactor, maxSpread * 1.12f) * scale
+        val ry = min(h * ryFactor, maxSpread * 0.60f) * scale
         val loopTime = time * speed
-        for (i in 0 until steps) {
-            val theta = (i.toDouble() / steps) * Math.PI * 2.0
+        for (i in 0 until CONTOUR_STEPS) {
+            val theta = (i.toDouble() / CONTOUR_STEPS) * Math.PI * 2.0
             val harmonic = 0.45 * sin(2.0 * theta + loopTime) +
                 0.35 * sin(3.0 * theta - 1.35 * loopTime + offset) +
                 0.20 * sin(5.0 * theta + 2.1 * loopTime)
             val s = 1f + amp * harmonic.toFloat()
-            val px = cx + cos(theta).toFloat() * rx * s
-            val py = cy + sin(theta).toFloat() * ry * s
-            if (i == 0) path.moveTo(px, py) else path.lineTo(px, py)
+            ptsX[i] = cx + cos(theta).toFloat() * rx * s
+            ptsY[i] = cy + sin(theta).toFloat() * ry * s
+        }
+        path.rewind()
+        val last = CONTOUR_STEPS - 1
+        path.moveTo((ptsX[last] + ptsX[0]) * 0.5f, (ptsY[last] + ptsY[0]) * 0.5f)
+        for (i in 0 until CONTOUR_STEPS) {
+            val next = (i + 1) % CONTOUR_STEPS
+            path.quadTo(ptsX[i], ptsY[i], (ptsX[i] + ptsX[next]) * 0.5f, (ptsY[i] + ptsY[next]) * 0.5f)
         }
         path.close()
 
-        fillPaint.color = color
-        fillPaint.alpha = ((alpha * (if (light) 0.24f else 0.22f)).coerceIn(0f, 1f) * 255f).toInt()
-        canvas.drawPath(path, fillPaint)
+        contourFillPaint.color = color
+        contourFillPaint.alpha = ((alpha * (if (light) 0.50f else 0.42f)).coerceIn(0f, 1f) * 255f).toInt()
+        canvas.drawPath(path, contourFillPaint)
 
-        strokePaint.color = color
-        val baseWidth = (9f + 7f * en + 5f * kick) * density
-        strokePaint.alpha = ((alpha * 0.26f).coerceIn(0f, 1f) * 255f).toInt()
-        strokePaint.strokeWidth = baseWidth * 2.1f
-        canvas.drawPath(path, strokePaint)
-
-        strokePaint.alpha = ((alpha * 0.52f).coerceIn(0f, 1f) * 255f).toInt()
-        strokePaint.strokeWidth = baseWidth
-        canvas.drawPath(path, strokePaint)
+        contourStrokePaint.color = color
+        contourStrokePaint.alpha = (alpha.coerceIn(0f, 1f) * 255f).toInt()
+        contourStrokePaint.strokeWidth = (9f + 7f * en + 5f * kick) * density
+        canvas.drawPath(path, contourStrokePaint)
     }
 
     private fun buildSilkPath(leftX: Float, spanX: Float, baseY: Float, amp: Float, freq: Double, phaseOffset: Double) {
-        val steps = 56
+        val steps = 64
         path.rewind()
         for (i in 0..steps) {
-            val t = i.toFloat() / steps
-            val x = leftX + spanX * t
-            val env = sin(t * Math.PI).toFloat().pow(1.6f)
-            val angle = t * Math.PI * 2.0 * freq + phaseOffset
-            val y = baseY + (0.65 * sin(angle) + 0.35 * sin(angle * 1.7 + phaseOffset * 0.4)).toFloat() * amp * env
+            val u = i.toDouble() / steps
+            val env = sin(Math.PI * u)
+            val window = env * env
+            val yWave = sin(u * Math.PI * 2.0 * freq + phaseOffset) * 0.65 +
+                sin(u * Math.PI * 2.0 * (freq * 1.7) - phaseOffset * 1.3) * 0.35
+            val x = leftX + spanX * u.toFloat()
+            val y = baseY + amp * (window * yWave).toFloat()
             if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
         }
     }
 
     private companion object {
+        const val CONTOUR_STEPS = 48
         val BLOB_SPEEDS = doubleArrayOf(0.58, 0.37, 0.46)
         val RIBBON_FREQ = doubleArrayOf(2.1, 3.0, 1.5)
         val RIBBON_SPEED = doubleArrayOf(1.55, -1.15, 0.90)

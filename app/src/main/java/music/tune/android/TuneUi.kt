@@ -298,7 +298,7 @@ internal enum class Symbol {
     LYRICS, REPEAT, REPEAT_ONE, SHUFFLE, CLOCK, HISTORY, ADD, CLOSE, MINUS_CIRCLE, SHARE,
     ARROW_UP, ARROW_DOWN, ARROW_UP_LEFT, VIDEO, CONCERT, LINK, OUTPUT, MOON, THUMB_DOWN, THUMB_DOWN_FILLED,
     ACCOUNT, PERSON_MINUS, GEAR, STATS, TRASH, EDIT, FILTER, SORT, REORDER, PHOTO, SPEAKER, CIRCLE, CHECK_CIRCLE,
-    FILE, DOWNLOAD_CIRCLE, UNLOCK, EYE_OFF, WIFI_OFF, MIC_MUSIC, MIC, BOOK, BALLOON, GRID
+    FILE, DOWNLOAD_CIRCLE, LOCK, UNLOCK, EYE_OFF, WIFI_OFF, MIC_MUSIC, MIC, BOOK, BALLOON, GRID
 }
 
 internal class IconView(context: Context, var symbol: Symbol, var tint: Int) : View(context) {
@@ -566,6 +566,9 @@ internal class IconView(context: Context, var symbol: Symbol, var tint: Int) : V
             Symbol.CHECK_CIRCLE -> { circle(12, 12, 8.5f); shape(8, 12, 11, 15, 16, 9) }
             Symbol.FILE -> { shape(5, 3, 15, 3, 20, 8, 20, 21, 5, 21, close = true); shape(15, 3, 15, 8, 20, 8); line(8, 12, 16, 12); line(8, 16, 16, 16) }
             Symbol.DOWNLOAD_CIRCLE -> { circle(12, 12, 9); line(12, 7.5f, 12, 15.5f); shape(8.5f, 12.2f, 12, 15.8f, 15.5f, 12.2f) }
+            Symbol.LOCK -> { canvas.drawRoundRect(5f, 10f, 19f, 22f, 2f, 2f, paint)
+                path.rewind(); path.moveTo(8f, 10f); path.lineTo(8f, 7f); path.cubicTo(8f, 2.5f, 16f, 2.5f, 16f, 7f); path.lineTo(16f, 10f); canvas.drawPath(path, paint)
+                line(12, 15, 12, 18) }
             Symbol.UNLOCK -> { canvas.drawRoundRect(5f, 10f, 19f, 22f, 2f, 2f, paint)
                 path.rewind(); path.moveTo(8f, 10f); path.lineTo(8f, 6f); path.cubicTo(8f, 1f, 17f, 1f, 17f, 6f); canvas.drawPath(path, paint)
                 line(12, 15, 12, 18) }
@@ -773,6 +776,7 @@ internal class TuneRefreshLayout(
     ui: TuneUi,
     private val list: ListView,
     private val canRefresh: () -> Boolean = { true },
+    private val onPullOffset: ((Float) -> Unit)? = null,
     private val onRefresh: () -> Unit,
 ) : FrameLayout(ui.context) {
     private val slop = ViewConfiguration.get(ui.context).scaledTouchSlop.toFloat()
@@ -838,6 +842,7 @@ internal class TuneRefreshLayout(
                 list.animate().cancel()
                 pill.animate().cancel()
                 list.translationY = pull
+                onPullOffset?.invoke(pull)
                 pill.visibility = if (pull > 2f) View.VISIBLE else View.GONE
                 pill.translationY = (pull - pillOffset).coerceAtLeast(0f)
                 pill.alpha = progress
@@ -856,7 +861,8 @@ internal class TuneRefreshLayout(
                 pulling = false
                 if (event.actionMasked == MotionEvent.ACTION_UP && primed) {
                     refreshing = true
-                    list.animate().translationY(resting).setDuration(180).start()
+                    list.animate().translationY(resting).setDuration(180)
+                        .setUpdateListener { onPullOffset?.invoke(list.translationY) }.start()
                     pill.animate().translationY(resting - pillOffset).alpha(1f).scaleX(1f).scaleY(1f).setDuration(180).start()
                     onRefresh()
                 } else {
@@ -869,7 +875,10 @@ internal class TuneRefreshLayout(
 
     private fun reset() {
         primed = false
-        list.animate().translationY(0f).setDuration(200).start()
+        list.animate().translationY(0f).setDuration(200)
+            .setUpdateListener { onPullOffset?.invoke(list.translationY) }
+            .withEndAction { onPullOffset?.invoke(0f) }
+            .start()
         pill.animate().translationY(-pillOffset).alpha(0f).scaleX(.75f).scaleY(.75f).setDuration(180)
             .withEndAction { if (!pulling && !refreshing) pill.visibility = View.GONE }
             .start()

@@ -15,11 +15,13 @@ import android.graphics.Shader
 import android.graphics.Typeface
 import android.graphics.drawable.ClipDrawable
 import android.graphics.drawable.LayerDrawable
+import android.os.SystemClock
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.View
+import android.view.ViewConfiguration
 import android.view.ViewGroup
 import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
@@ -30,6 +32,7 @@ import android.widget.TextView
 import androidx.core.graphics.ColorUtils
 import java.text.NumberFormat
 import java.util.Locale
+import kotlin.math.abs
 import kotlin.math.roundToInt
 
 internal class SoundSheet(private val activity: MainActivity) {
@@ -76,14 +79,14 @@ internal class SoundSheet(private val activity: MainActivity) {
             val speedSteps = (prefs.getFloat("speed", 1f) * 20).roundToInt().coerceIn(10, 40)
             var speedBarRef: SeekBar? = null
             var speedValueRef: TextView? = null
-            val speedPresets = listOf(15 to "0,75×", 20 to "1×", 25 to "1,25×", 30 to "1,5×", 40 to "2×")
+            val speedPresets = listOf(17 to "0,85×", 20 to "1×", 25 to "1,25×", 30 to "1,5×")
             val speedChips = mutableListOf<Pair<Int, TextView>>()
             fun syncSpeedChips(step: Int) {
                 speedChips.forEach { (presetStep, chip) ->
                     val active = presetStep == step
                     chip.isSelected = active
                     chip.setTextColor(if (active) Color.BLACK else ui.palette.text)
-                    chip.background = ui.touch(if (active) ui.palette.accent else ui.palette.lifted, 20)
+                    chip.background = ui.touch(if (active) ui.palette.accent else ui.palette.lifted, 10)
                 }
             }
             add(slider("Скорость", speedSteps, 10, 40, { "${speedText(it)}×" }, onCreated = { bar, label ->
@@ -98,7 +101,8 @@ internal class SoundSheet(private val activity: MainActivity) {
                 speedPresets.forEachIndexed { idx, (presetStep, caption) ->
                     val chip = ui.line(caption, 13, bold = true).apply {
                         gravity = Gravity.CENTER
-                        minHeight = ui.dp(34)
+                        minHeight = ui.dp(32)
+                        fontFeatureSettings = "tnum"
                         pressFeedback(.94f)
                         isFocusable = true
                         setOnClickListener {
@@ -110,8 +114,8 @@ internal class SoundSheet(private val activity: MainActivity) {
                         }
                     }
                     speedChips += presetStep to chip
-                    addView(chip, LinearLayout.LayoutParams(0, ui.dp(34), 1f).apply {
-                        if (idx > 0) marginStart = ui.dp(6)
+                    addView(chip, LinearLayout.LayoutParams(0, ui.dp(32), 1f).apply {
+                        if (idx > 0) marginStart = ui.dp(8)
                     })
                 }
                 syncSpeedChips(speedSteps)
@@ -177,6 +181,7 @@ internal class SoundSheet(private val activity: MainActivity) {
                     currentPreset = selected
                     presetChips.forEach { (name, chip) ->
                         val active = name == selected
+                        chip.visibility = if (name == options.first() && !active) View.GONE else View.VISIBLE
                         chip.isSelected = active
                         chip.setTextColor(if (active) Color.BLACK else ui.palette.text)
                         chip.background = ui.touch(if (active) ui.palette.accent else ui.palette.lifted, 20)
@@ -185,8 +190,9 @@ internal class SoundSheet(private val activity: MainActivity) {
                 val chipRow = ui.row().apply {
                     setPadding(ui.dp(16), ui.dp(10), ui.dp(16), ui.dp(10))
                 }
-                options.forEachIndexed { idx, option ->
-                    val chip = ui.button(option, option == currentPreset) {
+                options.forEach { option ->
+                    val active = option == currentPreset
+                    val chip = ui.button(option, active) {
                         val edit = prefs.edit().putString("eqPreset", option)
                         SoundSettings.presets[option]?.let { preset ->
                             edit.putInt("preamp", 100)
@@ -202,13 +208,14 @@ internal class SoundSheet(private val activity: MainActivity) {
                         syncPresetChips(option)
                         updateReset()
                     }.apply {
-                        minHeight = ui.dp(34)
-                        setPadding(ui.dp(13), ui.dp(6), ui.dp(13), ui.dp(6))
-                        background = ui.touch(if (option == currentPreset) ui.palette.accent else ui.palette.lifted, 20)
+                        minHeight = ui.dp(32)
+                        setPadding(ui.dp(12), ui.dp(5), ui.dp(12), ui.dp(5))
+                        visibility = if (option == options.first() && !active) View.GONE else View.VISIBLE
+                        background = ui.touch(if (active) ui.palette.accent else ui.palette.lifted, 20)
                     }
                     presetChips += option to chip
-                    chipRow.addView(chip, LinearLayout.LayoutParams(-2, ui.dp(34)).apply {
-                        if (idx > 0) marginStart = ui.dp(8)
+                    chipRow.addView(chip, LinearLayout.LayoutParams(-2, ui.dp(32)).apply {
+                        marginEnd = ui.dp(8)
                     })
                 }
                 val presetStrip = HorizontalScrollView(activity).apply {
@@ -218,7 +225,7 @@ internal class SoundSheet(private val activity: MainActivity) {
                     addView(chipRow, ViewGroup.LayoutParams(-2, -2))
                     addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
                         val activeChip = presetChips.firstOrNull { it.first == currentPreset }?.second ?: return@addOnLayoutChangeListener
-                        if (activeChip.right > scrollX + width || activeChip.left < scrollX) {
+                        if (activeChip.visibility == View.VISIBLE && (activeChip.right > scrollX + width || activeChip.left < scrollX)) {
                             scrollTo((activeChip.left - ui.dp(16)).coerceAtLeast(0), 0)
                         }
                     }
@@ -228,6 +235,12 @@ internal class SoundSheet(private val activity: MainActivity) {
                     edit.putString("eqPreset", options.first()).apply()
                     if (currentPreset != options.first()) syncPresetChips(options.first())
                 }
+                eqView = GraphicEqualizerView(ui, gains, ::gainText) { index, halfDb ->
+                    gains[index] = halfDb
+                    markCustom(prefs.edit().putInt("eqStep:$index", halfDb))
+                    updateReset()
+                }
+                add(eqView)
                 add(slider("Уровень", (prefs.getInt("preamp", 100) / 5f).roundToInt(), 10, 30, { "${it * 5}%" },
                     live = true, onCreated = { bar, label ->
                         preampBarRef = bar
@@ -235,12 +248,6 @@ internal class SoundSheet(private val activity: MainActivity) {
                     }) {
                     markCustom(prefs.edit().putInt("preamp", it * 5))
                 })
-                eqView = GraphicEqualizerView(ui, gains, ::gainText) { index, halfDb ->
-                    gains[index] = halfDb
-                    markCustom(prefs.edit().putInt("eqStep:$index", halfDb))
-                    updateReset()
-                }
-                add(eqView)
             }
         }.view, ui.full())
         reset = SettingsGroup(ui, "", "").apply {
@@ -341,26 +348,33 @@ private class GraphicEqualizerView(
     private val onChange: (index: Int, halfDb: Int) -> Unit,
 ) : View(ui.context) {
     private val density = resources.displayMetrics.density
+    private val slop = ViewConfiguration.get(ui.context).scaledTouchSlop.toFloat()
     private val levels = IntArray(SoundSettings.bands.size) { initialLevels.getOrElse(it) { 0 }.coerceIn(-24, 24) }
     private val labels = SoundSettings.bands.map { hz -> if (hz < 1000) "$hz" else "${hz / 1000}k" }
+    private val fullTitles = SoundSettings.bands.map { hz -> if (hz < 1000) "$hz Гц" else "${hz / 1000} кГц" }
     private val pointX = FloatArray(levels.size)
     private val pointY = FloatArray(levels.size)
     private var activeBand = -1
+    private var lastUpBand = -1
+    private var lastUpMs = 0L
+    private var downX = 0f
+    private var downY = 0f
+    private var maxMove = 0f
 
     private val zeroPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = ColorUtils.setAlphaComponent(ui.palette.text, 48)
+        color = ColorUtils.setAlphaComponent(ui.palette.text, 41)
         style = Paint.Style.STROKE
         strokeWidth = 1f * density
-        pathEffect = DashPathEffect(floatArrayOf(4f * density, 4f * density), 0f)
+        pathEffect = DashPathEffect(floatArrayOf(3f * density, 3f * density), 0f)
     }
     private val trackPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = ui.palette.line
+        color = ColorUtils.setAlphaComponent(ui.palette.text, 31)
         style = Paint.Style.STROKE
         strokeCap = Paint.Cap.ROUND
-        strokeWidth = 3f * density
+        strokeWidth = 2f * density
     }
     private val activeTrackPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = ColorUtils.setAlphaComponent(ui.palette.accent, 110)
+        color = ui.palette.accent
         style = Paint.Style.STROKE
         strokeCap = Paint.Cap.ROUND
         strokeWidth = 3f * density
@@ -370,42 +384,50 @@ private class GraphicEqualizerView(
         style = Paint.Style.STROKE
         strokeCap = Paint.Cap.ROUND
         strokeJoin = Paint.Join.ROUND
-        strokeWidth = 2.5f * density
+        strokeWidth = 2f * density
     }
     private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = ColorUtils.setAlphaComponent(ui.palette.accent, 36)
         style = Paint.Style.FILL
     }
     private val thumbPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.WHITE
+        color = ui.palette.accent
         style = Paint.Style.FILL
     }
-    private val haloPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = ColorUtils.setAlphaComponent(ui.palette.accent, 72)
-        style = Paint.Style.FILL
+    private val thumbStrokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = 0xff1c1c1c.toInt()
+        style = Paint.Style.STROKE
+        strokeWidth = 1.5f * density
     }
     private val labelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = ui.palette.muted
-        textSize = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, 11f, resources.displayMetrics)
+        textSize = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, 10f, resources.displayMetrics)
         textAlign = Paint.Align.CENTER
         typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
     }
-    private val pillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = ui.palette.lifted
-        style = Paint.Style.FILL
+    private val activeLabelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = ui.palette.accentText
+        textSize = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, 10f, resources.displayMetrics)
+        textAlign = Paint.Align.CENTER
+        typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
     }
-    private val pillTextPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = ui.palette.accent
+    private val headerLeftPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = ui.palette.muted
         textSize = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, 12f, resources.displayMetrics)
-        textAlign = Paint.Align.CENTER
+        textAlign = Paint.Align.LEFT
         typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+    }
+    private val headerRightPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = ui.palette.muted
+        textSize = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, 11f, resources.displayMetrics)
+        textAlign = Paint.Align.RIGHT
+        fontFeatureSettings = "tnum"
     }
     private val curvePath = Path()
     private val areaPath = Path()
-    private val pillRect = RectF()
-    private var areaShader: LinearGradient? = null
 
     init {
-        minimumHeight = ui.dp(228)
+        minimumHeight = ui.dp(220)
         isFocusable = true
     }
 
@@ -422,30 +444,32 @@ private class GraphicEqualizerView(
         invalidate()
     }
 
-    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
-        super.onSizeChanged(w, h, oldw, oldh)
-        val accent = 0xfffacc15.toInt()
-        val top = 34f * density
-        val bottom = h - 26f * density
-        areaShader = if (bottom > top) LinearGradient(
-            0f, top, 0f, bottom,
-            ColorUtils.setAlphaComponent(accent, 68),
-            ColorUtils.setAlphaComponent(accent, 0),
-            Shader.TileMode.CLAMP,
-        ) else null
-    }
-
     override fun onDraw(canvas: Canvas) {
         val w = width.toFloat()
         val h = height.toFloat()
         if (w <= 0f || h <= 0f) return
 
         val sidePad = 20f * density
+        val headerY = 18f * density
         val top = 34f * density
         val bottom = h - 26f * density
         val spanH = (bottom - top).coerceAtLeast(1f)
         val midY = (top + bottom) * 0.5f
         val colStep = (w - sidePad * 2f) / (levels.size - 1).coerceAtLeast(1)
+
+        if (activeBand in levels.indices) {
+            headerLeftPaint.color = Color.WHITE
+            headerRightPaint.color = 0xfffacc15.toInt()
+            headerRightPaint.textSize = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, 12f, resources.displayMetrics)
+            canvas.drawText(fullTitles[activeBand], sidePad * 0.8f, headerY, headerLeftPaint)
+            canvas.drawText(formatGain(levels[activeBand]), w - sidePad * 0.8f, headerY, headerRightPaint)
+        } else {
+            headerLeftPaint.color = 0xff999999.toInt()
+            headerRightPaint.color = 0xff999999.toInt()
+            headerRightPaint.textSize = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, 11f, resources.displayMetrics)
+            canvas.drawText("АЧХ", sidePad * 0.8f, headerY, headerLeftPaint)
+            canvas.drawText("+12 / 0 / −12 дБ", w - sidePad * 0.8f, headerY, headerRightPaint)
+        }
 
         canvas.drawLine(sidePad * 0.5f, midY, w - sidePad * 0.5f, midY, zeroPaint)
 
@@ -463,42 +487,26 @@ private class GraphicEqualizerView(
         curvePath.rewind()
         areaPath.rewind()
         curvePath.moveTo(pointX[0], pointY[0])
-        areaPath.moveTo(pointX[0], bottom)
+        areaPath.moveTo(pointX[0], midY)
         areaPath.lineTo(pointX[0], pointY[0])
         for (i in 0 until levels.lastIndex) {
             val midX = (pointX[i] + pointX[i + 1]) * 0.5f
             curvePath.cubicTo(midX, pointY[i], midX, pointY[i + 1], pointX[i + 1], pointY[i + 1])
             areaPath.cubicTo(midX, pointY[i], midX, pointY[i + 1], pointX[i + 1], pointY[i + 1])
         }
-        areaPath.lineTo(pointX.last(), bottom)
+        areaPath.lineTo(pointX.last(), midY)
         areaPath.close()
 
-        fillPaint.shader = areaShader
         canvas.drawPath(areaPath, fillPaint)
-        fillPaint.shader = null
         canvas.drawPath(curvePath, curvePaint)
 
-        val thumbRadius = 7f * density
         val labelY = h - 7f * density
         for (i in levels.indices) {
             val isActive = i == activeBand
-            if (isActive) {
-                canvas.drawCircle(pointX[i], pointY[i], thumbRadius * 1.9f, haloPaint)
-            }
-            canvas.drawCircle(pointX[i], pointY[i], if (isActive) thumbRadius * 1.25f else thumbRadius, thumbPaint)
-            canvas.drawText(labels[i], pointX[i], labelY, labelPaint)
-        }
-
-        if (activeBand in levels.indices) {
-            val text = "${labels[activeBand]} Гц · ${formatGain(levels[activeBand])}"
-            val textW = pillTextPaint.measureText(text)
-            val pillW = textW + 22f * density
-            val pillH = 22f * density
-            val cx = (w * 0.5f).coerceIn(pillW * 0.5f, (w - pillW * 0.5f).coerceAtLeast(pillW * 0.5f))
-            pillRect.set(cx - pillW * 0.5f, 4f * density, cx + pillW * 0.5f, 4f * density + pillH)
-            canvas.drawRoundRect(pillRect, pillH * 0.5f, pillH * 0.5f, pillPaint)
-            val textY = pillRect.centerY() - (pillTextPaint.ascent() + pillTextPaint.descent()) * 0.5f
-            canvas.drawText(text, pillRect.centerX(), textY, pillTextPaint)
+            val r = (if (isActive) 7.5f else 6f) * density
+            canvas.drawCircle(pointX[i], pointY[i], r, thumbPaint)
+            canvas.drawCircle(pointX[i], pointY[i], r, thumbStrokePaint)
+            canvas.drawText(labels[i], pointX[i], labelY, if (isActive) activeLabelPaint else labelPaint)
         }
     }
 
@@ -526,19 +534,41 @@ private class GraphicEqualizerView(
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 parent?.requestDisallowInterceptTouchEvent(true)
+                downX = event.x
+                downY = event.y
+                maxMove = 0f
                 val band = ((event.x - sidePad) / colStep).roundToInt().coerceIn(0, levels.lastIndex)
                 activeBand = band
+                val now = SystemClock.uptimeMillis()
+                if (band == lastUpBand && now - lastUpMs < 300L) {
+                    lastUpBand = -1
+                    if (levels[band] != 0) {
+                        levels[band] = 0
+                        performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                        onChange(band, 0)
+                    }
+                    invalidate()
+                    return true
+                }
                 updateBand(band, event.y)
                 invalidate()
                 return true
             }
             MotionEvent.ACTION_MOVE -> {
+                val dx = event.x - downX
+                val dy = event.y - downY
+                maxMove = maxOf(maxMove, kotlin.math.hypot(dx, dy))
                 if (activeBand in levels.indices) updateBand(activeBand, event.y)
                 return true
             }
             MotionEvent.ACTION_UP -> {
+                val endedBand = activeBand
                 activeBand = -1
                 parent?.requestDisallowInterceptTouchEvent(false)
+                if (maxMove < slop && endedBand in levels.indices) {
+                    lastUpBand = endedBand
+                    lastUpMs = SystemClock.uptimeMillis()
+                }
                 invalidate()
                 performClick()
                 return true

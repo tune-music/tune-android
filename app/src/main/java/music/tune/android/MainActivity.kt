@@ -183,6 +183,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
     private var homeLoaded = false
     private var loadingHome = false
     private var homeDevicesButton: IconView? = null
+    private var homeWaveBackdrop: WaveBackdrop? = null
     private var libraryPlaylistFilter = 0
     private var details: MusicPage? = null
     private var reordering = false
@@ -815,6 +816,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
         toolbarTitle = null
         detailToolbar = null
         homeDevicesButton = null
+        homeWaveBackdrop = null
         detailTone = null
         detailChrome = Color.TRANSPARENT
         statsClearButton = null
@@ -831,16 +833,37 @@ class MainActivity : ComponentActivity(), Player.Listener {
         refreshLayout = null
         root.removeAllViews()
         root.setBackgroundColor(ui.palette.background)
-        content = ui.column()
+        content = ui.column().apply {
+            if (current.screen == Screen.HOME) {
+                clipChildren = false
+                clipToPadding = false
+            }
+        }
         root.addView(content, FrameLayout.LayoutParams(-1, -1))
-        if (current.screen == Screen.SEARCH) {
+        val homeStage: FrameLayout? = if (current.screen == Screen.HOME) {
+            FrameLayout(this).apply {
+                clipChildren = false
+                clipToPadding = false
+                val backdrop = WaveBackdrop(this@MainActivity, ui.palette.light).apply {
+                    importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+                }
+                homeWaveBackdrop = backdrop
+                addView(backdrop, FrameLayout.LayoutParams(-1, ui.dp(540), Gravity.TOP))
+            }.also { content.addView(it, LinearLayout.LayoutParams(-1, 0, 1f)) }
+        } else null
+        val topBar = if (current.screen == Screen.SEARCH) {
             content.isFocusableInTouchMode = true
             content.requestFocus()
             content.addView(searchBar(), ui.full())
             content.addView(ui.column().also { suggestions = it }, ui.full())
             updateSuggestions(searchText)
-        } else content.addView(toolbar(current).also { if (current.screen == Screen.DETAILS) detailToolbar = it },
-            ui.full(if (current.screen == Screen.HOME) 48 else 56))
+            null
+        } else {
+            toolbar(current).also { bar ->
+                if (current.screen == Screen.DETAILS) detailToolbar = bar
+                if (homeStage == null) content.addView(bar, ui.full(56))
+            }
+        }
         if (current.screen == Screen.SETTINGS) {
             val body = ui.column().apply { setPadding(0, 0, 0, ui.dp(20)) }
             val scroll = ScrollView(this).apply {
@@ -863,11 +886,17 @@ class MainActivity : ComponentActivity(), Player.Listener {
                 divider = null
                 selector = android.graphics.drawable.ColorDrawable(Color.TRANSPARENT)
                 overScrollMode = View.OVER_SCROLL_NEVER
-                cacheColorHint = ui.palette.background
-                setPadding(0, 0, 0, ui.dp(8))
+                cacheColorHint = if (current.screen == Screen.HOME) Color.TRANSPARENT else ui.palette.background
+                setPadding(0, if (current.screen == Screen.HOME) ui.dp(48) else 0, 0, ui.dp(8))
                 clipToPadding = false
                 if (current.screen == Screen.HOME) clipChildren = false
                 isNestedScrollingEnabled = true
+                if (current.screen == Screen.HOME) setOnScrollListener(object : android.widget.AbsListView.OnScrollListener {
+                    override fun onScrollStateChanged(view: android.widget.AbsListView, state: Int) = Unit
+                    override fun onScroll(view: android.widget.AbsListView, first: Int, visible: Int, total: Int) {
+                        syncHomeWaveBackdrop()
+                    }
+                })
                 if (current.screen in HEADER_FADE_SCREENS) setOnScrollListener(object : android.widget.AbsListView.OnScrollListener {
                     override fun onScrollStateChanged(view: android.widget.AbsListView, state: Int) = Unit
                     override fun onScroll(view: android.widget.AbsListView, first: Int, visible: Int, total: Int) {
@@ -886,7 +915,13 @@ class MainActivity : ComponentActivity(), Player.Listener {
             list = pageList
             adapter = pageAdapter
             val pageContainer: View = if (current.screen in REFRESHABLE_SCREENS) {
-                TuneRefreshLayout(ui, pageList, { !reordering && !selecting }, ::refreshCurrentPage).apply {
+                TuneRefreshLayout(
+                    ui,
+                    pageList,
+                    { !reordering && !selecting },
+                    onPullOffset = if (current.screen == Screen.HOME) ({ syncHomeWaveBackdrop() }) else null,
+                    onRefresh = ::refreshCurrentPage,
+                ).apply {
                     if (current.screen == Screen.HOME) {
                         clipChildren = false
                         clipToPadding = false
@@ -897,7 +932,12 @@ class MainActivity : ComponentActivity(), Player.Listener {
             } else {
                 pageList
             }
-            content.addView(pageContainer, LinearLayout.LayoutParams(-1, 0, 1f))
+            if (homeStage != null) {
+                homeStage.addView(pageContainer, FrameLayout.LayoutParams(-1, -1))
+                topBar?.let { homeStage.addView(it, FrameLayout.LayoutParams(-1, ui.dp(48), Gravity.TOP)) }
+            } else {
+                content.addView(pageContainer, LinearLayout.LayoutParams(-1, 0, 1f))
+            }
             if (animateTabFade) {
                 animateTabFade = false
                 if (ValueAnimator.areAnimatorsEnabled()) {
@@ -1611,8 +1651,12 @@ class MainActivity : ComponentActivity(), Player.Listener {
         val key = HomeRowsKey(home, trending, store.offline, homeError, downloaded, loadingHome, showWheel)
         val cached = cachedHomeRows
         if (cachedHomeKey == key && cached != null) {
-            if (keepScroll && pageHasRows && adapter?.count == cached.size) return
+            if (keepScroll && pageHasRows && adapter?.count == cached.size) {
+                syncHomeWaveBackdrop()
+                return
+            }
             rows(cached, keepScroll)
+            syncHomeWaveBackdrop()
             return
         }
         val shelves = if (trending) page.trends else page.personal
@@ -1679,6 +1723,23 @@ class MainActivity : ComponentActivity(), Player.Listener {
         cachedHomeKey = key
         cachedHomeRows = built
         rows(built, keepScroll)
+        syncHomeWaveBackdrop()
+    }
+
+    private fun syncHomeWaveBackdrop() {
+        val backdrop = homeWaveBackdrop ?: return
+        if (trending || route.screen != Screen.HOME) {
+            backdrop.visibility = View.GONE
+            return
+        }
+        backdrop.visibility = View.VISIBLE
+        val pageList = list ?: return
+        val headRow = waveHead?.view?.takeIf { it.parent === pageList }
+        if (headRow != null) {
+            backdrop.translationY = headRow.top + ui.dp(244) * 0.5f - ui.dp(540) * 0.5f + pageList.translationY
+        } else {
+            backdrop.translationY = -ui.dp(600).toFloat()
+        }
     }
 
     private fun shelfRows(shelves: List<Shelf>) = buildList {
@@ -1746,9 +1807,6 @@ class MainActivity : ComponentActivity(), Player.Listener {
             clipToPadding = false
         }
         val words = WaveWordsView(this@MainActivity)
-        private val glow = WaveBackdrop(this@MainActivity, ui.palette.light).apply {
-            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
-        }
         private val playingBars = PlayingBars(this@MainActivity, ui.palette.accentText)
         private val playingText = ui.line("", 14, ColorUtils.setAlphaComponent(ui.palette.text, 217), bold = true)
         private val playingRow = ui.row().apply {
@@ -1831,7 +1889,6 @@ class MainActivity : ComponentActivity(), Player.Listener {
         private val hero = FrameLayout(this@MainActivity).apply {
             clipChildren = false
             clipToPadding = false
-            addView(glow, FrameLayout.LayoutParams(-1, ui.dp(360), Gravity.CENTER))
             addView(heroContent, FrameLayout.LayoutParams(-1, -2, Gravity.CENTER))
         }
         private val wavesHeader = ui.row().apply {
@@ -1851,14 +1908,14 @@ class MainActivity : ComponentActivity(), Player.Listener {
         private var wheelState: Pair<List<WheelItem>, String?>? = null
 
         init {
-            view.addView(hero, ui.full(248))
+            view.addView(hero, ui.full(244))
             view.addView(words, ui.full())
             view.addView(wavesHeader, ui.full())
             view.addView(rail, ui.full())
         }
 
-        fun resumeGlow() = glow.resumeIfPlaying()
-        fun refreshVolume() = glow.refreshVolume()
+        fun resumeGlow() = homeWaveBackdrop?.resumeIfPlaying()
+        fun refreshVolume() = homeWaveBackdrop?.refreshVolume()
 
         private fun resolveWaveHex(context: PlayContext): String? {
             if (context.kind != "radio") return null
@@ -1925,8 +1982,11 @@ class MainActivity : ComponentActivity(), Player.Listener {
             val settings = WAVE_SETTING_ORDER.filter { it in store.preferences.getStringSet("waveSettings", emptySet()).orEmpty() }
             currentActive = active
 
-            glow.setWave(resolveWaveHex(context), "${context.kind}:${context.item.orEmpty()}")
-            glow.playing = isAnyPlaying
+            homeWaveBackdrop?.let { glow ->
+                glow.setWave(resolveWaveHex(context), "${context.kind}:${context.item.orEmpty()}")
+                glow.playing = isAnyPlaying
+            }
+            view.post { syncHomeWaveBackdrop() }
 
             val state = HeroState(context, active, playingWave, settings)
             if (state == heroState) return
@@ -2166,23 +2226,34 @@ class MainActivity : ComponentActivity(), Player.Listener {
                             addView(ui.space(4))
                             addView(ui.line(trackCount(count), 14, ui.palette.muted))
                         }, ui.weight())
-                        val likesPlay = ui.icon(Symbol.PLAY, "Слушать «Мне нравится»", Color.BLACK) { playLikesQuick(false) }.apply {
-                            iconSize = 16
-                            background = ui.touch(ui.palette.accent, 20)
-                        }
-                        likesPlay.observePlayback {
-                            val now = QueueItems.context(controller?.currentMediaItem)
-                            val active = currentTrack() != null && now.kind == "playlist" && now.item == "${userId.orEmpty()}:3" &&
-                                controller?.isPlaying == true
-                            setIcon(likesPlay, if (active) Symbol.PAUSE else Symbol.PLAY,
-                                if (active) "Пауза" else "Слушать «Мне нравится»", Color.BLACK)
-                        }
-                        addView(likesPlay, LinearLayout.LayoutParams(ui.dp(40), ui.dp(40)))
-                        gap(this, 8)
                         addView(ui.icon(Symbol.SHUFFLE, "Перемешать «Мне нравится»", ui.palette.text) { playLikesQuick(true) }.apply {
-                            iconSize = 16
-                            background = ui.touch(ui.palette.lifted, 20)
-                        }, LinearLayout.LayoutParams(ui.dp(40), ui.dp(40)))
+                            iconSize = 15
+                            background = ui.touch(ui.palette.lifted, 19)
+                        }, LinearLayout.LayoutParams(ui.dp(38), ui.dp(38)))
+                        gap(this, 8)
+                        val likesPlay = ui.icon(Symbol.PLAY, "Слушать «Мне нравится»", Color.BLACK) { playLikesQuick(false) }.apply {
+                            iconSize = 15
+                            background = ui.touch(ui.palette.accent, 19)
+                        }
+                        val likesBars = PlayingBars(this@MainActivity, Color.BLACK).apply { visibility = View.INVISIBLE }
+                        val likesPlaySlot = FrameLayout(this@MainActivity).apply {
+                            background = ui.touch(ui.palette.accent, 19)
+                            pressFeedback(.92f)
+                            isFocusable = true
+                            addView(likesPlay, FrameLayout.LayoutParams(-1, -1))
+                            addView(likesBars, FrameLayout.LayoutParams(ui.dp(15), ui.dp(15), Gravity.CENTER))
+                            setOnClickListener { playLikesQuick(false) }
+                            observePlayback {
+                                val now = QueueItems.context(controller?.currentMediaItem)
+                                val active = currentTrack() != null && now.kind == "playlist" && now.item == "${userId.orEmpty()}:3" &&
+                                    controller?.isPlaying == true
+                                likesPlay.visibility = if (active) View.INVISIBLE else View.VISIBLE
+                                likesBars.visibility = if (active) View.VISIBLE else View.INVISIBLE
+                                likesBars.running = active
+                                contentDescription = if (active) "Пауза" else "Слушать «Мне нравится»"
+                            }
+                        }
+                        addView(likesPlaySlot, LinearLayout.LayoutParams(ui.dp(38), ui.dp(38)))
                         setOnClickListener { push(Screen.LIKES) }
                     }, ui.full())
                 }
@@ -3587,6 +3658,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
                 .minByOrNull { kotlin.math.abs(it - anchor) } ?: anchor
             list.setSelectionFromTop(target, position.offset)
         } else list.setSelection(0)
+        if (route.screen == Screen.HOME) list.post { syncHomeWaveBackdrop() }
         if (selecting) updateSelectionBar()
     }
 
@@ -4134,7 +4206,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
         }
     }
 
-    private fun chooseVersion(track: Track) {
+    internal fun chooseVersion(track: Track) {
         val uid = store.requireUser().uid
         val current = store.files.selectedVersion(uid, track.id)
         val options = buildList {
@@ -4150,7 +4222,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
         }
     }
 
-    private fun reloadVersion(trackId: String) {
+    internal fun reloadVersion(trackId: String) {
         val args = Bundle().apply { putString("track", trackId) }
         controller?.sendCustomCommand(androidx.media3.session.SessionCommand(QueueItems.RELOAD_VERSION, Bundle.EMPTY), args)
     }
