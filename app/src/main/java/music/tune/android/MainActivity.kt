@@ -84,7 +84,13 @@ private class Route(val screen: Screen, var card: Card? = null, val shelf: Shelf
     var chipId: String? = null
 }
 private data class TrackListPosition(val index: Int, val offset: Int, val trackId: String?)
-private data class TrackList(val tracks: List<Track>, val context: PlayContext, val art: Symbol? = null)
+private data class TrackList(
+    val tracks: List<Track>,
+    val context: PlayContext,
+    val art: Symbol? = null,
+    val card: Card? = null,
+    val diskBytes: Long? = null,
+)
 private enum class TrackOrder(val label: String) {
     ORIGINAL("Как в списке"), TITLE("По названию"), ARTIST("По исполнителю"),
     RECENT("Сначала новые"), OLDEST("Сначала старые")
@@ -124,7 +130,8 @@ private sealed interface Row {
         val play: () -> Unit,
         val menu: (View) -> Unit,
         val number: Int? = null,
-        val reorderIndex: Int? = null
+        val reorderIndex: Int? = null,
+        val trailingLabel: String? = null,
     ) : Row
     class Entry(val card: Card, val open: () -> Unit) : Row
     data object WaveHead : Row
@@ -169,8 +176,8 @@ class MainActivity : ComponentActivity(), Player.Listener {
         val offline: Boolean,
         val error: String?,
         val downloaded: Int,
-        val playlists: List<Card>,
         val loading: Boolean,
+        val waveWheel: Boolean,
     )
     private var home: HomePage? = null
     private var trending = false
@@ -181,6 +188,9 @@ class MainActivity : ComponentActivity(), Player.Listener {
     private var homeError: String? = null
     private var homeLoaded = false
     private var loadingHome = false
+    private var homeDevicesButton: IconView? = null
+    private var homeWaveBackdrop: WaveBackdrop? = null
+    private var libraryPlaylistFilter = 0
     private var details: MusicPage? = null
     private var reordering = false
     private var reorderJob: Job? = null
@@ -214,6 +224,9 @@ class MainActivity : ComponentActivity(), Player.Listener {
     private var listHasContent = false
     private val playbackBindings = mutableSetOf<() -> Unit>()
     private var downloadRows = emptyList<Pair<String, String?>>()
+    private var downloadsDiskBytes: Long? = null
+    private var downloadsDiskKey: Pair<Int, Int>? = null
+    private var downloadsDiskJob: Job? = null
     private var searchField: EditText? = null
     private var suggestions: LinearLayout? = null
     private var discovery: List<Shelf> = emptyList()
@@ -433,14 +446,19 @@ class MainActivity : ComponentActivity(), Player.Listener {
                 launch { store.dislikes.collect { refreshCollection(); playerPanel?.update() } }
                 launch { store.savedCards.collect { refreshCollection() } }
                 launch { store.ownPlaylists.collect {
-                    if (route.screen == Screen.HOME && userId != null) showHome(keepScroll = true)
                     if (route.screen == Screen.LIBRARY && userId != null) library()
                 } }
                 launch { store.savedPlaylists.collect { if (route.screen == Screen.LIBRARY && userId != null) library() } }
                 launch { store.waveExtras.cards.collect { updateWordCard() } }
                 launch { store.waveExtras.wheel.collect { waveHead?.bindWheel() } }
-                launch { store.ynison.state.collect { if (route.screen == Screen.DEVICES && userId != null) devices() } }
-                launch { store.ynison.connection.collect { if (route.screen == Screen.DEVICES && userId != null) devices() } }
+                launch { store.ynison.state.collect {
+                    if (route.screen == Screen.DEVICES && userId != null) devices()
+                    if (route.screen == Screen.HOME) updateHomeDevicesButton()
+                } }
+                launch { store.ynison.connection.collect {
+                    if (route.screen == Screen.DEVICES && userId != null) devices()
+                    if (route.screen == Screen.HOME) updateHomeDevicesButton()
+                } }
                 launch { store.ynison.detail.collect { if (route.screen == Screen.DEVICES && userId != null) devices() } }
                 launch { store.files.revision.collect {
                     if (route.screen == Screen.DOWNLOADS && userId != null) downloads()
@@ -480,6 +498,28 @@ class MainActivity : ComponentActivity(), Player.Listener {
         super.onNewIntent(intent)
         setIntent(intent)
         accept(intent)
+    }
+
+    private fun syncWaveVolumeKey(keyCode: Int) {
+        if (keyCode == KeyEvent.KEYCODE_VOLUME_UP ||
+            keyCode == KeyEvent.KEYCODE_VOLUME_DOWN ||
+            keyCode == KeyEvent.KEYCODE_VOLUME_MUTE
+        ) {
+            homeWaveBackdrop?.refreshVolume()
+            if (::root.isInitialized) root.post { homeWaveBackdrop?.refreshVolume() }
+        }
+    }
+
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        val handled = super.onKeyDown(keyCode, event)
+        syncWaveVolumeKey(keyCode)
+        return handled
+    }
+
+    override fun onKeyUp(keyCode: Int, event: KeyEvent?): Boolean {
+        val handled = super.onKeyUp(keyCode, event)
+        syncWaveVolumeKey(keyCode)
+        return handled
     }
 
     private fun accept(intent: Intent) {
@@ -536,6 +576,8 @@ class MainActivity : ComponentActivity(), Player.Listener {
             closeVideo()
             closePlayer()
             pageJob?.cancel()
+            downloadsDiskJob?.cancel()
+            downloadsDiskJob = null
             waveJob?.cancel()
             suggestionJob?.cancel()
             pendingPlayback = null
@@ -781,6 +823,8 @@ class MainActivity : ComponentActivity(), Player.Listener {
         restorePosition = current.position
         pageHasRows = false
         pageJob?.cancel()
+        downloadsDiskJob?.cancel()
+        downloadsDiskJob = null
         listHasContent = false
         suggestionJob?.cancel()
         details = null
@@ -806,6 +850,8 @@ class MainActivity : ComponentActivity(), Player.Listener {
         suggestions = null
         toolbarTitle = null
         detailToolbar = null
+        homeDevicesButton = null
+        homeWaveBackdrop = null
         detailTone = null
         detailChrome = Color.TRANSPARENT
         statsClearButton = null
@@ -822,16 +868,37 @@ class MainActivity : ComponentActivity(), Player.Listener {
         refreshLayout = null
         root.removeAllViews()
         root.setBackgroundColor(ui.palette.background)
-        content = ui.column()
+        content = ui.column().apply {
+            if (current.screen == Screen.HOME) {
+                clipChildren = false
+                clipToPadding = false
+            }
+        }
         root.addView(content, FrameLayout.LayoutParams(-1, -1))
-        if (current.screen == Screen.SEARCH) {
+        val homeStage: FrameLayout? = if (current.screen == Screen.HOME) {
+            FrameLayout(this).apply {
+                clipChildren = false
+                clipToPadding = false
+                val backdrop = WaveBackdrop(this@MainActivity, ui.palette.light).apply {
+                    importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+                }
+                homeWaveBackdrop = backdrop
+                addView(backdrop, FrameLayout.LayoutParams(-1, ui.dp(540), Gravity.TOP))
+            }.also { content.addView(it, LinearLayout.LayoutParams(-1, 0, 1f)) }
+        } else null
+        val topBar = if (current.screen == Screen.SEARCH) {
             content.isFocusableInTouchMode = true
             content.requestFocus()
             content.addView(searchBar(), ui.full())
             content.addView(ui.column().also { suggestions = it }, ui.full())
             updateSuggestions(searchText)
-        } else content.addView(toolbar(current).also { if (current.screen == Screen.DETAILS) detailToolbar = it },
-            ui.full(if (current.screen == Screen.HOME) 48 else 56))
+            null
+        } else {
+            toolbar(current).also { bar ->
+                if (current.screen in TONE_CHROME_SCREENS) detailToolbar = bar
+                if (homeStage == null) content.addView(bar, ui.full(56))
+            }
+        }
         if (current.screen == Screen.SETTINGS) {
             val body = ui.column().apply { setPadding(0, 0, 0, ui.dp(20)) }
             val scroll = ScrollView(this).apply {
@@ -854,15 +921,22 @@ class MainActivity : ComponentActivity(), Player.Listener {
                 divider = null
                 selector = android.graphics.drawable.ColorDrawable(Color.TRANSPARENT)
                 overScrollMode = View.OVER_SCROLL_NEVER
-                cacheColorHint = ui.palette.background
-                setPadding(0, 0, 0, ui.dp(8))
+                cacheColorHint = if (current.screen == Screen.HOME) Color.TRANSPARENT else ui.palette.background
+                setPadding(0, if (current.screen == Screen.HOME) ui.dp(48) else 0, 0, ui.dp(8))
                 clipToPadding = false
+                if (current.screen == Screen.HOME) clipChildren = false
                 isNestedScrollingEnabled = true
-                if (current.screen == Screen.DETAILS) setOnScrollListener(object : android.widget.AbsListView.OnScrollListener {
+                if (current.screen == Screen.HOME) setOnScrollListener(object : android.widget.AbsListView.OnScrollListener {
                     override fun onScrollStateChanged(view: android.widget.AbsListView, state: Int) = Unit
                     override fun onScroll(view: android.widget.AbsListView, first: Int, visible: Int, total: Int) {
-                        updateDetailsTitle(current, view, first)
-                        updateDetailChrome()
+                        syncHomeWaveBackdrop()
+                    }
+                })
+                if (current.screen in HEADER_FADE_SCREENS) setOnScrollListener(object : android.widget.AbsListView.OnScrollListener {
+                    override fun onScrollStateChanged(view: android.widget.AbsListView, state: Int) = Unit
+                    override fun onScroll(view: android.widget.AbsListView, first: Int, visible: Int, total: Int) {
+                        updateHeaderTitle(current, view, first)
+                        if (current.screen in TONE_CHROME_SCREENS) updateDetailChrome()
                     }
                 })
                 if (current.screen == Screen.SEARCH) setOnScrollListener(object : android.widget.AbsListView.OnScrollListener {
@@ -876,13 +950,29 @@ class MainActivity : ComponentActivity(), Player.Listener {
             list = pageList
             adapter = pageAdapter
             val pageContainer: View = if (current.screen in REFRESHABLE_SCREENS) {
-                TuneRefreshLayout(ui, pageList, { !reordering && !selecting }, ::refreshCurrentPage).also {
+                TuneRefreshLayout(
+                    ui,
+                    pageList,
+                    { !reordering && !selecting },
+                    onPullOffset = if (current.screen == Screen.HOME) ({ syncHomeWaveBackdrop() }) else null,
+                    onRefresh = ::refreshCurrentPage,
+                ).apply {
+                    if (current.screen == Screen.HOME) {
+                        clipChildren = false
+                        clipToPadding = false
+                    }
+                }.also {
                     refreshLayout = it
                 }
             } else {
                 pageList
             }
-            content.addView(pageContainer, LinearLayout.LayoutParams(-1, 0, 1f))
+            if (homeStage != null) {
+                homeStage.addView(pageContainer, FrameLayout.LayoutParams(-1, -1))
+                topBar?.let { homeStage.addView(it, FrameLayout.LayoutParams(-1, ui.dp(48), Gravity.TOP)) }
+            } else {
+                content.addView(pageContainer, LinearLayout.LayoutParams(-1, 0, 1f))
+            }
             if (animateTabFade) {
                 animateTabFade = false
                 if (ValueAnimator.areAnimatorsEnabled()) {
@@ -915,15 +1005,25 @@ class MainActivity : ComponentActivity(), Player.Listener {
                 FrameLayout.LayoutParams(ui.dp(48), -1, Gravity.START))
         }
     } else ui.row().apply {
-        if (stack.isNotEmpty()) addView(ui.icon(Symbol.BACK, "Назад") { onBackPressedDispatcher.onBackPressed() })
-        else setPadding(ui.dp(16), 0, 0, 0)
+        if (current.screen == Screen.HOME) {
+            setPadding(ui.dp(6), 0, ui.dp(6), 0)
+            val devicesButton = ui.icon(Symbol.SPEAKER, "Устройства Яндекс Музыки") { openDevices() }
+            homeDevicesButton = devicesButton
+            updateHomeDevicesButton()
+            addView(devicesButton)
+        } else if (stack.isNotEmpty()) {
+            addView(ui.icon(Symbol.BACK, "Назад") { onBackPressedDispatcher.onBackPressed() })
+        } else {
+            setPadding(ui.dp(16), 0, 0, 0)
+        }
         val title = when (current.screen) {
             Screen.DETAILS, Screen.HOME -> ""
             Screen.SHELF -> current.shelf?.title.orEmpty()
+            Screen.ARTIST_TRACKS -> current.card?.title.orEmpty().ifBlank { current.screen.label }
             else -> current.screen.label
         }
         addView(ui.line(title, if (stack.isEmpty()) 32 else 18, bold = true).also {
-            if (current.screen == Screen.DETAILS) {
+            if (current.screen in HEADER_FADE_SCREENS) {
                 it.alpha = 0f
                 it.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
             }
@@ -989,6 +1089,15 @@ class MainActivity : ComponentActivity(), Player.Listener {
             })
             else -> Unit
         }
+    }
+
+    private fun updateHomeDevicesButton() {
+        val button = homeDevicesButton ?: return
+        val sync = store.ynison
+        val activeRemote = sync.enabled && sync.connection.value == Ynison.CONNECTED &&
+            sync.state.value.active != null && sync.state.value.active != sync.deviceId
+        setIcon(button, Symbol.SPEAKER, "Устройства Яндекс Музыки",
+            if (activeRemote) ui.palette.accentText else ui.palette.text)
     }
 
     private fun menuButton(open: (View) -> Unit) = ui.icon(Symbol.MORE, "Ещё") {}.apply {
@@ -1219,14 +1328,41 @@ class MainActivity : ComponentActivity(), Player.Listener {
         val query = searchText
         if (query.isEmpty()) {
             fun showDiscovery() = rows(buildList {
-                add(filterBar())
+                val byLyrics = FILTERS[searchFilter].second == "lyrics"
+                add(Row.Layout {
+                    horizontal(listOf(ui.chip("По тексту", active = byLyrics) {
+                        searchType(if (byLyrics) 0 else FILTERS.lastIndex)
+                    }))
+                })
                 val recent = recentSearches()
                 if (recent.isNotEmpty()) {
                     add(section("Вы искали", "Очистить") {
                         store.preferences.edit().remove("recentSearches").apply()
                         loadSearch()
                     })
-                    recent.forEach { item -> add(shortcut(Symbol.HISTORY, item) { submitSearch(item) }) }
+                    add(Row.Layout {
+                        horizontal(recent.map { item ->
+                            ui.row().apply {
+                                gravity = Gravity.CENTER
+                                setPadding(ui.dp(13), 0, ui.dp(6), 0)
+                                background = ui.touch(ui.palette.lifted, 18)
+                                pressFeedback(.95f)
+                                isFocusable = true
+                                addView(ui.line(item, 14, ui.palette.text, bold = true).apply {
+                                    maxWidth = ui.dp(200)
+                                })
+                                addView(ui.icon(Symbol.CLOSE, "Удалить запрос «$item»", ui.palette.muted) {
+                                    val updated = recentSearches().filterNot { it.equals(item, ignoreCase = true) }
+                                    store.preferences.edit().putString("recentSearches", JSONArray(updated).toString()).apply()
+                                    loadSearch()
+                                }.apply {
+                                    iconSize = 11
+                                    background = null
+                                }, LinearLayout.LayoutParams(ui.dp(28), ui.dp(34)).apply { marginStart = ui.dp(2) })
+                                setOnClickListener { submitSearch(item) }
+                            }.apply { layoutParams = LinearLayout.LayoutParams(-2, ui.dp(36)) }
+                        })
+                    })
                 }
                 discovery.forEach { shelf ->
                     add(heading(shelf.title))
@@ -1485,10 +1621,14 @@ class MainActivity : ComponentActivity(), Player.Listener {
             Screen.ALBUMS, Screen.ARTISTS, Screen.PODCASTS, Screen.BOOKS -> collection(current.screen)
             Screen.DETAILS -> current.card?.let(::loadDetails)
             Screen.ARTIST_TRACKS -> current.card?.let { card ->
-                loadRows {
+                preloadTrackChips("artist-tracks:${card.id}")
+                val context = PlayContext("artist", card.id, card.title)
+                loadRows(loading = {
+                    listOf(Row.Layout { listHeader(emptyList(), context, null, card = card, loading = true) }, Row.Layout { ui.loadingRows() })
+                }) {
                     val tracks = store.online { artistTracks(card.id) }
                     loadTrackChips("artist-tracks:${card.id}", tracks)
-                    trackList = TrackList(tracks, PlayContext("artist", card.id, card.title))
+                    trackList = TrackList(tracks, context, card = card)
                     listRows(requireNotNull(trackList))
                 }
             }
@@ -1546,12 +1686,16 @@ class MainActivity : ComponentActivity(), Player.Listener {
         val page = home ?: HomePage()
         val offlineOrError = store.offline || homeError != null
         val downloaded = if (!trending && offlineOrError) store.files.downloaded().size else -1
-        val own = if (!trending) store.ownPlaylists.value.take(3) else emptyList()
-        val key = HomeRowsKey(home, trending, store.offline, homeError, downloaded, own, loadingHome)
+        val showWheel = store.preferences.getBoolean("waveWheel", true)
+        val key = HomeRowsKey(home, trending, store.offline, homeError, downloaded, loadingHome, showWheel)
         val cached = cachedHomeRows
         if (cachedHomeKey == key && cached != null) {
-            if (keepScroll && pageHasRows && adapter?.count == cached.size) return
+            if (keepScroll && pageHasRows && adapter?.count == cached.size) {
+                syncHomeWaveBackdrop()
+                return
+            }
             rows(cached, keepScroll)
+            syncHomeWaveBackdrop()
             return
         }
         val shelves = if (trending) page.trends else page.personal
@@ -1564,7 +1708,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
                     add(shortcut(Symbol.DOWNLOAD, "Слушать скачанное",
                         if (downloaded <= 0) "Скачанной музыки пока нет" else "Скачано: ${trackCount(downloaded)}") { push(Screen.DOWNLOADS) })
                 }
-                if (stations.isNotEmpty()) add(Row.Layout(cache = true) {
+                if (!showWheel && stations.isNotEmpty()) add(Row.Layout(cache = true) {
                     val allWaves = ui.row().apply {
                         gravity = Gravity.CENTER
                         setPadding(ui.dp(15), 0, ui.dp(15), 0)
@@ -1588,7 +1732,6 @@ class MainActivity : ComponentActivity(), Player.Listener {
                         lazyHorizontalCovers(scroll, stationTiles, stationCovers, listOf<String?>(null) + stations.map { it.cover }, 100)
                     }
                 })
-                addAll(quickRows())
                 if (page.recent.isNotEmpty()) {
                     add(section("Вы недавно слушали", "Все") { push(Screen.HISTORY) })
                     add(Row.Layout(cache = true) {
@@ -1619,6 +1762,23 @@ class MainActivity : ComponentActivity(), Player.Listener {
         cachedHomeKey = key
         cachedHomeRows = built
         rows(built, keepScroll)
+        syncHomeWaveBackdrop()
+    }
+
+    private fun syncHomeWaveBackdrop() {
+        val backdrop = homeWaveBackdrop ?: return
+        if (trending || route.screen != Screen.HOME) {
+            backdrop.visibility = View.GONE
+            return
+        }
+        backdrop.visibility = View.VISIBLE
+        val pageList = list ?: return
+        val headRow = waveHead?.view?.takeIf { it.parent === pageList }
+        if (headRow != null) {
+            backdrop.translationY = headRow.top + ui.dp(244) * 0.5f - ui.dp(540) * 0.5f + pageList.translationY
+        } else {
+            backdrop.translationY = -ui.dp(600).toFloat()
+        }
     }
 
     private fun shelfRows(shelves: List<Shelf>) = buildList {
@@ -1673,41 +1833,260 @@ class MainActivity : ComponentActivity(), Player.Listener {
         updateWordCard()
     }
 
-    private data class HeroState(val context: PlayContext, val active: Boolean, val playing: Boolean, val tuned: Boolean)
+    private data class HeroState(
+        val context: PlayContext,
+        val active: Boolean,
+        val playing: Boolean,
+        val settings: List<String>,
+    )
 
     private inner class HomeWaveHead {
-        val view = ui.column()
+        val view = ui.column().apply {
+            clipChildren = false
+            clipToPadding = false
+        }
         val words = WaveWordsView(this@MainActivity)
-        private val hero = FrameLayout(this@MainActivity)
-        private val glow = WaveBackdrop(this@MainActivity, ui.palette.background).apply {
-            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+        private val playingBars = PlayingBars(this@MainActivity, ui.palette.accentText)
+        private val playingText = ui.line("", 14, ColorUtils.setAlphaComponent(ui.palette.text, 217), bold = true)
+        private val playingRow = ui.row().apply {
+            gravity = Gravity.CENTER
+            visibility = View.INVISIBLE
+            alpha = 0f
+            setPadding(ui.dp(24), 0, ui.dp(24), 0)
+            addView(playingBars, LinearLayout.LayoutParams(ui.dp(13), ui.dp(13)).apply { marginEnd = ui.dp(7) })
+            addView(playingText)
+        }
+        private val playGlyph = PlayingBars(this@MainActivity, Color.BLACK).apply { visibility = View.INVISIBLE }
+        private val playIcon = IconView(this@MainActivity, Symbol.PLAY, Color.BLACK).apply { iconSize = 18 }
+        private val playLabel = ui.line("Слушать", 16, Color.BLACK, bold = true).apply { gravity = Gravity.CENTER }
+        private val playSpacer = ui.line("Слушать", 16, Color.BLACK, bold = true).apply { visibility = View.INVISIBLE }
+        private val tuneIcon = IconView(this@MainActivity, Symbol.SETTINGS, ui.palette.text).apply { iconSize = 18 }
+        private var currentActive = false
+        private val playButton = ui.row().apply {
+            gravity = Gravity.CENTER
+            val hPad = ui.dp(when {
+                resources.configuration.screenWidthDp < 350 -> 14
+                resources.configuration.screenWidthDp <= 370 -> 22
+                else -> 26
+            })
+            setPadding(hPad, 0, hPad, 0)
+            background = ui.touch(ui.palette.accent, 24)
+            pressFeedback(.95f)
+            isFocusable = true
+            addView(FrameLayout(this@MainActivity).apply {
+                addView(playIcon, FrameLayout.LayoutParams(-1, -1))
+                addView(playGlyph, FrameLayout.LayoutParams(-1, -1))
+            }, LinearLayout.LayoutParams(ui.dp(18), ui.dp(18)))
+            addView(FrameLayout(this@MainActivity).apply {
+                addView(playSpacer, FrameLayout.LayoutParams(-2, -2, Gravity.CENTER))
+                addView(playLabel, FrameLayout.LayoutParams(-2, -2, Gravity.CENTER))
+            }, LinearLayout.LayoutParams(-2, -2).apply { marginStart = ui.dp(7) })
+            setOnClickListener {
+                if (currentActive) toggle() else startWave(listOf(MY_WAVE), "Моя волна")
+            }
+        }
+        private val tuneButton = ui.row().apply {
+            gravity = Gravity.CENTER
+            val hPad = ui.dp(when {
+                resources.configuration.screenWidthDp < 350 -> 14
+                resources.configuration.screenWidthDp <= 370 -> 18
+                else -> 20
+            })
+            setPadding(hPad, 0, hPad, 0)
+            background = ui.touch(ui.palette.panel, 24)
+            pressFeedback(.95f)
+            isFocusable = true
+            addView(tuneIcon, LinearLayout.LayoutParams(ui.dp(18), ui.dp(18)))
+            addView(ui.line("Настроить", 16, ui.palette.text, bold = true),
+                LinearLayout.LayoutParams(-2, -2).apply { marginStart = ui.dp(7) })
+            setOnClickListener { waveSettings() }
+        }
+        private val filterRow = ui.row().apply {
+            gravity = Gravity.CENTER
+            setPadding(ui.dp(16), 0, ui.dp(16), 0)
+        }
+        private val filterSlot = FrameLayout(this@MainActivity).apply {
+            clipChildren = false
+            clipToPadding = false
+            addView(filterRow, FrameLayout.LayoutParams(-2, -1, Gravity.CENTER))
+        }
+        private val heroContent = ui.column().apply {
+            gravity = Gravity.CENTER_HORIZONTAL
+            clipChildren = false
+            addView(playingRow, ui.full(20))
+            addView(ui.space(10))
+            addView(ui.line("Моя волна", 35, bold = true).apply { gravity = Gravity.CENTER })
+            addView(ui.space(14))
+            addView(ui.row().apply {
+                gravity = Gravity.CENTER
+                addView(playButton, LinearLayout.LayoutParams(-2, ui.dp(48)))
+                addView(tuneButton, LinearLayout.LayoutParams(-2, ui.dp(48)).apply { marginStart = ui.dp(12) })
+            })
+            addView(ui.space(12))
+            addView(filterSlot, ui.full(36))
+        }
+        private val hero = FrameLayout(this@MainActivity).apply {
+            clipChildren = false
+            clipToPadding = false
+            addView(heroContent, FrameLayout.LayoutParams(-1, -2, Gravity.CENTER))
+        }
+        private val wavesHeader = ui.row().apply {
+            setPadding(ui.dp(16), ui.dp(6), ui.dp(16), ui.dp(6))
+            addView(ui.line("Волны", 22, bold = true), ui.weight())
+            addView(ui.text("Все", 14, ui.palette.accentText, bold = true).apply {
+                setPadding(ui.dp(10), ui.dp(8), 0, ui.dp(8))
+                background = ui.touch()
+                setOnClickListener { push(Screen.STATIONS) }
+                isFocusable = true
+            })
         }
         private val rail = ui.column()
         private var heroState: HeroState? = null
+        private var lastPlayVisual: Boolean? = null
+        private var lastSettings: List<String>? = null
         private var wheelState: Pair<List<WheelItem>, String?>? = null
 
         init {
-            hero.addView(glow, FrameLayout.LayoutParams(-1, -1))
-            view.addView(hero, ui.full(300))
+            view.addView(hero, ui.full(244))
             view.addView(words, ui.full())
+            view.addView(wavesHeader, ui.full())
             view.addView(rail, ui.full())
         }
 
-        fun resumeGlow() = glow.resumeIfPlaying()
+        fun resumeGlow() = homeWaveBackdrop?.resumeIfPlaying()
+        fun refreshVolume() = homeWaveBackdrop?.refreshVolume()
+
+        private fun resolveWaveHex(context: PlayContext): String? {
+            if (context.kind != "radio") return null
+            val item = context.item ?: return null
+            if (item == MY_WAVE) return null
+            context.color?.takeIf(String::isNotBlank)?.let { return it }
+            store.waveExtras.wheel.value.firstOrNull { it.card?.id == item }?.let { wheelItem ->
+                return wheelItem.color?.takeIf(String::isNotBlank) ?: wheelItem.card?.color?.takeIf(String::isNotBlank)
+            }
+            home?.personal.orEmpty().asSequence().flatMap { it.cards.asSequence() }
+                .firstOrNull { it.kind == Kind.WAVE && it.id == item }?.color?.takeIf(String::isNotBlank)?.let { return it }
+            return null
+        }
+
+        private fun syncFilterChips(settings: List<String>) {
+            if (lastSettings == settings) return
+            val animated = lastSettings != null && playbackMotion.enabled && filterSlot.isAttachedToWindow
+            lastSettings = settings
+            if (animated) {
+                val transition = android.transition.TransitionSet().apply {
+                    addTransition(android.transition.Fade(android.transition.Fade.IN or android.transition.Fade.OUT))
+                    addTransition(android.transition.ChangeBounds())
+                    duration = 220
+                }
+                android.transition.TransitionManager.beginDelayedTransition(filterSlot, transition)
+            }
+            filterRow.removeAllViews()
+            if (settings.isEmpty()) {
+                filterRow.visibility = View.INVISIBLE
+                return
+            }
+            filterRow.visibility = View.VISIBLE
+            settings.forEachIndexed { idx, seed ->
+                val title = WAVE_SETTING_LABELS[seed] ?: return@forEachIndexed
+                val chip = ui.row().apply {
+                    gravity = Gravity.CENTER_VERTICAL
+                    setPadding(ui.dp(11), ui.dp(6), ui.dp(9), ui.dp(6))
+                    background = ui.touch(ui.palette.lifted, 16)
+                    pressFeedback(.94f)
+                    isFocusable = true
+                    addView(ui.line(title, 13, ui.palette.text, bold = true))
+                    addView(IconView(this@MainActivity, Symbol.CLOSE, ui.palette.muted).apply { iconSize = 10 },
+                        LinearLayout.LayoutParams(ui.dp(11), ui.dp(11)).apply { marginStart = ui.dp(5) })
+                    setOnClickListener {
+                        val updated = store.preferences.getStringSet("waveSettings", emptySet()).orEmpty()
+                            .filterNot { it == seed }.toSet()
+                        store.preferences.edit().putStringSet("waveSettings", updated).apply()
+                        bindHero()
+                        if (currentActive) startWave(listOf(MY_WAVE), "Моя волна")
+                    }
+                }
+                filterRow.addView(chip, LinearLayout.LayoutParams(-2, -2).apply {
+                    if (idx > 0) marginStart = ui.dp(6)
+                })
+            }
+        }
 
         fun bindHero() {
             val player = controller
             val context = QueueItems.context(player?.currentMediaItem)
             val active = context.kind == "radio" && (context.item == MY_WAVE || context.item == null && context.name == "Моя волна")
-            val playing = active && player?.isPlaying == true
-            val tuned = store.preferences.getStringSet("waveSettings", emptySet()).orEmpty().isNotEmpty()
-            val state = HeroState(context, active, player?.isPlaying == true, tuned)
+            val isAnyPlaying = player?.let {
+                it.isPlaying || (it.playWhenReady && it.playbackState != Player.STATE_ENDED && it.mediaItemCount > 0)
+            } == true
+            val playingWave = active && isAnyPlaying
+            val settings = WAVE_SETTING_ORDER.filter { it in store.preferences.getStringSet("waveSettings", emptySet()).orEmpty() }
+            currentActive = active
+
+            homeWaveBackdrop?.let { glow ->
+                glow.setWave(resolveWaveHex(context), "${context.kind}:${context.item.orEmpty()}")
+                glow.playing = isAnyPlaying
+            }
+            view.post { syncHomeWaveBackdrop() }
+
+            val state = HeroState(context, active, playingWave, settings)
             if (state == heroState) return
             heroState = state
-            glow.playing = playing
-            if (hero.childCount > 1) hero.removeViewAt(1)
-            hero.addView(waveHero(context, active, playing, tuned), FrameLayout.LayoutParams(-1, -2, Gravity.CENTER))
-            bindWheel()
+
+            val other = if (!active && context.name.isNotBlank()) when (context.kind) {
+                "radio" -> if (context.name.startsWith("Волна")) context.name else "Волна «${context.name}»"
+                "album" -> "Альбом «${context.name}»"
+                "playlist" -> "Плейлист «${context.name}»"
+                else -> context.name
+            } else null
+
+            playingBars.running = isAnyPlaying
+            if (other != null) {
+                val caption = "Сейчас играет: $other"
+                if (playingText.text != caption) playingText.text = caption
+                if (playingRow.visibility != View.VISIBLE) {
+                    playingRow.visibility = View.VISIBLE
+                    if (playbackMotion.enabled && hero.isAttachedToWindow) {
+                        playingRow.animate().cancel()
+                        playingRow.alpha = 0f
+                        playingRow.animate().alpha(1f).setDuration(220).start()
+                    } else playingRow.alpha = 1f
+                }
+            } else if (playingRow.visibility == View.VISIBLE) {
+                if (playbackMotion.enabled && hero.isAttachedToWindow) {
+                    playingRow.animate().cancel()
+                    playingRow.animate().alpha(0f).setDuration(180).withEndAction {
+                        if (heroState?.active != false || heroState?.context?.name.isNullOrBlank()) {
+                            playingRow.visibility = View.INVISIBLE
+                        }
+                    }.start()
+                } else {
+                    playingRow.alpha = 0f
+                    playingRow.visibility = View.INVISIBLE
+                }
+            }
+
+            val nextLabel = if (playingWave) "Пауза" else "Слушать"
+            if (playLabel.text != nextLabel) playLabel.text = nextLabel
+            if (lastPlayVisual != playingWave) {
+                val shown = if (playingWave) playGlyph else playIcon
+                val hidden = if (playingWave) playIcon else playGlyph
+                shown.visibility = View.VISIBLE
+                hidden.visibility = View.INVISIBLE
+                playGlyph.running = playingWave
+                if (lastPlayVisual != null && playbackMotion.enabled && hero.isAttachedToWindow) {
+                    shown.animate().cancel()
+                    shown.alpha = 0.3f
+                    shown.scaleX = 0.78f
+                    shown.scaleY = 0.78f
+                    shown.animate().alpha(1f).scaleX(1f).scaleY(1f).setDuration(220).start()
+                }
+                lastPlayVisual = playingWave
+            }
+
+            setIcon(tuneIcon, Symbol.SETTINGS, "Настроить",
+                if (settings.isEmpty()) ui.palette.text else ui.palette.accentText)
+            syncFilterChips(settings)
         }
 
         fun bindWheel() {
@@ -1715,6 +2094,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
             val ctx = QueueItems.context(player?.currentMediaItem)
             val key = ctx.item.takeIf { ctx.kind == "radio" }
             val showing = store.preferences.getBoolean("waveWheel", true)
+            wavesHeader.visibility = if (showing) View.VISIBLE else View.GONE
             val items = if (showing) store.waveExtras.wheel.value.ifEmpty {
                 listOf(WheelItem("WAVE", "", "Моя волна", Card(Kind.WAVE, MY_WAVE, "Моя волна", seeds = listOf(MY_WAVE)), "#E5A823"),
                     WheelItem("SETTING", "", "Настроить Мою волну", null))
@@ -1761,7 +2141,8 @@ class MainActivity : ComponentActivity(), Player.Listener {
                     pressFeedback(.92f)
                     setOnClickListener {
                         store.waveExtras.wheelEvent(item, "CLICK")
-                        if (active) toggle() else item.card?.let(::openCard) ?: waveSettings()
+                        if (active) toggle()
+                        else item.card?.let { startWave(it.seeds, it.title, item.color ?: it.color) } ?: waveSettings()
                     }
                     isFocusable = true
                 }
@@ -1785,57 +2166,6 @@ class MainActivity : ComponentActivity(), Player.Listener {
         render()
     }
 
-    private fun waveHero(ctx: PlayContext, active: Boolean, playing: Boolean, tuned: Boolean): View = ui.column().apply {
-        gravity = Gravity.CENTER_HORIZONTAL
-        setPadding(ui.dp(16), 0, ui.dp(16), 0)
-        if (!active && ctx.name.isNotBlank()) {
-            val now = when (ctx.kind) {
-                "radio" -> if (ctx.name.startsWith("Волна")) ctx.name else "Волна «${ctx.name}»"
-                "album" -> "Альбом «${ctx.name}»"
-                "playlist" -> "Плейлист «${ctx.name}»"
-                else -> ctx.name
-            }
-            addView(ui.row().apply {
-                gravity = Gravity.CENTER
-                addView(PlayingBars(this@MainActivity, ui.palette.accentText).apply {
-                    running = controller?.isPlaying == true
-                }, LinearLayout.LayoutParams(ui.dp(13), ui.dp(13)).apply { marginEnd = ui.dp(7) })
-                addView(ui.line("Сейчас играет: $now", 14, ui.palette.text, bold = true))
-            })
-            addView(ui.space(18))
-        }
-        addView(ui.line("Моя волна", 36, bold = true).apply { gravity = Gravity.CENTER })
-        addView(ui.space(18))
-        addView(ui.row().apply {
-            gravity = Gravity.CENTER
-            addView(waveHeroAction(if (playing) "Пауза" else "Слушать",
-                Symbol.PLAY, true, playing = playing) {
-                if (active) toggle() else startWave(listOf(MY_WAVE), "Моя волна")
-            }, LinearLayout.LayoutParams(-2, ui.dp(48)))
-            addView(waveHeroAction(if (tuned) "Настроено" else "Настроить", Symbol.SETTINGS, false, click = ::waveSettings),
-                LinearLayout.LayoutParams(-2, ui.dp(48)).apply { marginStart = ui.dp(12) })
-        })
-    }
-
-    private fun waveHeroAction(title: String, symbol: Symbol, primary: Boolean, playing: Boolean = false, click: () -> Unit) = ui.row().apply {
-        val color = if (primary) Color.BLACK else ui.palette.text
-        val padding = ui.dp(when {
-            resources.configuration.screenWidthDp < 350 -> 12
-            resources.configuration.screenWidthDp <= 370 -> if (primary) 22 else 18
-            primary -> 26
-            else -> 20
-        })
-        setPadding(padding, 0, padding, 0)
-        background = ui.touch(if (primary) ui.palette.accent else ui.palette.panel, 24)
-        pressFeedback(.95f)
-        val glyph = if (playing) PlayingBars(this@MainActivity, color).apply { running = true }
-            else IconView(this@MainActivity, symbol, color).apply { iconSize = 18 }
-        addView(glyph, LinearLayout.LayoutParams(ui.dp(18), ui.dp(18)))
-        addView(ui.line(title, 16, color, bold = true), LinearLayout.LayoutParams(-2, -2).apply { marginStart = ui.dp(7) })
-        setOnClickListener { click() }
-        isFocusable = true
-    }
-
     private fun homeSkeleton() = ui.row().apply {
         setPadding(ui.dp(16), ui.dp(16), ui.dp(16), ui.dp(12))
         importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
@@ -1844,43 +2174,6 @@ class MainActivity : ComponentActivity(), Player.Listener {
                 LinearLayout.LayoutParams(0, ui.dp(105), 1f).apply { if (it > 0) marginStart = ui.dp(10) })
         }
         pulseWhileAttached()
-    }
-
-    private fun quickRows(): List<Row> {
-        val tiles = listOf<() -> View>(
-            { quickTile("Мне нравится", Symbol.HEART_FILLED) { push(Screen.LIKES) } },
-            { quickTile("Скачанное", Symbol.DOWNLOAD) { push(Screen.DOWNLOADS) } },
-            { quickTile("История", Symbol.HISTORY) { push(Screen.HISTORY) } },
-        ) + store.ownPlaylists.value.take(3).map { card ->
-            { quickTile(card.title, cover = card.cover) { openCard(card) } }
-        }
-        return tiles.chunked(2).map { pair ->
-            Row.Layout(cache = true) {
-                ui.row().apply {
-                    setPadding(ui.dp(16), 0, ui.dp(16), ui.dp(10))
-                    pair.forEachIndexed { index, item ->
-                        addView(item(), LinearLayout.LayoutParams(0, ui.dp(56), 1f).apply { if (index > 0) marginStart = ui.dp(10) })
-                    }
-                    if (pair.size == 1) addView(View(this@MainActivity), LinearLayout.LayoutParams(0, 1, 1f).apply { marginStart = ui.dp(10) })
-                }
-            }
-        }
-    }
-
-    private fun quickTile(title: String, symbol: Symbol? = null, cover: String? = null, click: () -> Unit) = ui.row().apply {
-        background = ui.touch(ui.palette.panel, 14)
-        clipToOutline = true
-        val art = if (symbol == null) ui.art(cover, 120, corner = 0) else ui.symbolCover(symbol, 56, 0)
-        addView(art, LinearLayout.LayoutParams(ui.dp(56), ui.dp(56)))
-        addView(ui.text(title, 14, bold = true).apply {
-            maxLines = if (title.any(Char::isWhitespace)) 2 else 1
-            setAutoSizeTextTypeUniformWithConfiguration(12, 14, 1, android.util.TypedValue.COMPLEX_UNIT_SP)
-            ellipsize = android.text.TextUtils.TruncateAt.END
-            setPaddingRelative(ui.dp(10), 0, ui.dp(4), 0)
-        }, ui.weight())
-        pressFeedback(.95f)
-        setOnClickListener { click() }
-        isFocusable = true
     }
 
     private fun library() {
@@ -1894,51 +2187,154 @@ class MainActivity : ComponentActivity(), Player.Listener {
             }
             card.copy(subtitle = sub)
         }
-        val displayed = playlistCards(store.ownPlaylists.value, own = true) + playlistCards(store.savedPlaylists.value, own = false)
+        val ownList = playlistCards(store.ownPlaylists.value, own = true)
+        val savedList = playlistCards(store.savedPlaylists.value, own = false)
+        val hasBoth = ownList.isNotEmpty() && savedList.isNotEmpty()
+        if (!hasBoth) libraryPlaylistFilter = 0
+        val displayed = when {
+            !hasBoth || libraryPlaylistFilter == 0 -> ownList + savedList
+            libraryPlaylistFilter == 1 -> ownList
+            else -> savedList
+        }
         val count = store.likes.value.size
         val downloaded = store.files.downloaded().size
+        val queued = store.files.status.value.values.count { it.error == null }
+        libraryQueuedCount = queued
+        val downloadsValue = when {
+            queued > 0 -> "в очереди: $queued"
+            downloaded > 0 -> trackCount(downloaded)
+            else -> "пока пусто"
+        }
+        fun playLikesQuick(shuffled: Boolean) {
+            val uid = userId ?: return
+            val ctx = PlayContext("playlist", "$uid:3", "Мне нравится")
+            val currentCtx = QueueItems.context(controller?.currentMediaItem)
+            if (!shuffled && currentTrack() != null && currentCtx.kind == "playlist" && currentCtx.item == ctx.item) {
+                toggle()
+                return
+            }
+            action {
+                val tracks = store.likedTracks()
+                val playable = tracks.indices.filter { !tracks[it].unavailable || store.files.hasReplacement(tracks[it]) || store.files.has(tracks[it]) }
+                val start = if (shuffled) playable.randomOrNull() else playable.firstOrNull()
+                if (start != null) playTracks(tracks, start, ctx, shuffle = shuffled) else toast("Нет доступных треков")
+            }
+        }
+        fun gridTile(symbol: Symbol, title: String, subtitle: String?, click: () -> Unit): View = ui.row().apply {
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(ui.dp(12), ui.dp(12), ui.dp(12), ui.dp(12))
+            background = ui.touch(ui.palette.panel, 16)
+            pressFeedback(.96f)
+            isFocusable = true
+            addView(IconView(this@MainActivity, symbol, ui.palette.text).apply {
+                iconSize = 18
+                background = ui.shape(ui.palette.lifted, 12)
+            }, LinearLayout.LayoutParams(ui.dp(40), ui.dp(40)))
+            addView(ui.column().apply {
+                setPadding(ui.dp(10), 0, 0, 0)
+                addView(ui.line(title, 15, ui.palette.text, bold = true))
+                subtitle?.takeIf(String::isNotBlank)?.let {
+                    addView(ui.space(2))
+                    addView(ui.line(it, 12, ui.palette.muted))
+                }
+            }, ui.weight())
+            setOnClickListener { click() }
+        }
+        fun gridRow(left: () -> View, right: () -> View) = Row.Layout {
+            ui.row().apply {
+                setPadding(ui.dp(16), ui.dp(5), ui.dp(16), ui.dp(5))
+                addView(left(), LinearLayout.LayoutParams(0, ui.dp(68), 1f))
+                gap(this, 10)
+                addView(right(), LinearLayout.LayoutParams(0, ui.dp(68), 1f))
+            }
+        }
         rows(buildList {
             availableUpdate?.let { update ->
                 add(libraryEntry(Symbol.DOWNLOAD, "Доступна версия ${update.version}", "Обновить") { push(Screen.SETTINGS) })
             }
             add(Row.Layout {
-                ui.row().apply {
-                    setPadding(ui.dp(16), ui.dp(8), ui.dp(16), ui.dp(20))
-                    addView(ui.symbolCover(Symbol.HEART_FILLED, 92), LinearLayout.LayoutParams(ui.dp(92), ui.dp(92)))
-                    addView(ui.column().apply {
-                        setPadding(ui.dp(16), 0, 0, 0)
-                        addView(ui.text("Мне нравится", 24, bold = true))
-                        addView(ui.space(4))
-                        addView(ui.line(trackCount(count), 15, ui.palette.muted))
-                    }, ui.weight())
-                    addView(IconView(this@MainActivity, Symbol.BACK, ui.palette.muted).apply { rotation = 180f; iconSize = 16 },
-                        LinearLayout.LayoutParams(ui.dp(20), ui.dp(34)))
-                    background = ui.touch()
-                    setOnClickListener { push(Screen.LIKES) }
-                    isFocusable = true
+                ui.column().apply {
+                    setPadding(ui.dp(16), ui.dp(6), ui.dp(16), ui.dp(10))
+                    addView(ui.row().apply {
+                        setPadding(ui.dp(12), ui.dp(12), ui.dp(12), ui.dp(12))
+                        background = ui.touch(ui.palette.panel, 20)
+                        pressFeedback(.98f)
+                        isFocusable = true
+                        addView(ui.symbolCover(Symbol.HEART_FILLED, 64, 14), LinearLayout.LayoutParams(ui.dp(64), ui.dp(64)))
+                        addView(ui.column().apply {
+                            setPadding(ui.dp(14), 0, ui.dp(8), 0)
+                            addView(ui.line("Мне нравится", 20, bold = true))
+                            addView(ui.space(4))
+                            addView(ui.line(trackCount(count), 14, ui.palette.muted))
+                        }, ui.weight())
+                        addView(ui.icon(Symbol.SHUFFLE, "Перемешать «Мне нравится»", ui.palette.text) { playLikesQuick(true) }.apply {
+                            iconSize = 15
+                            background = ui.touch(ui.palette.lifted, 19)
+                        }, LinearLayout.LayoutParams(ui.dp(38), ui.dp(38)))
+                        gap(this, 8)
+                        val likesPlay = ui.icon(Symbol.PLAY, "Слушать «Мне нравится»", Color.BLACK) { playLikesQuick(false) }.apply {
+                            iconSize = 15
+                            background = ui.touch(ui.palette.accent, 19)
+                        }
+                        val likesBars = PlayingBars(this@MainActivity, Color.BLACK).apply { visibility = View.INVISIBLE }
+                        val likesPlaySlot = FrameLayout(this@MainActivity).apply {
+                            background = ui.touch(ui.palette.accent, 19)
+                            pressFeedback(.92f)
+                            isFocusable = true
+                            addView(likesPlay, FrameLayout.LayoutParams(-1, -1))
+                            addView(likesBars, FrameLayout.LayoutParams(ui.dp(15), ui.dp(15), Gravity.CENTER))
+                            setOnClickListener { playLikesQuick(false) }
+                            observePlayback {
+                                val now = QueueItems.context(controller?.currentMediaItem)
+                                val active = currentTrack() != null && now.kind == "playlist" && now.item == "${userId.orEmpty()}:3" &&
+                                    controller?.isPlaying == true
+                                likesPlay.visibility = if (active) View.INVISIBLE else View.VISIBLE
+                                likesBars.visibility = if (active) View.VISIBLE else View.INVISIBLE
+                                likesBars.running = active
+                                contentDescription = if (active) "Пауза" else "Слушать «Мне нравится»"
+                            }
+                        }
+                        addView(likesPlaySlot, LinearLayout.LayoutParams(ui.dp(38), ui.dp(38)))
+                        setOnClickListener { push(Screen.LIKES) }
+                    }, ui.full())
                 }
             })
-            val queued = store.files.status.value.values.count { it.error == null }
-            libraryQueuedCount = queued
-            val downloadsValue = when {
-                queued > 0 -> "ещё $queued в очереди"
-                downloaded > 0 -> downloaded.toString()
-                else -> null
+            add(gridRow(
+                { gridTile(Symbol.DOWNLOAD_CIRCLE, "Скачанное", downloadsValue) { push(Screen.DOWNLOADS) } },
+                { gridTile(Symbol.LIBRARY, "Альбомы", savedCount(Kind.ALBUM)?.let { plural(it.toInt(), "альбом", "альбома", "альбомов") } ?: "коллекция") { push(Screen.ALBUMS) } },
+            ))
+            add(gridRow(
+                { gridTile(Symbol.MIC_MUSIC, "Исполнители", savedCount(Kind.ARTIST) ?: "подписки") { push(Screen.ARTISTS) } },
+                { gridTile(Symbol.HISTORY, "История", "прослушанное") { push(Screen.HISTORY) } },
+            ))
+            val extraChips = buildList {
+                add(Triple(Symbol.STATS, "Статистика") { push(Screen.STATS) })
+                add(Triple(Symbol.MIC, "Подкасты") { push(Screen.PODCASTS) })
+                add(Triple(Symbol.BOOK, "Аудиокниги") { push(Screen.BOOKS) })
+                add(Triple(Symbol.BALLOON, "Детям") { push(Screen.KIDS) })
+                add(Triple(Symbol.CONCERT, "Концерты") { push(Screen.CONCERTS) })
+                val dislikesCount = store.dislikes.value.size
+                if (dislikesCount > 0) add(Triple(Symbol.THUMB_DOWN, "Не нравится · $dislikesCount") { push(Screen.DISLIKES) })
+                add(Triple(Symbol.PERSON_MINUS, "Скрытые") { push(Screen.HIDDEN_ARTISTS) })
             }
-            add(libraryEntry(Symbol.DOWNLOAD_CIRCLE, "Скачанные треки", downloadsValue) { push(Screen.DOWNLOADS) })
-            add(libraryEntry(Symbol.LIBRARY, "Альбомы", savedCount(Kind.ALBUM)) { push(Screen.ALBUMS) })
-            add(libraryEntry(Symbol.MIC_MUSIC, "Исполнители", savedCount(Kind.ARTIST)) { push(Screen.ARTISTS) })
-            add(libraryEntry(Symbol.MIC, "Подкасты") { push(Screen.PODCASTS) })
-            add(libraryEntry(Symbol.BOOK, "Аудиокниги") { push(Screen.BOOKS) })
-            add(libraryEntry(Symbol.BALLOON, "Детям") { push(Screen.KIDS) })
-            add(libraryEntry(Symbol.CONCERT, "Концерты") { push(Screen.CONCERTS) })
-            add(libraryEntry(Symbol.HISTORY, "История") { push(Screen.HISTORY) })
-            add(libraryEntry(Symbol.STATS, "Статистика") { push(Screen.STATS) })
-            if (store.dislikes.value.isNotEmpty()) add(libraryEntry(Symbol.THUMB_DOWN, "Не нравится", store.dislikes.value.size.toString()) { push(Screen.DISLIKES) })
-            add(libraryEntry(Symbol.PERSON_MINUS, "Скрытые исполнители") { push(Screen.HIDDEN_ARTISTS) })
+            add(Row.Layout {
+                horizontal(extraChips.map { (symbol, title, click) ->
+                    ui.row().apply {
+                        gravity = Gravity.CENTER
+                        setPadding(ui.dp(12), 0, ui.dp(14), 0)
+                        background = ui.touch(ui.palette.panel, 19)
+                        pressFeedback(.95f)
+                        isFocusable = true
+                        addView(IconView(this@MainActivity, symbol, ui.palette.text).apply { iconSize = 15 },
+                            LinearLayout.LayoutParams(ui.dp(16), ui.dp(16)).apply { marginEnd = ui.dp(6) })
+                        addView(ui.line(title, 14, ui.palette.text, bold = true))
+                        setOnClickListener { click() }
+                    }.apply { layoutParams = LinearLayout.LayoutParams(-2, ui.dp(38)) }
+                }).apply { setPadding(0, ui.dp(8), 0, ui.dp(2)) }
+            })
             add(Row.Layout {
                 ui.row().apply {
-                    setPadding(ui.dp(16), ui.dp(26), ui.dp(16), ui.dp(10))
+                    setPadding(ui.dp(16), ui.dp(20), ui.dp(16), ui.dp(8))
                     addView(ui.text("Плейлисты", 22, bold = true), ui.weight())
                     addView(ui.row().apply {
                         gravity = Gravity.CENTER_VERTICAL
@@ -1955,6 +2351,15 @@ class MainActivity : ComponentActivity(), Player.Listener {
                         background = ui.touch(ui.palette.panel, 18)
                     }, LinearLayout.LayoutParams(ui.dp(36), ui.dp(36)))
                 }
+            })
+            if (hasBoth) add(Row.Layout {
+                val options = listOf("Все", "Мои", "Добавленные")
+                horizontal(options.mapIndexed { idx, title ->
+                    ui.chip(title, libraryPlaylistFilter == idx) {
+                        libraryPlaylistFilter = idx
+                        library()
+                    }
+                })
             })
             if (displayed.isEmpty()) add(note("Создайте плейлист или добавьте чужой в коллекцию."))
             else addAll(displayed.map(::entry))
@@ -1985,6 +2390,12 @@ class MainActivity : ComponentActivity(), Player.Listener {
 
     private fun loadTracks(screen: Screen) {
         val uid = userId ?: return
+        val chipPlace = when (screen) {
+            Screen.LIKES -> "likes"
+            Screen.HISTORY -> "history"
+            else -> null
+        }
+        chipPlace?.let(::preloadTrackChips)
         val context = PlayContext(if (screen == Screen.LIKES) "playlist" else "various",
             if (screen == Screen.LIKES) "$uid:3" else null, screen.label)
         val symbol = when (screen) {
@@ -1995,7 +2406,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
         fun trackRowsForPage(tracks: List<Track>): List<Row> {
             val data = TrackList(tracks, context, symbol)
             trackList = data
-            if (screen == Screen.LIKES) loadTrackChips("likes", tracks)
+            chipPlace?.let { loadTrackChips(it, tracks) }
             return listRows(data)
         }
         loadRows(loading = {
@@ -2016,25 +2427,32 @@ class MainActivity : ComponentActivity(), Player.Listener {
         }
     }
 
-    private fun artistFamiliar(artist: Card, wave: Boolean) = loadRows {
-        val account = store.requireUser()
-        val catalog = store.versions.artistInsertions(artist.id).first.toSet()
-        val local = if (wave) store.listening.recentWave(account.uid, artist, catalog) else {
-            catalog.mapNotNull { store.versions.synthetic(it) }.filter { track ->
-                track.id in store.likes.value || track.album?.key in store.savedCards.value
+    private fun artistFamiliar(artist: Card, wave: Boolean) {
+        val chipPlace = "artist-familiar:${artist.id}:$wave"
+        preloadTrackChips(chipPlace)
+        val context = PlayContext("artist", "${artist.id}:$wave", artist.title)
+        loadRows(loading = {
+            listOf(Row.Layout { listHeader(emptyList(), context, null, card = artist, loading = true) }, Row.Layout { ui.loadingRows() })
+        }) {
+            val account = store.requireUser()
+            val catalog = store.versions.artistInsertions(artist.id).first.toSet()
+            val local = if (wave) store.listening.recentWave(account.uid, artist, catalog) else {
+                catalog.mapNotNull { store.versions.synthetic(it) }.filter { track ->
+                    track.id in store.likes.value || track.album?.key in store.savedCards.value
+                }
             }
+            val remote = try {
+                store.cachedTracks("artist-familiar:${artist.id}:$wave") { store.online { artistFamiliar(artist.id, wave) } }
+            } catch (error: java.io.IOException) {
+                if (local.isEmpty()) throw error
+                emptyList()
+            }
+            val selected = (remote + local).distinctBy { it.id }
+            loadTrackChips(chipPlace, selected)
+            val data = TrackList(selected, context, card = artist)
+            trackList = data
+            listRows(data)
         }
-        val remote = try {
-            store.cachedTracks("artist-familiar:${artist.id}:$wave") { store.online { artistFamiliar(artist.id, wave) } }
-        } catch (error: java.io.IOException) {
-            if (local.isEmpty()) throw error
-            emptyList()
-        }
-        val selected = (remote + local).distinctBy { it.id }
-        val context = PlayContext("artist", artist.id, artist.title)
-        val data = TrackList(selected, context, if (wave) Symbol.WAVE else Symbol.HEART_FILLED)
-        trackList = data
-        listRows(data)
     }
 
     private fun collection(screen: Screen) = loadRows(
@@ -2111,7 +2529,11 @@ class MainActivity : ComponentActivity(), Player.Listener {
         }.ifEmpty { listOf(note("Вы ещё не скрывали исполнителей")) }
     }
 
-    private fun loadDetails(card: Card) = loadRows(
+    private fun loadDetails(card: Card) = run {
+        if (card.kind == Kind.PLAYLIST || (card.kind == Kind.ALBUM && !card.isPodcast) || card.kind == Kind.ARTIST) {
+            preloadTrackChips("details:${card.key}")
+        }
+        loadRows(
         loading = { listOf(Row.Layout { pageHeader(MusicPage(card, emptyList()), context = null) }, Row.Layout { ui.loadingRows() }) }
     ) { showCached ->
         reorderJob?.join()
@@ -2130,6 +2552,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
         }
         detailRows(page)
     }
+    }
 
     private fun detailRows(page: MusicPage): List<Row> {
         val context = PlayContext(page.card.kind.name.lowercase(Locale.ROOT),
@@ -2137,9 +2560,11 @@ class MainActivity : ComponentActivity(), Player.Listener {
         val displayed = if (page.card.kind == Kind.ARTIST) page.tracks else visibleTracks(page.tracks)
         return buildList {
             add(Row.Layout(cache = true) { pageHeader(page, context) })
-            if ((page.card.kind == Kind.PLAYLIST || (page.card.kind == Kind.ALBUM && !page.card.isPodcast)) &&
-                trackChips.isNotEmpty() && !reordering) {
-                add(trackChipsRow())
+            if (page.card.kind != Kind.ARTIST && !reordering) {
+                add(trackControlsRow(page.tracks, showDownloadedToggle = true))
+            }
+            if (page.card.kind != Kind.ARTIST && !reordering && hasActiveTrackFilter()) {
+                add(filterStatusRow(page.tracks.size, displayed.size))
             }
             page.latestRelease?.let {
                 add(heading("Последний релиз"))
@@ -2261,8 +2686,8 @@ class MainActivity : ComponentActivity(), Player.Listener {
         val gradient = SmoothGradientDrawable(ui.palette.panel, ui.palette.background)
         background = gradient
         gravity = Gravity.CENTER_HORIZONTAL
-        setPadding(ui.dp(16), ui.dp(10), ui.dp(16), ui.dp(12))
-        val size = minOf(if (artist) 190 else 220, resources.configuration.screenWidthDp - 60).coerceAtLeast(100)
+        setPadding(ui.dp(16), ui.dp(8), ui.dp(16), ui.dp(10))
+        val size = minOf(if (artist) 190 else 168, resources.configuration.screenWidthDp - 60).coerceAtLeast(100)
         addView(ui.art(card.cover, 800, artist, 18) { tone ->
             val top = if (ui.palette.light) ColorUtils.blendARGB(tone, ui.palette.background, .70f) else tone
             gradient.setColors(top, ui.palette.background)
@@ -2281,7 +2706,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
             }
         },
             LinearLayout.LayoutParams(ui.dp(size), ui.dp(size)))
-        addView(ui.space(18))
+        addView(ui.space(14))
         val kind = when (card.releaseType) {
             "single" -> "Сингл"
             "compilation" -> "Сборник"
@@ -2331,7 +2756,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
             ellipsize = android.text.TextUtils.TruncateAt.END
             setPadding(0, ui.dp(4), 0, 0)
         }) }
-        addView(ui.space(20))
+        addView(ui.space(14))
         val readyContext = context ?: run {
             addView(ui.loadingTrackControls(), ui.full())
             return@apply
@@ -2350,9 +2775,13 @@ class MainActivity : ComponentActivity(), Player.Listener {
         }, ui.full())
     }
 
-    private fun updateDetailsTitle(current: Route, page: android.widget.AbsListView, first: Int) {
+    private fun updateHeaderTitle(current: Route, page: android.widget.AbsListView, first: Int) {
         val title = toolbarTitle ?: return
-        val caption = details?.card?.title ?: current.card?.title.orEmpty()
+        val caption = when (current.screen) {
+            Screen.DETAILS -> details?.card?.title ?: current.card?.title.orEmpty()
+            Screen.ARTIST_TRACKS -> current.card?.title.orEmpty().ifBlank { current.screen.label }
+            else -> current.screen.label
+        }
         if (title.text != caption) title.text = caption
         val header = page.getChildAt(0)
         val heading = header?.findViewById<TextView>(DETAIL_HEADER_TITLE)
@@ -2387,8 +2816,25 @@ class MainActivity : ComponentActivity(), Player.Listener {
         val running = store.files.status.value.values.toList()
         downloadRows = running.map { it.track.id to it.error }
         val saved = store.files.downloaded()
+        preloadTrackChips("downloads")
+        loadTrackChips("downloads", saved)
+        val diskKey = saved.size to store.files.revision.value
+        if (saved.isEmpty()) {
+            downloadsDiskBytes = 0L
+            downloadsDiskKey = diskKey
+        } else if (downloadsDiskKey != diskKey) {
+            downloadsDiskKey = diskKey
+            downloadsDiskJob?.cancel()
+            downloadsDiskJob = action(onError = {}) {
+                val total = store.files.diskUsage().sumOf { it.second }
+                downloadsDiskBytes = total
+                if (route.screen == Screen.DOWNLOADS) downloads()
+            }
+        }
+        val downloadContext = PlayContext(name = Screen.DOWNLOADS.label)
         rows(buildList {
-            add(Row.Layout { listHeader(saved, PlayContext(name = Screen.DOWNLOADS.label), Symbol.DOWNLOAD) })
+            add(Row.Layout { listHeader(saved, downloadContext, Symbol.DOWNLOAD, diskBytes = downloadsDiskBytes) })
+            add(trackControlsRow(saved, showDownloadedToggle = false))
             if (running.isNotEmpty()) {
                 val paused = store.files.paused.value
                 val active = running.any { it.error == null }
@@ -2423,10 +2869,11 @@ class MainActivity : ComponentActivity(), Player.Listener {
             })
             else {
                 val displayed = visibleTracks(saved)
+                if (hasActiveTrackFilter()) add(filterStatusRow(saved.size, displayed.size))
                 if (displayed.isEmpty() && saved.isNotEmpty()) add(Row.Layout {
                     ui.pagePlaceholder(Symbol.SEARCH, "Ничего не найдено")
                 })
-                else addAll(trackRows(displayed, PlayContext(name = Screen.DOWNLOADS.label)))
+                else addAll(trackRows(displayed, downloadContext))
             }
         }, keepScroll = true)
     }
@@ -2452,11 +2899,14 @@ class MainActivity : ComponentActivity(), Player.Listener {
     }
 
     private fun listRows(data: TrackList): List<Row> = buildList {
-        add(Row.Layout { listHeader(data.tracks, data.context, data.art) })
-        if (trackChips.isNotEmpty() && route.screen in setOf(Screen.LIKES, Screen.ARTIST_TRACKS)) {
-            add(trackChipsRow())
+        add(Row.Layout { listHeader(data.tracks, data.context, data.art, data.card, diskBytes = data.diskBytes) })
+        if (!reordering) {
+            add(trackControlsRow(data.tracks, showDownloadedToggle = route.screen != Screen.DOWNLOADS))
         }
         val visible = visibleTracks(data.tracks)
+        if (hasActiveTrackFilter()) {
+            add(filterStatusRow(data.tracks.size, visible.size))
+        }
         if (visible.isEmpty()) add(Row.Layout {
             if (data.tracks.isEmpty()) ui.pagePlaceholder(Symbol.QUEUE, "Здесь пока пусто")
             else ui.pagePlaceholder(Symbol.SEARCH, "Ничего не найдено")
@@ -2488,6 +2938,115 @@ class MainActivity : ComponentActivity(), Player.Listener {
     private fun activeChipTracks(): Set<String>? =
         selectedTrackChip?.let { id -> trackChips.firstOrNull { it.id == id }?.trackIds }
 
+    private fun hasActiveTrackFilter(): Boolean =
+        trackFilter.isNotBlank() || onlyDownloaded || selectedTrackChip != null || trackOrder != TrackOrder.ORIGINAL
+
+    private fun clearTrackFilter() {
+        trackOrder = TrackOrder.ORIGINAL
+        onlyDownloaded = false
+        selectedTrackChip = null
+        if (filterBar != null) hideTrackFilter()
+        else {
+            trackFilter = ""
+            updateTrackFilter()
+        }
+    }
+
+    private fun filterStatusRow(total: Int, visible: Int): Row.Layout = Row.Layout {
+        val filtered = onlyDownloaded || selectedTrackChip != null || trackFilter.isNotBlank()
+        val label = if (filtered) "Показано $visible из $total" else "Сортировка: ${trackOrder.label}"
+        ui.column().apply {
+            setPadding(ui.dp(16), 0, ui.dp(16), ui.dp(8))
+            addView(ui.row().apply {
+                setPadding(ui.dp(12), ui.dp(8), ui.dp(12), ui.dp(8))
+                background = ui.shape(ui.palette.panel, 12)
+                addView(ui.line(label, 13, ui.palette.muted).apply {
+                    fontFeatureSettings = "tnum"
+                }, ui.weight())
+                addView(ui.text("Сбросить", 13, ui.palette.accentText, bold = true).apply {
+                    setPadding(ui.dp(10), ui.dp(2), 0, ui.dp(2))
+                    background = ui.touch()
+                    isFocusable = true
+                    setOnClickListener { clearTrackFilter() }
+                })
+            }, ui.full())
+        }
+    }
+
+    private fun chooseTrackOrder(all: List<Track>) {
+        val hasDates = all.any { item -> item.addedAt != null }
+        val choices = TrackOrder.entries.filter { it !in setOf(TrackOrder.RECENT, TrackOrder.OLDEST) || hasDates }
+        val currentIdx = choices.indexOf(trackOrder).coerceAtLeast(0)
+        choose("Сортировка", choices.map { it.label }, currentIdx) {
+            trackOrder = choices[it]
+            updateTrackFilter()
+        }
+    }
+
+    private fun trackControlsRow(allTracks: List<Track>, showDownloadedToggle: Boolean = true): Row.Layout = Row.Layout {
+        val sortActive = trackOrder != TrackOrder.ORIGINAL
+        val buttons = mutableListOf<View>()
+        fun pill(icon: Symbol?, label: String, active: Boolean, iconSizeDp: Int = 12, click: () -> Unit): View {
+            val fg = if (active) Color.BLACK else ui.palette.text
+            return ui.row().apply {
+                gravity = Gravity.CENTER_VERTICAL
+                minimumHeight = ui.dp(32)
+                setPadding(ui.dp(12), 0, ui.dp(12), 0)
+                background = ui.touch(if (active) ui.palette.accent else ui.palette.lifted, 16)
+                pressFeedback(.95f)
+                isFocusable = true
+                if (icon != null) {
+                    addView(IconView(this@MainActivity, icon, fg).apply { iconSize = iconSizeDp },
+                        LinearLayout.LayoutParams(ui.dp(iconSizeDp + 1), ui.dp(iconSizeDp + 1)).apply { marginEnd = ui.dp(5) })
+                }
+                addView(ui.line(label, 13, fg, bold = true))
+                setOnClickListener { click() }
+            }.apply {
+                layoutParams = LinearLayout.LayoutParams(-2, ui.dp(32))
+            }
+        }
+        buttons += pill(Symbol.SORT, if (sortActive) trackOrder.label else "Порядок", sortActive, iconSizeDp = 11) {
+            chooseTrackOrder(allTracks)
+        }
+        if (showDownloadedToggle) {
+            buttons += pill(Symbol.DOWNLOAD_CIRCLE, "Скачанные", onlyDownloaded, iconSizeDp = 12) {
+                onlyDownloaded = !onlyDownloaded
+                updateTrackFilter()
+            }
+        }
+        val activeChipIndexStart = buttons.size
+        trackChips.forEach { filter ->
+            buttons += pill(null, filter.name, selectedTrackChip == filter.id) {
+                selectedTrackChip = if (selectedTrackChip == filter.id) null else filter.id
+                updateTrackFilter()
+            }
+        }
+        val selectedIdx = selectedTrackChip?.let { id ->
+            trackChips.indexOfFirst { it.id == id }.takeIf { it >= 0 }?.let { activeChipIndexStart + it }
+        }
+        horizontal(buttons).apply {
+            setPadding(0, ui.dp(2), 0, ui.dp(8))
+            if (selectedIdx != null) addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+                val chip = buttons.getOrNull(selectedIdx) ?: return@addOnLayoutChangeListener
+                if (chip.right > scrollX + width || chip.left < scrollX) {
+                    scrollTo((chip.left - ui.dp(16)).coerceAtLeast(0), 0)
+                }
+            }
+        }
+    }
+
+    private fun preloadTrackChips(key: String) {
+        if (trackChips.isEmpty()) {
+            val cached = store.cachedTrackFilters(key).orEmpty()
+            if (cached.isNotEmpty()) {
+                trackChips = cached
+                if (selectedTrackChip != null && cached.none { it.id == selectedTrackChip }) {
+                    selectedTrackChip = null
+                }
+            }
+        }
+    }
+
     private fun loadTrackChips(key: String, tracks: List<Track>) {
         val ids = tracks.asSequence().map { it.id }.filter { it.isNotBlank() && it.all(Char::isDigit) }.distinct().toList()
         val cacheKey = "$key:${ids.size}:${ids.firstOrNull().orEmpty()}:${ids.lastOrNull().orEmpty()}"
@@ -2499,10 +3058,11 @@ class MainActivity : ComponentActivity(), Player.Listener {
             selectedTrackChip = null
             return
         }
-        trackChipsCache[cacheKey]?.let { cached ->
+        val cached = trackChipsCache[cacheKey] ?: store.cachedTrackFilters(key)
+        if (cached != null) {
+            trackChipsCache[cacheKey] = cached
             trackChips = cached
             if (selectedTrackChip != null && cached.none { it.id == selectedTrackChip }) selectedTrackChip = null
-            return
         }
         if (store.offline || !hasNetwork()) return
         trackChipsJob = lifecycleScope.launch {
@@ -2510,10 +3070,12 @@ class MainActivity : ComponentActivity(), Player.Listener {
                 optional { store.online { trackFilters(ids) } }
             } ?: return@launch
             if (trackChipsKey != cacheKey) return@launch
+            val changed = loaded != trackChips
             trackChipsCache[cacheKey] = loaded
+            store.saveTrackFilters(key, loaded)
             trackChips = loaded
             if (selectedTrackChip != null && loaded.none { it.id == selectedTrackChip }) selectedTrackChip = null
-            if (loaded.isNotEmpty() || selectedTrackChip != null) updateTrackFilter()
+            if (changed) updateTrackFilter()
         }
     }
 
@@ -2638,9 +3200,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
                 }
             })
             add(MenuAction("Сортировка · ${trackOrder.label}", Symbol.FILTER) {
-                val hasDates = all.any { item -> item.addedAt != null }
-                val choices = TrackOrder.entries.filter { it !in setOf(TrackOrder.RECENT, TrackOrder.OLDEST) || hasDates }
-                choose("Сортировка", choices.map { it.label }, choices.indexOf(trackOrder)) { trackOrder = choices[it]; updateTrackFilter() }
+                chooseTrackOrder(all)
             })
             if (route.screen != Screen.DOWNLOADS) add(MenuAction(if (onlyDownloaded) "Показать все треки" else "Только скачанные", Symbol.DOWNLOAD) {
                 onlyDownloaded = !onlyDownloaded
@@ -2714,22 +3274,117 @@ class MainActivity : ComponentActivity(), Player.Listener {
         } else button(Symbol.CLOSE, "Готово", click = ::endSelection)
     }
 
-    private fun listHeader(tracks: List<Track>, context: PlayContext, symbol: Symbol?, loading: Boolean = false) = ui.column().apply {
-        gravity = Gravity.CENTER_HORIZONTAL
-        setPadding(ui.dp(16), ui.dp(10), ui.dp(16), ui.dp(18))
-        if (symbol != null) {
-            addView(ui.symbolCover(symbol, 200, 22), LinearLayout.LayoutParams(ui.dp(200), ui.dp(200)))
-            addView(ui.space(16))
-            addView(ui.text(context.name, 26, bold = true).apply { gravity = Gravity.CENTER })
+    private fun listHeader(
+        tracks: List<Track>,
+        context: PlayContext,
+        symbol: Symbol?,
+        card: Card? = null,
+        loading: Boolean = false,
+        diskBytes: Long? = null,
+    ) = ui.column().apply {
+        val screen = route.screen
+        val isSystemList = screen in setOf(Screen.LIKES, Screen.DOWNLOADS, Screen.HISTORY, Screen.DISLIKES)
+        val kindLabel = when (screen) {
+            Screen.LIKES -> "Плейлист"
+            Screen.DOWNLOADS -> "На устройстве"
+            Screen.HISTORY -> "Вы слушали"
+            Screen.DISLIKES -> "Скрыто из рекомендаций"
+            Screen.ARTIST_TRACKS -> "Все треки"
+            Screen.ARTIST_COLLECTION, Screen.ARTIST_WAVE -> card?.title?.takeIf(String::isNotBlank) ?: context.name
+            else -> ""
         }
-        addView(ui.space(6))
-        if (loading) addView(ui.loadingShape(), LinearLayout.LayoutParams(ui.dp(76), ui.dp(13)))
-        else addView(ui.text(trackCount(tracks.size), 13, ui.palette.muted).apply { gravity = Gravity.CENTER })
-        addView(ui.space(14))
-        addView(if (loading) ui.loadingTrackControls() else ui.row().apply {
-            gravity = Gravity.CENTER
-            addTrackControls(this, tracks, context, downloaded = symbol == Symbol.DOWNLOAD) { visibleTracks(tracks) }
-        }, ui.full())
+        val summaryText = when {
+            tracks.isEmpty() -> kindLabel.ifBlank { trackCount(0) }
+            screen == Screen.DOWNLOADS -> if (diskBytes != null && diskBytes > 0L) {
+                "${trackCount(tracks.size)} · ${fileSize(diskBytes)}"
+            } else {
+                trackCount(tracks.size)
+            }
+            else -> "${trackCount(tracks.size)} · ${durationSummary(tracks.sumOf { it.duration })}"
+        }
+        val metaColor = ColorUtils.setAlphaComponent(ui.palette.text, 153)
+        if (isSystemList) {
+            setPadding(ui.dp(16), ui.dp(8), ui.dp(16), ui.dp(10))
+            addView(ui.row().apply {
+                gravity = Gravity.CENTER_VERTICAL
+                symbol?.let {
+                    addView(ui.symbolCover(it, 82, 18).apply { elevation = ui.dp(6).toFloat() },
+                        LinearLayout.LayoutParams(ui.dp(82), ui.dp(82)))
+                }
+                addView(ui.column().apply {
+                    if (symbol != null) setPadding(ui.dp(14), 0, 0, 0)
+                    if (kindLabel.isNotBlank()) {
+                        addView(ui.line(kindLabel.uppercase(Locale.forLanguageTag("ru")), 11, metaColor, bold = true).apply {
+                            letterSpacing = .09f
+                        })
+                        addView(ui.space(4))
+                    }
+                    addView(ui.text(context.name, 24, bold = true).apply {
+                        id = DETAIL_HEADER_TITLE
+                        maxLines = 2
+                        ellipsize = android.text.TextUtils.TruncateAt.END
+                    })
+                    addView(ui.space(4))
+                    if (loading) addView(ui.loadingShape(), LinearLayout.LayoutParams(ui.dp(96), ui.dp(13)))
+                    else addView(ui.line(summaryText, 13, ui.palette.muted))
+                }, ui.weight())
+            }, ui.full())
+            addView(ui.space(12))
+            addView(if (loading) ui.loadingTrackControls() else ui.row().apply {
+                gravity = Gravity.CENTER
+                addTrackControls(this, tracks, context, downloaded = screen == Screen.DOWNLOADS) { visibleTracks(tracks) }
+            }, ui.full())
+        } else {
+            val gradient = SmoothGradientDrawable(ui.palette.panel, ui.palette.background)
+            background = gradient
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(ui.dp(16), ui.dp(8), ui.dp(16), ui.dp(10))
+            val isArtistCover = card?.kind == Kind.ARTIST ||
+                screen in setOf(Screen.ARTIST_TRACKS, Screen.ARTIST_COLLECTION, Screen.ARTIST_WAVE)
+            val coverUri = card?.cover?.takeIf(String::isNotBlank) ?: tracks.firstOrNull()?.cover
+            val coverSize = minOf(168, resources.configuration.screenWidthDp - 60).coerceAtLeast(100)
+            addView(ui.art(coverUri, 800, circle = isArtistCover, corner = 18) { tone ->
+                val top = if (ui.palette.light) ColorUtils.blendARGB(tone, ui.palette.background, .70f) else tone
+                gradient.setColors(top, ui.palette.background)
+                if (route.screen == screen && route.card?.key == card?.key) {
+                    detailTone = top
+                    updateDetailChrome()
+                }
+            }.apply {
+                elevation = ui.dp(11).toFloat()
+            }, LinearLayout.LayoutParams(ui.dp(coverSize), ui.dp(coverSize)))
+            addView(ui.space(14))
+            if (kindLabel.isNotBlank()) {
+                addView(ui.text(kindLabel.uppercase(Locale.forLanguageTag("ru")), 11, metaColor, bold = true).apply {
+                    gravity = Gravity.CENTER
+                    letterSpacing = .09f
+                })
+                addView(ui.space(6))
+            }
+            val displayTitle = when (screen) {
+                Screen.ARTIST_TRACKS -> card?.title?.takeIf(String::isNotBlank) ?: context.name
+                Screen.ARTIST_COLLECTION, Screen.ARTIST_WAVE -> screen.label
+                else -> context.name
+            }
+            addView(ui.text(displayTitle, 26, bold = true).apply {
+                id = DETAIL_HEADER_TITLE
+                gravity = Gravity.CENTER
+                maxLines = 3
+                ellipsize = android.text.TextUtils.TruncateAt.END
+            })
+            if (loading) {
+                addView(ui.space(6))
+                addView(ui.loadingShape(), LinearLayout.LayoutParams(ui.dp(102), ui.dp(13)))
+            } else if (tracks.isNotEmpty()) {
+                addView(ui.space(6))
+                addView(ui.text(summaryText, 13, ui.palette.muted).apply { gravity = Gravity.CENTER })
+            }
+            addView(ui.space(14))
+            addView(if (loading) ui.loadingTrackControls() else ui.row().apply {
+                gravity = Gravity.CENTER
+                addTrackControls(this, tracks, context) { visibleTracks(tracks) }
+            }, ui.full())
+        }
     }
 
     private fun addTrackControls(
@@ -2824,11 +3479,18 @@ class MainActivity : ComponentActivity(), Player.Listener {
         row.addView(View(this), LinearLayout.LayoutParams(ui.dp(width), 1))
     }
 
-    private fun trackRows(tracks: List<Track>, context: PlayContext, playlist: Card? = null, numbered: Boolean = false) =
+    private fun trackRows(
+        tracks: List<Track>,
+        context: PlayContext,
+        playlist: Card? = null,
+        numbered: Boolean = false,
+        trailingLabels: List<String>? = null,
+    ) =
         tracks.mapIndexed { index, track ->
             Row.Music(track, { playTracks(tracks, index, context) }, { anchor -> trackMenu(track, playlist, anchor = anchor) },
                 number = (index + 1).takeIf { numbered },
-                reorderIndex = index.takeIf { reordering && playlist != null && tracks.size > 1 })
+                reorderIndex = index.takeIf { reordering && playlist != null && tracks.size > 1 },
+                trailingLabel = trailingLabels?.getOrNull(index))
         }
 
     private fun setReordering(enabled: Boolean) {
@@ -3223,6 +3885,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
                 .minByOrNull { kotlin.math.abs(it - anchor) } ?: anchor
             list.setSelectionFromTop(target, position.offset)
         } else list.setSelection(0)
+        if (route.screen == Screen.HOME) list.post { syncHomeWaveBackdrop() }
         if (selecting) updateSelectionBar()
     }
 
@@ -3390,7 +4053,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
 
     private fun openCard(card: Card) {
         when (card.kind) {
-            Kind.WAVE -> startWave(card.seeds, card.title)
+            Kind.WAVE -> startWave(card.seeds, card.title, card.color)
             Kind.CLIP -> card.link?.let(::browser) ?: showVideo(card)
             Kind.CONCERT -> card.url?.let(::browser)
             else -> if (card.id.isNotBlank()) push(Screen.DETAILS, card)
@@ -3770,7 +4433,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
         }
     }
 
-    private fun chooseVersion(track: Track) {
+    internal fun chooseVersion(track: Track) {
         val uid = store.requireUser().uid
         val current = store.files.selectedVersion(uid, track.id)
         val options = buildList {
@@ -3786,7 +4449,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
         }
     }
 
-    private fun reloadVersion(trackId: String) {
+    internal fun reloadVersion(trackId: String) {
         val args = Bundle().apply { putString("track", trackId) }
         controller?.sendCustomCommand(androidx.media3.session.SessionCommand(QueueItems.RELOAD_VERSION, Bundle.EMPTY), args)
     }
@@ -4127,8 +4790,10 @@ class MainActivity : ComponentActivity(), Player.Listener {
     private fun changes() {
         rows(listOf(
             heading("Tune ${BuildConfig.VERSION_NAME}"),
-            note("В поиске снова находятся удалённые и подменённые треки и альбомы из списка «Без цензуры»."),
+            note("Обновлены интерфейс главной, коллекции, списков треков, страниц исполнителей, плеера и настроек звука: плавная аудио-волна с реакцией на громкость и звук, графический эквалайзер с АЧХ, панель «Порядок» и «Скачанные» в списках и компактные шапки."),
             heading("В прошлых версиях"),
+            note("Фильтры по настроениям и жанрам в плейлистах, «Мне нравится», альбомах и на страницах исполнителей."),
+            note("В поиске снова находятся удалённые и подменённые треки и альбомы из списка «Без цензуры»."),
             note("Исправлено округление времени прослушивания в «Вашем топе месяца» до получаса, как в Яндекс Музыке."),
             note("Исправлена синхронизация устройств (Ynison), в коллекции исполнителей появился «Ваш топ месяца», поправлены обложки артистов в статистике, выравнивание подписей, ширина нижней панели без трека и строка о треках без цензуры в альбомах."),
             note("На страницах альбомов появились подпись лейбла и общая длительность, биография исполнителя сворачивается в 3 строки с кнопкой «Читать дальше», имя артиста в шапке альбома кликабельно, а в «Лучшем результате» поиска видны живые столбцы воспроизведения."),
@@ -4626,7 +5291,8 @@ class MainActivity : ComponentActivity(), Player.Listener {
                     }
                 })
                 add(heading("Любимые треки"))
-                addAll(trackRows(data.songs.map { it.first }, PlayContext(name = "Любимые треки"), numbered = true))
+                addAll(trackRows(data.songs.map { it.first }, PlayContext(name = "Любимые треки"), numbered = true,
+                    trailingLabels = data.songs.map { plural(it.second, "раз", "раза", "раз") }))
                 if (data.artists.isNotEmpty()) {
                     add(heading("Любимые исполнители"))
                     val missing = data.artists.map { it.first.id }.filter { it.isNotBlank() && cachedCovers[it] == null }
@@ -4682,6 +5348,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
             body.addView(ui.button("Включить волну", true) {
                 store.preferences.edit().putStringSet("waveSettings", selected.toSet()).apply()
                 sheet.dismiss()
+                waveHead?.bindHero()
                 startWave(listOf(MY_WAVE), "Моя волна")
                 refreshRows()
             }.apply { background = ui.touch(ui.palette.accent, 27) }, ui.full(50).apply {
@@ -4713,7 +5380,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
         return dialog
     }
 
-    private fun startWave(seeds: List<String>, name: String) {
+    private fun startWave(seeds: List<String>, name: String, color: String? = null) {
         waveJob?.cancel()
         waveJob = action {
             val settings = if (seeds == listOf(MY_WAVE)) store.preferences.getStringSet("waveSettings", emptySet()).orEmpty() else emptySet()
@@ -4726,12 +5393,12 @@ class MainActivity : ComponentActivity(), Player.Listener {
             if (wave == null) {
                 val saved = store.files.downloaded().shuffled()
                 if (saved.isEmpty()) throw MusicError("Скачайте музыку, чтобы включать волну без сети")
-                playTracks(saved, 0, PlayContext("radio", seeds.joinToString(","), name), shuffle = false)
+                playTracks(saved, 0, PlayContext("radio", seeds.joinToString(","), name, color = color), shuffle = false)
                 return@action
             }
             if (wave.tracks.isEmpty()) throw MusicError("Волна пока не предложила треков")
             store.scope.launch { optional { store.online { waveFeedback(wave.session, "radioStarted") } } }
-            playTracks(wave.tracks, 0, PlayContext("radio", seeds.joinToString(","), name, wave.session), shuffle = false)
+            playTracks(wave.tracks, 0, PlayContext("radio", seeds.joinToString(","), name, wave.session, color), shuffle = false)
         }
     }
 
@@ -4883,6 +5550,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
 
     override fun onResume() {
         super.onResume()
+        waveHead?.refreshVolume()
         store.files.resumeForegroundQueue()
     }
 
@@ -4912,11 +5580,11 @@ class MainActivity : ComponentActivity(), Player.Listener {
 
     override fun onEvents(player: Player, events: Player.Events) {
         updatePlaying()
-        if (events.containsAny(Player.EVENT_MEDIA_ITEM_TRANSITION, Player.EVENT_IS_PLAYING_CHANGED)) {
+        if (events.containsAny(Player.EVENT_MEDIA_ITEM_TRANSITION, Player.EVENT_IS_PLAYING_CHANGED, Player.EVENT_PLAYBACK_STATE_CHANGED)) {
             if (route.screen == Screen.HOME) waveHead?.bindHero()
             if (events.contains(Player.EVENT_MEDIA_ITEM_TRANSITION)) {
                 if (route.screen != Screen.HOME) refreshRows()
-            } else {
+            } else if (events.containsAny(Player.EVENT_MEDIA_ITEM_TRANSITION, Player.EVENT_IS_PLAYING_CHANGED)) {
                 val visible = list
                 val currentId = currentTrack()?.id
                 if (visible != null) for (index in 0 until visible.childCount) {
@@ -5136,7 +5804,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
             historySource.visibility = if (route.screen == Screen.HISTORY && historySource.text.isNotBlank()) View.VISIBLE else View.GONE
             downloaded.visibility = if (saved) View.VISIBLE else View.GONE
             updateDownloadStatus(store.files.status.value)
-            state.text = if (row.number != null && track.duration > 0) timeLabel(track.duration) else ""
+            state.text = row.trailingLabel ?: if (row.number != null && track.duration > 0) timeLabel(track.duration) else ""
             more.visibility = if (selecting) View.INVISIBLE else View.VISIBLE
             val index = row.reorderIndex
             menu = if (index == null) row.menu else { anchor -> reorderActions(anchor, index) }
@@ -5201,6 +5869,30 @@ class MainActivity : ComponentActivity(), Player.Listener {
         private val ROOM_ID = Regex("[a-zA-Z0-9_-]{1,150}")
         private val SHARED_LINK = Regex("""https://music\.yandex\.(?:ru|com|kz)/[^\s<>"»]+""")
         private val TUNE_LINK = Regex("""tune://[^\s<>"»]+""")
+        private val HEADER_FADE_SCREENS = setOf(
+            Screen.DETAILS, Screen.LIKES, Screen.DISLIKES, Screen.DOWNLOADS, Screen.HISTORY,
+            Screen.ARTIST_TRACKS, Screen.ARTIST_COLLECTION, Screen.ARTIST_WAVE
+        )
+        private val TONE_CHROME_SCREENS = setOf(
+            Screen.DETAILS, Screen.ARTIST_TRACKS, Screen.ARTIST_COLLECTION, Screen.ARTIST_WAVE
+        )
+        private val WAVE_SETTING_ORDER = listOf(
+            "settingDiversity:favorite", "settingDiversity:discover", "settingDiversity:popular",
+            "settingMoodEnergy:active", "settingMoodEnergy:fun", "settingMoodEnergy:calm", "settingMoodEnergy:sad",
+            "settingLanguage:russian", "settingLanguage:not-russian", "settingLanguage:without-words",
+        )
+        private val WAVE_SETTING_LABELS = mapOf(
+            "settingDiversity:favorite" to "Любимое",
+            "settingDiversity:discover" to "Незнакомое",
+            "settingDiversity:popular" to "Популярное",
+            "settingMoodEnergy:active" to "Бодрое",
+            "settingMoodEnergy:fun" to "Весёлое",
+            "settingMoodEnergy:calm" to "Спокойное",
+            "settingMoodEnergy:sad" to "Грустное",
+            "settingLanguage:russian" to "Русский",
+            "settingLanguage:not-russian" to "Иностранный",
+            "settingLanguage:without-words" to "Без слов",
+        )
         private val FILTERS = listOf("Всё" to "track,album,artist,playlist,podcast,podcast_episode", "Треки" to "track",
             "Исполнители" to "artist", "Альбомы" to "album", "Плейлисты" to "playlist",
             "Подкасты" to "podcast", "По тексту" to "lyrics")

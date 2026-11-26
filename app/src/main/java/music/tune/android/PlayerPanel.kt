@@ -34,11 +34,15 @@ import android.widget.TextView
 import androidx.media3.common.Player
 import androidx.media3.session.SessionCommand
 import androidx.core.animation.doOnEnd
+import androidx.core.graphics.ColorUtils
 import androidx.core.graphics.Insets
 import kotlinx.coroutines.Job
+import java.text.NumberFormat
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import kotlin.math.abs
+import kotlin.math.ceil
 
 internal class PlayerPanel(private val activity: MainActivity) {
     private val ui = TuneUi(activity)
@@ -73,7 +77,16 @@ internal class PlayerPanel(private val activity: MainActivity) {
         addView(lyricStatus, FrameLayout.LayoutParams(-1, -1))
     }
     private val elapsed = ui.text("0:00", 12, Palette.muted).apply { fontFeatureSettings = "tnum" }
-    private val duration = ui.text("0:00", 12, Palette.muted).apply { fontFeatureSettings = "tnum" }
+    private var showRemaining = store.preferences.getBoolean("playerRemainingTime", false)
+    private val duration = ui.text("0:00", 12, Palette.muted).apply {
+        fontFeatureSettings = "tnum"
+        setPadding(ui.dp(6), ui.dp(2), 0, ui.dp(2))
+        setOnClickListener {
+            showRemaining = !showRemaining
+            store.preferences.edit().putBoolean("playerRemainingTime", showRemaining).apply()
+            progress()
+        }
+    }
     private val seekLayers = LayerDrawable(arrayOf(
         ui.shape(0x38ffffff, 10),
         ClipDrawable(ui.shape(0x26ffffff, 10), Gravity.START, ClipDrawable.HORIZONTAL),
@@ -120,6 +133,10 @@ internal class PlayerPanel(private val activity: MainActivity) {
         addView(download, FrameLayout.LayoutParams(-1, -1))
         addView(downloadRing, FrameLayout.LayoutParams(ui.dp(22), ui.dp(22), Gravity.CENTER))
     }
+    private val statusRow = ui.row().apply {
+        gravity = Gravity.CENTER
+    }
+    private var lastStatusSignature: String? = null
     private val soundButton = ui.icon(Symbol.SETTINGS, "Настройки звука", click = ::showSound)
     private val sleepButton = ui.icon(Symbol.MOON, "Таймер сна", click = ::sleepTimer)
     private var dragging = false
@@ -190,10 +207,11 @@ internal class PlayerPanel(private val activity: MainActivity) {
         }, ui.full())
         controls.addView(ui.space(14))
         controls.addView(seek, ui.full(28))
-        controls.addView(ui.row().apply {
-            addView(elapsed, ui.weight())
-            addView(duration)
-        }, ui.full())
+        controls.addView(FrameLayout(activity).apply {
+            addView(elapsed, FrameLayout.LayoutParams(-2, -2, Gravity.START or Gravity.CENTER_VERTICAL))
+            addView(statusRow, FrameLayout.LayoutParams(-2, ui.dp(20), Gravity.CENTER))
+            addView(duration, FrameLayout.LayoutParams(-2, -2, Gravity.END or Gravity.CENTER_VERTICAL))
+        }, ui.full(22))
         controls.addView(ui.space(7))
         controls.addView(ui.row().apply {
             clipChildren = false
@@ -311,6 +329,9 @@ internal class PlayerPanel(private val activity: MainActivity) {
                 if (length > 0) {
                     val position = length * progress / 1000
                     elapsed.text = timeLabel(position)
+                    if (showRemaining) {
+                        duration.text = "-${timeLabel((length - position).coerceAtLeast(0))}"
+                    }
                     if (!dragging) player?.seekTo(position)
                 }
             }
@@ -359,6 +380,7 @@ internal class PlayerPanel(private val activity: MainActivity) {
         updateDownload()
         updateSoundButton()
         updateSleepButton()
+        updateStatusIcons()
         queueAdapter?.notifyDataSetChanged()
         progress()
     }
@@ -392,20 +414,113 @@ internal class PlayerPanel(private val activity: MainActivity) {
         activity.setIcon(sleepButton, Symbol.MOON,
             if (active) "Таймер сна включён" else "Таймер сна",
             if (active) Palette.accent else 0xd9ffffff.toInt())
+        sleepButton.background = if (active) ui.touch(0x24ffffff, 22) else ui.touch()
+        updateStatusIcons()
+    }
+
+    private fun updateStatusIcons() {
+        val track = activity.currentTrack() ?: return
+        val uid = store.profile.value?.uid
+        val edition = uid?.let { store.files.selectedVersion(it, track.id) } ?: "auto"
+        val hasUncensor = uid != null && (
+            (store.allowsAlternate(uid, track.id) && store.versions.hasAudio(track.id)) ||
+                track.alternate ||
+                store.files.hasReplacement(track)
+            )
+        val uncensored = when (edition) {
+            "original" -> false
+            "alternate", "local" -> hasUncensor
+            else -> hasUncensor
+        }
+        val canSwitch = track.originalAvailable != false && !track.unavailable
+        val hasLocal = store.files.hasReplacement(track)
+        val soundActive = soundIsAdjusted(store.preferences)
+        val speed = store.preferences.getFloat("speed", 1f).coerceIn(.5f, 2f)
+        val speedChanged = abs(speed - 1f) > 0.001f
+        val sleep = store.sleepTimer.value
+        val sleepMinutes = sleep.stopAtMs?.let {
+            ceil((it - System.currentTimeMillis()) / 60_000.0).toInt().coerceAtLeast(1)
+        }
+        val sig = "$hasUncensor:$uncensored:$canSwitch:$hasLocal:$soundActive:$speed:$sleepMinutes:${sleep.afterTrack}"
+        if (sig == lastStatusSignature) return
+        lastStatusSignature = sig
+
+        statusRow.removeAllViews()
+        if (!hasUncensor && !soundActive && !sleep.active) return
+
+        val accentBg = ColorUtils.setAlphaComponent(Palette.accent, 46)
+        val dimBg = 0x1fffffff
+        val dimTint = 0xa6ffffff.toInt()
+        fun addPill(symbol: Symbol, text: String?, active: Boolean, enabled: Boolean = true, label: String, click: () -> Unit) {
+            val tint = if (active) Palette.accent else dimTint
+            val pill = ui.row().apply {
+                gravity = Gravity.CENTER
+                setPadding(ui.dp(7), 0, ui.dp(7), 0)
+                background = if (enabled) ui.touch(if (active) accentBg else dimBg, 10)
+                else ui.shape(if (active) accentBg else dimBg, 10)
+                contentDescription = label
+                isEnabled = enabled
+                isFocusable = enabled
+                if (enabled) pressFeedback(.92f)
+                addView(IconView(activity, symbol, tint).apply { iconSize = 11 },
+                    LinearLayout.LayoutParams(ui.dp(12), ui.dp(12)))
+                if (!text.isNullOrEmpty()) {
+                    addView(ui.line(text, 10, tint, bold = true).apply {
+                        fontFeatureSettings = "tnum"
+                    }, LinearLayout.LayoutParams(-2, -2).apply { marginStart = ui.dp(3) })
+                }
+                if (enabled) setOnClickListener { click() }
+            }
+            statusRow.addView(pill, LinearLayout.LayoutParams(-2, ui.dp(20)).apply {
+                if (statusRow.childCount > 0) marginStart = ui.dp(6)
+            })
+        }
+
+        if (hasUncensor) {
+            addPill(
+                if (uncensored) Symbol.UNLOCK else Symbol.LOCK,
+                null,
+                active = uncensored,
+                enabled = canSwitch || hasLocal,
+                label = if (uncensored) "Версия без цензуры" else "Версия Яндекса",
+            ) {
+                if (hasLocal) {
+                    activity.chooseVersion(track)
+                } else {
+                    store.files.selectVersion(track, if (uncensored) "original" else "alternate")
+                    activity.reloadVersion(track.id)
+                    updateStatusIcons()
+                }
+            }
+        }
+        if (soundActive) {
+            val speedLabel = if (speedChanged) {
+                NumberFormat.getNumberInstance(Locale.forLanguageTag("ru")).apply {
+                    maximumFractionDigits = 2
+                }.format(speed) + "×"
+            } else null
+            addPill(Symbol.SETTINGS, speedLabel, active = true, label = "Настройки звука", click = ::showSound)
+        }
+        if (sleep.active) {
+            val sleepLabel = sleepMinutes?.let { "${it}м" } ?: if (sleep.afterTrack) "1" else null
+            addPill(Symbol.MOON, sleepLabel, active = true, label = "Таймер сна", click = ::sleepTimer)
+        }
     }
 
     fun progress() {
         val player = player ?: return
         val length = player.duration.takeIf { it > 0 } ?: activity.currentTrack()?.duration ?: 0
-        val total = timeLabel(length)
-        if (duration.text != total) duration.text = total
+        val currentPos = player.currentPosition.coerceIn(0, length.coerceAtLeast(0))
+        val total = if (showRemaining && length > 0) "-${timeLabel((length - currentPos).coerceAtLeast(0))}" else timeLabel(length)
+        if (!dragging && duration.text != total) duration.text = total
         seek.isEnabled = length > 0 && player.isCurrentMediaItemSeekable
         if (!dragging) {
             val position = timeLabel(player.currentPosition)
             if (elapsed.text != position) elapsed.text = position
             seek.progress = if (length > 0) (player.currentPosition * 1000 / length).toInt().coerceIn(0, 1000) else 0
-            seek.secondaryProgress = if (length > 0) (player.bufferedPosition * 1000 / length).toInt().coerceIn(0, 1000) else 0
+            seek.secondaryProgress = if (length > 0) (player.bufferedPosition * 1000 / length).toInt().coerceAtLeast(0).coerceAtMost(1000) else 0
         }
+        if (store.sleepTimer.value.stopAtMs != null) updateStatusIcons()
         if (!showingLyrics || !timedLyrics) return
         val now = player.currentPosition + 250
         val index = lyrics.indexOfLast { it.position?.let { position -> position <= now } == true }
@@ -498,6 +613,7 @@ internal class PlayerPanel(private val activity: MainActivity) {
         } else finishLyricsTransition()
         activity.setIcon(lyricButton, Symbol.LYRICS, if (showingLyrics) "Показать обложку" else "Текст песни",
             if (showingLyrics) Palette.accent else Palette.text)
+        lyricButton.background = if (showingLyrics) ui.touch(0x24ffffff, 22) else ui.touch()
         if (showingLyrics) loadLyrics(track)
         else lyricJob?.cancel()
     }
@@ -672,8 +788,11 @@ internal class PlayerPanel(private val activity: MainActivity) {
     }
 
     private fun updateSoundButton() {
+        val active = soundIsAdjusted(store.preferences)
         activity.setIcon(soundButton, Symbol.SETTINGS, "Настройки звука",
-            if (soundIsAdjusted(store.preferences)) Palette.accent else 0xd9ffffff.toInt())
+            if (active) Palette.accent else 0xd9ffffff.toInt())
+        soundButton.background = if (active) ui.touch(0x24ffffff, 22) else ui.touch()
+        updateStatusIcons()
     }
 
     @android.annotation.SuppressLint("ClickableViewAccessibility")
@@ -877,7 +996,9 @@ internal class PlayerPanel(private val activity: MainActivity) {
                         }.apply { iconSize = 18 }, LinearLayout.LayoutParams(ui.dp(36), ui.dp(40)))
                         else addView(View(activity), LinearLayout.LayoutParams(ui.dp(36), ui.dp(40)))
                     } else {
-                        if (current) addView(PlayingBars(activity, Palette.accent).apply { running = player.isPlaying },
+                        if (current) addView(PlayingBars(activity, Palette.accent).apply {
+                            running = player.isPlaying || (player.playWhenReady && player.playbackState == Player.STATE_BUFFERING)
+                        },
                             LinearLayout.LayoutParams(ui.dp(18), ui.dp(18)).apply { marginStart = ui.dp(6) })
                         setOnClickListener { player.seekToDefaultPosition(position); player.play() }
                         setOnLongClickListener { queueMenu(position); true }

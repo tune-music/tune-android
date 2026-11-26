@@ -79,6 +79,7 @@ internal class MusicStore(val context: Context) {
     val externalLyrics = ExternalLyrics(this)
     private val searchCache = SearchCache(context.cacheDir)
     private val artistCoverCache = java.util.concurrent.ConcurrentHashMap<String, String>()
+    private val trackFiltersMemory = java.util.concurrent.ConcurrentHashMap<String, List<TrackFilter>>()
     @Volatile private var artistCoverCacheLoaded = false
     @Volatile private var token: String? = preferences.getString("activeAccount", null)?.let(vault::read) ?: vault.read()
 
@@ -199,6 +200,7 @@ internal class MusicStore(val context: Context) {
 
     private fun activate(account: Profile, value: String) {
         automaticDownloads?.cancel()
+        trackFiltersMemory.clear()
         token = value
         setProfile(account)
         offline = false
@@ -230,6 +232,7 @@ internal class MusicStore(val context: Context) {
         }
         files.switchUser(null)
         waveExtras.resetUser(null)
+        trackFiltersMemory.clear()
         uploads.resume()
         offline = false
         preferences.edit().remove("profile").remove("activeAccount").apply()
@@ -549,6 +552,36 @@ internal class MusicStore(val context: Context) {
 
     private fun dataCache(uid: String, key: String) =
         AtomicFile(File(context.cacheDir, "data-${digest("$uid:$key")}.json"))
+
+    private fun trackFiltersFile(uid: String, place: String) =
+        AtomicFile(File(context.cacheDir, "filters-${digest("$uid:$place")}.json"))
+
+    fun cachedTrackFilters(place: String): List<TrackFilter>? {
+        val uid = profile.value?.uid ?: return null
+        val key = "$uid:$place"
+        trackFiltersMemory[key]?.let { return it }
+        val file = trackFiltersFile(uid, place)
+        val loaded = optional {
+            JSONArray(file.readFully().toString(Charsets.UTF_8)).objects().mapNotNull { entry ->
+                val id = entry.text("id") ?: return@mapNotNull null
+                val name = entry.text("name") ?: return@mapNotNull null
+                val ids = entry.arr("trackIds").items().mapNotNull(Any?::asId).toSet()
+                TrackFilter(id, name, ids)
+            }
+        } ?: return null
+        trackFiltersMemory[key] = loaded
+        return loaded
+    }
+
+    fun saveTrackFilters(place: String, filters: List<TrackFilter>) {
+        val uid = profile.value?.uid ?: return
+        trackFiltersMemory["$uid:$place"] = filters
+        val encoded = JSONArray(filters.map { filter ->
+            JSONObject().put("id", filter.id).put("name", filter.name).put("trackIds", JSONArray(filter.trackIds.toList()))
+        }).toString()
+        val file = trackFiltersFile(uid, place)
+        scope.launch(Dispatchers.IO) { optional { file.writeText(encoded) } }
+    }
 
     suspend fun collection(kind: Kind, onCached: ((List<Card>) -> Unit)? = null): List<Card> {
         val uid = requireUser().uid

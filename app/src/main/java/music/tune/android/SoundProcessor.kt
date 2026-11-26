@@ -41,6 +41,63 @@ internal data class PcmTuning(
     val active = preamp != 1f || reverb > 0f || eightD || gains.any { it != 0f }
 }
 
+internal object AudioMeter {
+    @Volatile private var level = 0f
+    @Volatile private var bass = 0f
+    @Volatile private var updatedNs = 0L
+    private var bassFilter = 0f
+
+    fun reset() {
+        level = 0f
+        bass = 0f
+        updatedNs = 0L
+        bassFilter = 0f
+    }
+
+    fun sample(buffer: ByteBuffer, channels: Int) {
+        if (channels <= 0 || !buffer.hasRemaining()) return
+        val copy = buffer.duplicate().order(ByteOrder.nativeOrder())
+        val frameBytes = channels * 2
+        val totalFrames = copy.remaining() / frameBytes
+        if (totalFrames <= 0) return
+
+        val stride = 4
+        var sumSq = 0.0
+        var bassSq = 0.0
+        var count = 0
+        var lp = bassFilter
+        var frameIndex = 0
+        while (frameIndex < totalFrames) {
+            val bytePos = copy.position() + frameIndex * frameBytes
+            var mono = 0f
+            for (ch in 0 until channels) {
+                mono += copy.getShort(bytePos + ch * 2) / 32768f
+            }
+            mono /= channels
+            lp += (mono - lp) * .12f
+            sumSq += (mono * mono).toDouble()
+            bassSq += (lp * lp).toDouble()
+            count++
+            frameIndex += stride
+        }
+        bassFilter = lp
+        if (count == 0) return
+        val rms = sqrt(sumSq / count).toFloat()
+        val bassRms = sqrt(bassSq / count).toFloat()
+        level = (rms * 2.8f).coerceIn(0f, 1f)
+        bass = (bassRms * 3.6f).coerceIn(0f, 1f)
+        updatedNs = System.nanoTime()
+    }
+
+    fun snapshot(): Triple<Float, Float, Boolean> {
+        val stamp = updatedNs
+        if (stamp == 0L || (System.nanoTime() - stamp) >= 350_000_000L) {
+            return Triple(0f, 0f, false)
+        }
+        return Triple(level, bass, true)
+    }
+}
+
 @OptIn(UnstableApi::class)
 internal class SoundProcessor(private val tuning: () -> PcmTuning) : BaseAudioProcessor() {
     private var renderer: SoundDsp? = null
@@ -78,6 +135,7 @@ internal class SoundProcessor(private val tuning: () -> PcmTuning) : BaseAudioPr
             if (inputBuffer.hasRemaining()) output.put(inputBuffer)
         }
         output.flip()
+        AudioMeter.sample(output, inputAudioFormat.channelCount)
     }
 }
 

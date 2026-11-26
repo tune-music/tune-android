@@ -6,14 +6,10 @@ import android.content.res.ColorStateList
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.CornerPathEffect
-import android.graphics.LinearGradient
-import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.PixelFormat
-import android.graphics.RadialGradient
 import android.graphics.RectF
-import android.graphics.Shader
 import android.graphics.Typeface
 import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
@@ -302,7 +298,7 @@ internal enum class Symbol {
     LYRICS, REPEAT, REPEAT_ONE, SHUFFLE, CLOCK, HISTORY, ADD, CLOSE, MINUS_CIRCLE, SHARE,
     ARROW_UP, ARROW_DOWN, ARROW_UP_LEFT, VIDEO, CONCERT, LINK, OUTPUT, MOON, THUMB_DOWN, THUMB_DOWN_FILLED,
     ACCOUNT, PERSON_MINUS, GEAR, STATS, TRASH, EDIT, FILTER, SORT, REORDER, PHOTO, SPEAKER, CIRCLE, CHECK_CIRCLE,
-    FILE, DOWNLOAD_CIRCLE, UNLOCK, EYE_OFF, WIFI_OFF, MIC_MUSIC, MIC, BOOK, BALLOON, GRID
+    FILE, DOWNLOAD_CIRCLE, LOCK, UNLOCK, EYE_OFF, WIFI_OFF, MIC_MUSIC, MIC, BOOK, BALLOON, GRID
 }
 
 internal class IconView(context: Context, var symbol: Symbol, var tint: Int) : View(context) {
@@ -570,6 +566,9 @@ internal class IconView(context: Context, var symbol: Symbol, var tint: Int) : V
             Symbol.CHECK_CIRCLE -> { circle(12, 12, 8.5f); shape(8, 12, 11, 15, 16, 9) }
             Symbol.FILE -> { shape(5, 3, 15, 3, 20, 8, 20, 21, 5, 21, close = true); shape(15, 3, 15, 8, 20, 8); line(8, 12, 16, 12); line(8, 16, 16, 16) }
             Symbol.DOWNLOAD_CIRCLE -> { circle(12, 12, 9); line(12, 7.5f, 12, 15.5f); shape(8.5f, 12.2f, 12, 15.8f, 15.5f, 12.2f) }
+            Symbol.LOCK -> { canvas.drawRoundRect(5f, 10f, 19f, 22f, 2f, 2f, paint)
+                path.rewind(); path.moveTo(8f, 10f); path.lineTo(8f, 7f); path.cubicTo(8f, 2.5f, 16f, 2.5f, 16f, 7f); path.lineTo(16f, 10f); canvas.drawPath(path, paint)
+                line(12, 15, 12, 18) }
             Symbol.UNLOCK -> { canvas.drawRoundRect(5f, 10f, 19f, 22f, 2f, 2f, paint)
                 path.rewind(); path.moveTo(8f, 10f); path.lineTo(8f, 6f); path.cubicTo(8f, 1f, 17f, 1f, 17f, 6f); canvas.drawPath(path, paint)
                 line(12, 15, 12, 18) }
@@ -622,77 +621,6 @@ internal class IconView(context: Context, var symbol: Symbol, var tint: Int) : V
             }
         }
         canvas.restore()
-    }
-}
-
-internal class WaveBackdrop(private val activity: MainActivity, private val backgroundColor: Int) : View(activity) {
-    private val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.DITHER_FLAG)
-    private val motion = activity.playbackMotion
-    private val visibleBounds = android.graphics.Rect()
-    private val density = resources.displayMetrics.density
-    private val speeds = doubleArrayOf(0.69, 0.42, 0.53)
-    private val matrix = Matrix()
-    private val glows = intArrayOf(0xffffb81f.toInt(), 0xffff6e14.toInt(), 0xffe8400d.toInt()).map { color ->
-        RadialGradient(0f, 0f, 1f, intArrayOf(ColorUtils.setAlphaComponent(color, 148),
-            ColorUtils.setAlphaComponent(color, 56), Color.TRANSPARENT), null, Shader.TileMode.CLAMP)
-    }
-    private var fade: LinearGradient? = null
-    private var lastFrame: Long? = null
-    private var phase = 0.0
-    init { motion.observe(this) }
-
-    var playing = false
-        set(value) {
-            if (field != value) {
-                field = value
-                lastFrame = null
-                invalidate()
-            }
-        }
-
-    override fun onSizeChanged(width: Int, height: Int, oldWidth: Int, oldHeight: Int) {
-        super.onSizeChanged(width, height, oldWidth, oldHeight)
-        fade = if (height > 0) LinearGradient(0f, 0f, 0f, height.toFloat(),
-            intArrayOf(backgroundColor, Color.TRANSPARENT, Color.TRANSPARENT, backgroundColor),
-            floatArrayOf(0f, .22f, .72f, 1f), Shader.TileMode.CLAMP) else null
-    }
-
-    fun resumeIfPlaying() {
-        if (playing) invalidate()
-    }
-
-    override fun onVisibilityAggregated(isVisible: Boolean) {
-        super.onVisibilityAggregated(isVisible)
-        lastFrame = null
-        if (isVisible) invalidate()
-    }
-
-    override fun onDraw(canvas: Canvas) {
-        val animated = playing && motion.enabled && !activity.hasOverlay && isShown && windowVisibility == VISIBLE && getLocalVisibleRect(visibleBounds)
-        if (animated) {
-            val now = android.os.SystemClock.uptimeMillis()
-            lastFrame?.let { phase += (now - it) / 1000.0 }
-            lastFrame = now
-        } else lastFrame = null
-        val radius = minOf(width * .53f, 208f * density)
-        for (index in glows.indices) {
-            val angle = phase * speeds[index] + index * 2.1
-            val x = width / 2f + kotlin.math.cos(angle).toFloat() * radius * .4f
-            val y = height * .44f + kotlin.math.sin(angle * 1.2).toFloat() * radius * .24f
-            val spread = radius * (.82f + .1f * kotlin.math.sin(angle + 1).toFloat())
-            matrix.setScale(spread, spread)
-            matrix.postTranslate(x, y)
-            val glow = glows[index]
-            glow.setLocalMatrix(matrix)
-            paint.shader = glow
-            canvas.drawCircle(x, y, spread, paint)
-        }
-        fade?.let {
-            paint.shader = it
-            canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), paint)
-        }
-        paint.shader = null
-        if (animated) postInvalidateOnAnimation()
     }
 }
 
@@ -848,6 +776,7 @@ internal class TuneRefreshLayout(
     ui: TuneUi,
     private val list: ListView,
     private val canRefresh: () -> Boolean = { true },
+    private val onPullOffset: ((Float) -> Unit)? = null,
     private val onRefresh: () -> Unit,
 ) : FrameLayout(ui.context) {
     private val slop = ViewConfiguration.get(ui.context).scaledTouchSlop.toFloat()
@@ -913,6 +842,7 @@ internal class TuneRefreshLayout(
                 list.animate().cancel()
                 pill.animate().cancel()
                 list.translationY = pull
+                onPullOffset?.invoke(pull)
                 pill.visibility = if (pull > 2f) View.VISIBLE else View.GONE
                 pill.translationY = (pull - pillOffset).coerceAtLeast(0f)
                 pill.alpha = progress
@@ -931,7 +861,8 @@ internal class TuneRefreshLayout(
                 pulling = false
                 if (event.actionMasked == MotionEvent.ACTION_UP && primed) {
                     refreshing = true
-                    list.animate().translationY(resting).setDuration(180).start()
+                    list.animate().translationY(resting).setDuration(180)
+                        .setUpdateListener { onPullOffset?.invoke(list.translationY) }.start()
                     pill.animate().translationY(resting - pillOffset).alpha(1f).scaleX(1f).scaleY(1f).setDuration(180).start()
                     onRefresh()
                 } else {
@@ -944,7 +875,10 @@ internal class TuneRefreshLayout(
 
     private fun reset() {
         primed = false
-        list.animate().translationY(0f).setDuration(200).start()
+        list.animate().translationY(0f).setDuration(200)
+            .setUpdateListener { onPullOffset?.invoke(list.translationY) }
+            .withEndAction { onPullOffset?.invoke(0f) }
+            .start()
         pill.animate().translationY(-pillOffset).alpha(0f).scaleX(.75f).scaleY(.75f).setDuration(180)
             .withEndAction { if (!pulling && !refreshing) pill.visibility = View.GONE }
             .start()
