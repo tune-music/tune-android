@@ -1,6 +1,10 @@
 package music.tune.android
 
 import android.annotation.SuppressLint
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.database.ContentObserver
 import android.graphics.BlurMaskFilter
 import android.graphics.Canvas
@@ -20,6 +24,7 @@ import android.os.Looper
 import android.os.SystemClock
 import android.provider.Settings
 import android.view.View
+import androidx.core.content.ContextCompat
 import androidx.core.graphics.ColorUtils
 import kotlin.math.abs
 import kotlin.math.cos
@@ -133,20 +138,21 @@ internal class WaveBackdrop(
     private val visibleBounds = Rect()
     private val density = resources.displayMetrics.density
     private val addMode = if (light) null else PorterDuffXfermode(PorterDuff.Mode.ADD)
+    private val screenMode = if (light) null else PorterDuffXfermode(PorterDuff.Mode.SCREEN)
 
     private val blobPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.DITHER_FLAG).apply {
-        xfermode = addMode
+        xfermode = screenMode
     }
     private val contourFillPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.DITHER_FLAG).apply {
         style = Paint.Style.FILL
-        xfermode = addMode
+        xfermode = screenMode
         maskFilter = BlurMaskFilter((if (light) 12f else 18f) * density, BlurMaskFilter.Blur.NORMAL)
     }
     private val contourStrokePaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.DITHER_FLAG).apply {
         style = Paint.Style.STROKE
         strokeCap = Paint.Cap.ROUND
         strokeJoin = Paint.Join.ROUND
-        xfermode = addMode
+        xfermode = screenMode
         maskFilter = BlurMaskFilter((if (light) 12f else 18f) * density, BlurMaskFilter.Blur.NORMAL)
     }
     private val ribbonGlowPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.DITHER_FLAG).apply {
@@ -177,6 +183,8 @@ internal class WaveBackdrop(
 
     private var phase = 0.0
     private var lastFrameMs: Long? = null
+    private var stateInitialized = false
+    private var lastVolumePollMs = 0L
     private var systemVolume = 0.5f
     private var energy = 0.5f
     private var activityLevel = 0f
@@ -192,6 +200,12 @@ internal class WaveBackdrop(
     private val volumeObserver = object : ContentObserver(Handler(Looper.getMainLooper())) {
         override fun onChange(selfChange: Boolean) = refreshVolume()
     }
+    private var volumeReceiverRegistered = false
+    private val volumeReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            refreshVolume()
+        }
+    }
 
     init {
         motion.observe(this)
@@ -203,7 +217,6 @@ internal class WaveBackdrop(
         set(value) {
             if (field != value) {
                 field = value
-                lastFrameMs = null
                 invalidate()
             }
         }
@@ -213,7 +226,7 @@ internal class WaveBackdrop(
             if (lastWaveKey != key && lastWaveKey.isNotEmpty()) {
                 surge = min(1f, surge + 0.5f)
             }
-            val initial = lastWaveKey.isEmpty()
+            val initial = !stateInitialized && lastWaveKey.isEmpty()
             lastWaveKey = key
             waveHex = hex
             targetPalette = WavePalette.fromHex(hex, light)
@@ -234,7 +247,6 @@ internal class WaveBackdrop(
     }
 
     fun resumeIfPlaying() {
-        lastFrameMs = null
         refreshVolume()
         invalidate()
     }
@@ -246,7 +258,7 @@ internal class WaveBackdrop(
         return (manager.getStreamVolume(AudioManager.STREAM_MUSIC).toFloat() / maxVol).coerceIn(0f, 1f)
     }
 
-    private fun volumeTarget(): Float = systemVolume.coerceIn(0f, 1f).pow(0.85f)
+    private fun volumeTarget(): Float = systemVolume.coerceIn(0f, 1f).pow(1.25f)
 
     override fun onAttachedToWindow() {
         super.onAttachedToWindow()
@@ -257,12 +269,27 @@ internal class WaveBackdrop(
                 volumeObserverRegistered = true
             }
         }
+        if (!volumeReceiverRegistered) {
+            optional {
+                ContextCompat.registerReceiver(
+                    context,
+                    volumeReceiver,
+                    IntentFilter("android.media.VOLUME_CHANGED_ACTION"),
+                    ContextCompat.RECEIVER_EXPORTED,
+                )
+                volumeReceiverRegistered = true
+            }
+        }
     }
 
     override fun onDetachedFromWindow() {
         if (volumeObserverRegistered) {
             optional { context.contentResolver.unregisterContentObserver(volumeObserver) }
             volumeObserverRegistered = false
+        }
+        if (volumeReceiverRegistered) {
+            optional { context.unregisterReceiver(volumeReceiver) }
+            volumeReceiverRegistered = false
         }
         lastFrameMs = null
         super.onDetachedFromWindow()
@@ -339,10 +366,12 @@ internal class WaveBackdrop(
     }
 
     private fun stepAnimation(animated: Boolean) {
-        val targetAct = if (playing) 1f else 0f
-        val targetEn = volumeTarget()
+        val now = SystemClock.uptimeMillis()
         if (!animated) {
             lastFrameMs = null
+            stateInitialized = true
+            val targetAct = if (playing) 1f else 0f
+            val targetEn = volumeTarget()
             energy = targetEn
             activityLevel = targetAct
             palette.copyFrom(targetPalette)
@@ -352,14 +381,28 @@ internal class WaveBackdrop(
             return
         }
 
-        val now = SystemClock.uptimeMillis()
-        val dt = lastFrameMs?.let { ((now - it) / 1000f).coerceIn(0f, 0.05f) } ?: 0f
+        if (now - lastVolumePollMs >= 60L) {
+            lastVolumePollMs = now
+            systemVolume = readSystemVolume()
+        }
+        val targetAct = if (playing) 1f else 0f
+        val targetEn = volumeTarget()
+        if (!stateInitialized) {
+            stateInitialized = true
+            energy = targetEn
+            activityLevel = targetAct
+            palette.copyFrom(targetPalette)
+            lastFrameMs = now
+            return
+        }
+
+        val dt = lastFrameMs?.let { ((now - it) / 1000f).coerceIn(0f, 0.05f) } ?: 0.016f
         lastFrameMs = now
         if (dt > 0f) {
-            energy += (targetEn - energy) * min(1f, dt * 6.5f)
-            activityLevel += (targetAct - activityLevel) * min(1f, dt * 3.2f)
-            palette.lerpTo(targetPalette, min(1f, dt * 3.0f))
-            surge *= exp(-dt * 2.6f)
+            energy += (targetEn - energy) * min(1f, dt * 9.0f)
+            activityLevel += (targetAct - activityLevel) * min(1f, dt * 2.8f)
+            palette.lerpTo(targetPalette, min(1f, dt * 2.6f))
+            surge *= exp(-dt * 2.4f)
 
             val targetAudio: Float
             val targetBass: Float
@@ -387,10 +430,6 @@ internal class WaveBackdrop(
             val idleSpeed = 0.22 + 0.10 * energy
             val activeSpeed = (0.35 + 0.85 * energy + 0.75 * audioLevel * (0.25f + 0.75f * energy)) * activityLevel
             phase += dt * (idleSpeed + activeSpeed)
-        } else {
-            energy = targetEn
-            activityLevel = targetAct
-            palette.copyFrom(targetPalette)
         }
     }
 
@@ -407,10 +446,10 @@ internal class WaveBackdrop(
         val time = phase
         val en = energy
         val act = activityLevel
-        val volScale = 0.22f + 0.78f * en
+        val volScale = 0.14f + 0.86f * en
         val sonic = audioLevel * volScale * act
         val kick = audioBass * volScale * act
-        val power = (0.24f + 0.34f * en) + (0.22f + 0.32f * en) * act + 0.28f * sonic + 0.16f * surge
+        val power = (0.16f + 0.26f * en) + (0.08f + 0.46f * en) * act + 0.30f * sonic + 0.16f * surge
         val cx = w * 0.5f
         val cy = h * 0.48f
         val maxSpread = min(w * 0.52f, h * 0.42f)
@@ -428,7 +467,7 @@ internal class WaveBackdrop(
             matrix.postTranslate(bx, by)
             shader.setLocalMatrix(matrix)
             blobPaint.shader = shader
-            blobPaint.alpha = (((if (light) 0.48f else 0.40f) * power).coerceIn(0f, 1f) * 255f).toInt()
+            blobPaint.alpha = (((if (light) 0.46f else 0.38f) * power).coerceIn(0f, 1f) * 255f).toInt()
             canvas.drawCircle(bx, by, radius, blobPaint)
         }
         blobPaint.shader = null
@@ -438,9 +477,9 @@ internal class WaveBackdrop(
         val secondaryColor = shaderColors[1]
         val contourAmp = 0.04f + 0.05f * act + 0.11f * kick + 0.06f * surge
         drawContour(canvas, cx, cy, w, h, maxSpread, en, kick, time, 0.41f, 0.20f, 1.0, 0.0, primaryColor,
-            (if (light) 0.46f else 0.40f) * power, contourAmp)
+            (if (light) 0.40f else 0.32f) * power, contourAmp)
         drawContour(canvas, cx, cy, w, h, maxSpread, en, kick, time, 0.34f, 0.16f, -0.82, 1.9, secondaryColor,
-            (if (light) 0.38f else 0.34f) * power, contourAmp)
+            (if (light) 0.34f else 0.27f) * power, contourAmp)
 
         // 3. Шёлковые акустические нити с плавным затуханием к краям
         val ribbonAmp = (4.5f + 4.5f * en + 12f * sonic + 14f * kick + 8f * surge) * density
@@ -454,12 +493,12 @@ internal class WaveBackdrop(
             shader.setLocalMatrix(matrix)
 
             ribbonGlowPaint.shader = shader
-            ribbonGlowPaint.alpha = (((if (light) 0.44f else 0.48f) * power).coerceIn(0f, 1f) * 255f).toInt()
+            ribbonGlowPaint.alpha = (((if (light) 0.40f else 0.36f) * power).coerceIn(0f, 1f) * 255f).toInt()
             ribbonGlowPaint.strokeWidth = RIBBON_WIDTH[i] * 3.2f * density
             canvas.drawPath(path, ribbonGlowPaint)
 
             ribbonCorePaint.shader = shader
-            ribbonCorePaint.alpha = (((if (light) 0.82f else 0.68f) * power).coerceIn(0f, 1f) * 255f).toInt()
+            ribbonCorePaint.alpha = (((if (light) 0.78f else 0.58f) * power).coerceIn(0f, 1f) * 255f).toInt()
             ribbonCorePaint.strokeWidth = RIBBON_WIDTH[i] * (if (light) 1.25f else 1f) * density
             canvas.drawPath(path, ribbonCorePaint)
         }
@@ -480,7 +519,7 @@ internal class WaveBackdrop(
             matrix.postTranslate(px, py)
             shader.setLocalMatrix(matrix)
             sparkPaint.shader = shader
-            sparkPaint.alpha = (((if (light) 0.58f else 0.52f) * power * pulse).coerceIn(0f, 1f) * 255f).toInt()
+            sparkPaint.alpha = (((if (light) 0.54f else 0.46f) * power * pulse).coerceIn(0f, 1f) * 255f).toInt()
             canvas.drawCircle(px, py, radius, sparkPaint)
         }
         sparkPaint.shader = null
@@ -529,11 +568,11 @@ internal class WaveBackdrop(
         path.close()
 
         contourFillPaint.color = color
-        contourFillPaint.alpha = ((alpha * (if (light) 0.50f else 0.42f)).coerceIn(0f, 1f) * 255f).toInt()
+        contourFillPaint.alpha = ((alpha * (if (light) 0.42f else 0.32f)).coerceIn(0f, 1f) * 255f).toInt()
         canvas.drawPath(path, contourFillPaint)
 
         contourStrokePaint.color = color
-        contourStrokePaint.alpha = (alpha.coerceIn(0f, 1f) * 255f).toInt()
+        contourStrokePaint.alpha = ((alpha * (if (light) 0.85f else 0.72f)).coerceIn(0f, 1f) * 255f).toInt()
         contourStrokePaint.strokeWidth = (9f + 7f * en + 5f * kick) * density
         canvas.drawPath(path, contourStrokePaint)
     }

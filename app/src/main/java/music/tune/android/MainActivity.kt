@@ -84,7 +84,13 @@ private class Route(val screen: Screen, var card: Card? = null, val shelf: Shelf
     var chipId: String? = null
 }
 private data class TrackListPosition(val index: Int, val offset: Int, val trackId: String?)
-private data class TrackList(val tracks: List<Track>, val context: PlayContext, val art: Symbol? = null)
+private data class TrackList(
+    val tracks: List<Track>,
+    val context: PlayContext,
+    val art: Symbol? = null,
+    val card: Card? = null,
+    val diskBytes: Long? = null,
+)
 private enum class TrackOrder(val label: String) {
     ORIGINAL("Как в списке"), TITLE("По названию"), ARTIST("По исполнителю"),
     RECENT("Сначала новые"), OLDEST("Сначала старые")
@@ -218,6 +224,9 @@ class MainActivity : ComponentActivity(), Player.Listener {
     private var listHasContent = false
     private val playbackBindings = mutableSetOf<() -> Unit>()
     private var downloadRows = emptyList<Pair<String, String?>>()
+    private var downloadsDiskBytes: Long? = null
+    private var downloadsDiskKey: Pair<Int, Int>? = null
+    private var downloadsDiskJob: Job? = null
     private var searchField: EditText? = null
     private var suggestions: LinearLayout? = null
     private var discovery: List<Shelf> = emptyList()
@@ -491,6 +500,18 @@ class MainActivity : ComponentActivity(), Player.Listener {
         accept(intent)
     }
 
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        val handled = super.dispatchKeyEvent(event)
+        if (event.keyCode == KeyEvent.KEYCODE_VOLUME_UP ||
+            event.keyCode == KeyEvent.KEYCODE_VOLUME_DOWN ||
+            event.keyCode == KeyEvent.KEYCODE_VOLUME_MUTE
+        ) {
+            homeWaveBackdrop?.refreshVolume()
+            if (::root.isInitialized) root.post { homeWaveBackdrop?.refreshVolume() }
+        }
+        return handled
+    }
+
     private fun accept(intent: Intent) {
         if (intent.action == OPEN_PLAYER) {
             if (currentTrack() != null && ::mini.isInitialized) showPlayer() else openPlayerOnConnect = true
@@ -545,6 +566,8 @@ class MainActivity : ComponentActivity(), Player.Listener {
             closeVideo()
             closePlayer()
             pageJob?.cancel()
+        downloadsDiskJob?.cancel()
+        downloadsDiskJob = null
             waveJob?.cancel()
             suggestionJob?.cancel()
             pendingPlayback = null
@@ -790,6 +813,8 @@ class MainActivity : ComponentActivity(), Player.Listener {
         restorePosition = current.position
         pageHasRows = false
         pageJob?.cancel()
+        downloadsDiskJob?.cancel()
+        downloadsDiskJob = null
         listHasContent = false
         suggestionJob?.cancel()
         details = null
@@ -860,7 +885,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
             null
         } else {
             toolbar(current).also { bar ->
-                if (current.screen == Screen.DETAILS) detailToolbar = bar
+                if (current.screen in TONE_CHROME_SCREENS) detailToolbar = bar
                 if (homeStage == null) content.addView(bar, ui.full(56))
             }
         }
@@ -901,7 +926,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
                     override fun onScrollStateChanged(view: android.widget.AbsListView, state: Int) = Unit
                     override fun onScroll(view: android.widget.AbsListView, first: Int, visible: Int, total: Int) {
                         updateHeaderTitle(current, view, first)
-                        if (current.screen == Screen.DETAILS) updateDetailChrome()
+                        if (current.screen in TONE_CHROME_SCREENS) updateDetailChrome()
                     }
                 })
                 if (current.screen == Screen.SEARCH) setOnScrollListener(object : android.widget.AbsListView.OnScrollListener {
@@ -981,9 +1006,10 @@ class MainActivity : ComponentActivity(), Player.Listener {
         } else {
             setPadding(ui.dp(16), 0, 0, 0)
         }
-        val title = when {
-            current.screen == Screen.DETAILS || current.screen == Screen.HOME -> ""
-            current.screen == Screen.SHELF -> current.shelf?.title.orEmpty()
+        val title = when (current.screen) {
+            Screen.DETAILS, Screen.HOME -> ""
+            Screen.SHELF -> current.shelf?.title.orEmpty()
+            Screen.ARTIST_TRACKS -> current.card?.title.orEmpty().ifBlank { current.screen.label }
             else -> current.screen.label
         }
         addView(ui.line(title, if (stack.isEmpty()) 32 else 18, bold = true).also {
@@ -1586,10 +1612,13 @@ class MainActivity : ComponentActivity(), Player.Listener {
             Screen.DETAILS -> current.card?.let(::loadDetails)
             Screen.ARTIST_TRACKS -> current.card?.let { card ->
                 preloadTrackChips("artist-tracks:${card.id}")
-                loadRows {
+                val context = PlayContext("artist", card.id, card.title)
+                loadRows(loading = {
+                    listOf(Row.Layout { listHeader(emptyList(), context, null, card = card, loading = true) }, Row.Layout { ui.loadingRows() })
+                }) {
                     val tracks = store.online { artistTracks(card.id) }
                     loadTrackChips("artist-tracks:${card.id}", tracks)
-                    trackList = TrackList(tracks, PlayContext("artist", card.id, card.title))
+                    trackList = TrackList(tracks, context, card = card)
                     listRows(requireNotNull(trackList))
                 }
             }
@@ -1977,7 +2006,9 @@ class MainActivity : ComponentActivity(), Player.Listener {
             val player = controller
             val context = QueueItems.context(player?.currentMediaItem)
             val active = context.kind == "radio" && (context.item == MY_WAVE || context.item == null && context.name == "Моя волна")
-            val isAnyPlaying = player?.let { it.isPlaying || (it.playWhenReady && it.playbackState == Player.STATE_BUFFERING) } == true
+            val isAnyPlaying = player?.let {
+                it.isPlaying || (it.playWhenReady && it.playbackState != Player.STATE_ENDED && it.mediaItemCount > 0)
+            } == true
             val playingWave = active && isAnyPlaying
             val settings = WAVE_SETTING_ORDER.filter { it in store.preferences.getStringSet("waveSettings", emptySet()).orEmpty() }
             currentActive = active
@@ -2349,7 +2380,12 @@ class MainActivity : ComponentActivity(), Player.Listener {
 
     private fun loadTracks(screen: Screen) {
         val uid = userId ?: return
-        if (screen == Screen.LIKES) preloadTrackChips("likes")
+        val chipPlace = when (screen) {
+            Screen.LIKES -> "likes"
+            Screen.HISTORY -> "history"
+            else -> null
+        }
+        chipPlace?.let(::preloadTrackChips)
         val context = PlayContext(if (screen == Screen.LIKES) "playlist" else "various",
             if (screen == Screen.LIKES) "$uid:3" else null, screen.label)
         val symbol = when (screen) {
@@ -2360,7 +2396,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
         fun trackRowsForPage(tracks: List<Track>): List<Row> {
             val data = TrackList(tracks, context, symbol)
             trackList = data
-            if (screen == Screen.LIKES) loadTrackChips("likes", tracks)
+            chipPlace?.let { loadTrackChips(it, tracks) }
             return listRows(data)
         }
         loadRows(loading = {
@@ -2381,25 +2417,32 @@ class MainActivity : ComponentActivity(), Player.Listener {
         }
     }
 
-    private fun artistFamiliar(artist: Card, wave: Boolean) = loadRows {
-        val account = store.requireUser()
-        val catalog = store.versions.artistInsertions(artist.id).first.toSet()
-        val local = if (wave) store.listening.recentWave(account.uid, artist, catalog) else {
-            catalog.mapNotNull { store.versions.synthetic(it) }.filter { track ->
-                track.id in store.likes.value || track.album?.key in store.savedCards.value
+    private fun artistFamiliar(artist: Card, wave: Boolean) {
+        val chipPlace = "artist-familiar:${artist.id}:$wave"
+        preloadTrackChips(chipPlace)
+        val context = PlayContext("artist", "${artist.id}:$wave", artist.title)
+        loadRows(loading = {
+            listOf(Row.Layout { listHeader(emptyList(), context, null, card = artist, loading = true) }, Row.Layout { ui.loadingRows() })
+        }) {
+            val account = store.requireUser()
+            val catalog = store.versions.artistInsertions(artist.id).first.toSet()
+            val local = if (wave) store.listening.recentWave(account.uid, artist, catalog) else {
+                catalog.mapNotNull { store.versions.synthetic(it) }.filter { track ->
+                    track.id in store.likes.value || track.album?.key in store.savedCards.value
+                }
             }
+            val remote = try {
+                store.cachedTracks("artist-familiar:${artist.id}:$wave") { store.online { artistFamiliar(artist.id, wave) } }
+            } catch (error: java.io.IOException) {
+                if (local.isEmpty()) throw error
+                emptyList()
+            }
+            val selected = (remote + local).distinctBy { it.id }
+            loadTrackChips(chipPlace, selected)
+            val data = TrackList(selected, context, card = artist)
+            trackList = data
+            listRows(data)
         }
-        val remote = try {
-            store.cachedTracks("artist-familiar:${artist.id}:$wave") { store.online { artistFamiliar(artist.id, wave) } }
-        } catch (error: java.io.IOException) {
-            if (local.isEmpty()) throw error
-            emptyList()
-        }
-        val selected = (remote + local).distinctBy { it.id }
-        val context = PlayContext("artist", artist.id, artist.title)
-        val data = TrackList(selected, context, if (wave) Symbol.WAVE else Symbol.HEART_FILLED)
-        trackList = data
-        listRows(data)
     }
 
     private fun collection(screen: Screen) = loadRows(
@@ -2507,9 +2550,8 @@ class MainActivity : ComponentActivity(), Player.Listener {
         val displayed = if (page.card.kind == Kind.ARTIST) page.tracks else visibleTracks(page.tracks)
         return buildList {
             add(Row.Layout(cache = true) { pageHeader(page, context) })
-            if ((page.card.kind == Kind.PLAYLIST || (page.card.kind == Kind.ALBUM && !page.card.isPodcast)) &&
-                trackChips.isNotEmpty() && !reordering) {
-                add(trackChipsRow())
+            if (page.card.kind != Kind.ARTIST && !reordering) {
+                add(trackControlsRow(page.tracks, showDownloadedToggle = true))
             }
             if (page.card.kind != Kind.ARTIST && !reordering && hasActiveTrackFilter()) {
                 add(filterStatusRow(page.tracks.size, displayed.size))
@@ -2634,8 +2676,8 @@ class MainActivity : ComponentActivity(), Player.Listener {
         val gradient = SmoothGradientDrawable(ui.palette.panel, ui.palette.background)
         background = gradient
         gravity = Gravity.CENTER_HORIZONTAL
-        setPadding(ui.dp(16), ui.dp(10), ui.dp(16), ui.dp(12))
-        val size = minOf(if (artist) 190 else 220, resources.configuration.screenWidthDp - 60).coerceAtLeast(100)
+        setPadding(ui.dp(16), ui.dp(8), ui.dp(16), ui.dp(10))
+        val size = minOf(if (artist) 190 else 168, resources.configuration.screenWidthDp - 60).coerceAtLeast(100)
         addView(ui.art(card.cover, 800, artist, 18) { tone ->
             val top = if (ui.palette.light) ColorUtils.blendARGB(tone, ui.palette.background, .70f) else tone
             gradient.setColors(top, ui.palette.background)
@@ -2654,7 +2696,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
             }
         },
             LinearLayout.LayoutParams(ui.dp(size), ui.dp(size)))
-        addView(ui.space(18))
+        addView(ui.space(14))
         val kind = when (card.releaseType) {
             "single" -> "Сингл"
             "compilation" -> "Сборник"
@@ -2704,7 +2746,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
             ellipsize = android.text.TextUtils.TruncateAt.END
             setPadding(0, ui.dp(4), 0, 0)
         }) }
-        addView(ui.space(20))
+        addView(ui.space(14))
         val readyContext = context ?: run {
             addView(ui.loadingTrackControls(), ui.full())
             return@apply
@@ -2725,10 +2767,10 @@ class MainActivity : ComponentActivity(), Player.Listener {
 
     private fun updateHeaderTitle(current: Route, page: android.widget.AbsListView, first: Int) {
         val title = toolbarTitle ?: return
-        val caption = if (current.screen == Screen.DETAILS) {
-            details?.card?.title ?: current.card?.title.orEmpty()
-        } else {
-            current.screen.label
+        val caption = when (current.screen) {
+            Screen.DETAILS -> details?.card?.title ?: current.card?.title.orEmpty()
+            Screen.ARTIST_TRACKS -> current.card?.title.orEmpty().ifBlank { current.screen.label }
+            else -> current.screen.label
         }
         if (title.text != caption) title.text = caption
         val header = page.getChildAt(0)
@@ -2764,8 +2806,25 @@ class MainActivity : ComponentActivity(), Player.Listener {
         val running = store.files.status.value.values.toList()
         downloadRows = running.map { it.track.id to it.error }
         val saved = store.files.downloaded()
+        preloadTrackChips("downloads")
+        loadTrackChips("downloads", saved)
+        val diskKey = saved.size to store.files.revision.value
+        if (saved.isEmpty()) {
+            downloadsDiskBytes = 0L
+            downloadsDiskKey = diskKey
+        } else if (downloadsDiskKey != diskKey) {
+            downloadsDiskKey = diskKey
+            downloadsDiskJob?.cancel()
+            downloadsDiskJob = action(onError = {}) {
+                val total = store.files.diskUsage().sumOf { it.second }
+                downloadsDiskBytes = total
+                if (route.screen == Screen.DOWNLOADS) downloads()
+            }
+        }
+        val downloadContext = PlayContext(name = Screen.DOWNLOADS.label)
         rows(buildList {
-            add(Row.Layout { listHeader(saved, PlayContext(name = Screen.DOWNLOADS.label), Symbol.DOWNLOAD) })
+            add(Row.Layout { listHeader(saved, downloadContext, Symbol.DOWNLOAD, diskBytes = downloadsDiskBytes) })
+            add(trackControlsRow(saved, showDownloadedToggle = false))
             if (running.isNotEmpty()) {
                 val paused = store.files.paused.value
                 val active = running.any { it.error == null }
@@ -2804,7 +2863,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
                 if (displayed.isEmpty() && saved.isNotEmpty()) add(Row.Layout {
                     ui.pagePlaceholder(Symbol.SEARCH, "Ничего не найдено")
                 })
-                else addAll(trackRows(displayed, PlayContext(name = Screen.DOWNLOADS.label)))
+                else addAll(trackRows(displayed, downloadContext))
             }
         }, keepScroll = true)
     }
@@ -2830,9 +2889,9 @@ class MainActivity : ComponentActivity(), Player.Listener {
     }
 
     private fun listRows(data: TrackList): List<Row> = buildList {
-        add(Row.Layout { listHeader(data.tracks, data.context, data.art) })
-        if (trackChips.isNotEmpty() && route.screen in setOf(Screen.LIKES, Screen.ARTIST_TRACKS)) {
-            add(trackChipsRow())
+        add(Row.Layout { listHeader(data.tracks, data.context, data.art, data.card, diskBytes = data.diskBytes) })
+        if (!reordering) {
+            add(trackControlsRow(data.tracks, showDownloadedToggle = route.screen != Screen.DOWNLOADS))
         }
         val visible = visibleTracks(data.tracks)
         if (hasActiveTrackFilter()) {
@@ -2884,17 +2943,85 @@ class MainActivity : ComponentActivity(), Player.Listener {
     }
 
     private fun filterStatusRow(total: Int, visible: Int): Row.Layout = Row.Layout {
-        ui.row().apply {
-            setPadding(ui.dp(16), ui.dp(2), ui.dp(12), ui.dp(6))
-            addView(ui.line("Показано $visible из $total", 13, ui.palette.muted, bold = true).apply {
-                fontFeatureSettings = "tnum"
-            }, ui.weight())
-            addView(ui.text("Сбросить", 13, ui.palette.accentText, bold = true).apply {
-                setPadding(ui.dp(8), ui.dp(6), ui.dp(6), ui.dp(6))
-                background = ui.touch()
+        val filtered = onlyDownloaded || selectedTrackChip != null || trackFilter.isNotBlank()
+        val label = if (filtered) "Показано $visible из $total" else "Сортировка: ${trackOrder.label}"
+        ui.column().apply {
+            setPadding(ui.dp(16), 0, ui.dp(16), ui.dp(8))
+            addView(ui.row().apply {
+                setPadding(ui.dp(12), ui.dp(8), ui.dp(12), ui.dp(8))
+                background = ui.shape(ui.palette.panel, 12)
+                addView(ui.line(label, 13, ui.palette.muted).apply {
+                    fontFeatureSettings = "tnum"
+                }, ui.weight())
+                addView(ui.text("Сбросить", 13, ui.palette.accentText, bold = true).apply {
+                    setPadding(ui.dp(10), ui.dp(2), 0, ui.dp(2))
+                    background = ui.touch()
+                    isFocusable = true
+                    setOnClickListener { clearTrackFilter() }
+                })
+            }, ui.full())
+        }
+    }
+
+    private fun chooseTrackOrder(all: List<Track>) {
+        val hasDates = all.any { item -> item.addedAt != null }
+        val choices = TrackOrder.entries.filter { it !in setOf(TrackOrder.RECENT, TrackOrder.OLDEST) || hasDates }
+        val currentIdx = choices.indexOf(trackOrder).coerceAtLeast(0)
+        choose("Сортировка", choices.map { it.label }, currentIdx) {
+            trackOrder = choices[it]
+            updateTrackFilter()
+        }
+    }
+
+    private fun trackControlsRow(allTracks: List<Track>, showDownloadedToggle: Boolean = true): Row.Layout = Row.Layout {
+        val sortActive = trackOrder != TrackOrder.ORIGINAL
+        val buttons = mutableListOf<View>()
+        fun pill(icon: Symbol?, label: String, active: Boolean, iconSizeDp: Int = 12, click: () -> Unit): View {
+            val fg = if (active) Color.BLACK else ui.palette.text
+            return ui.row().apply {
+                gravity = Gravity.CENTER_VERTICAL
+                minimumHeight = ui.dp(32)
+                setPadding(ui.dp(12), 0, ui.dp(12), 0)
+                background = ui.touch(if (active) ui.palette.accent else ui.palette.lifted, 16)
+                pressFeedback(.95f)
                 isFocusable = true
-                setOnClickListener { clearTrackFilter() }
-            })
+                if (icon != null) {
+                    addView(IconView(this@MainActivity, icon, fg).apply { iconSize = iconSizeDp },
+                        LinearLayout.LayoutParams(ui.dp(iconSizeDp + 1), ui.dp(iconSizeDp + 1)).apply { marginEnd = ui.dp(5) })
+                }
+                addView(ui.line(label, 13, fg, bold = true))
+                setOnClickListener { click() }
+            }.apply {
+                layoutParams = LinearLayout.LayoutParams(-2, ui.dp(32))
+            }
+        }
+        buttons += pill(Symbol.SORT, if (sortActive) trackOrder.label else "Порядок", sortActive, iconSizeDp = 11) {
+            chooseTrackOrder(allTracks)
+        }
+        if (showDownloadedToggle) {
+            buttons += pill(Symbol.DOWNLOAD_CIRCLE, "Скачанные", onlyDownloaded, iconSizeDp = 12) {
+                onlyDownloaded = !onlyDownloaded
+                updateTrackFilter()
+            }
+        }
+        val activeChipIndexStart = buttons.size
+        trackChips.forEach { filter ->
+            buttons += pill(null, filter.name, selectedTrackChip == filter.id) {
+                selectedTrackChip = if (selectedTrackChip == filter.id) null else filter.id
+                updateTrackFilter()
+            }
+        }
+        val selectedIdx = selectedTrackChip?.let { id ->
+            trackChips.indexOfFirst { it.id == id }.takeIf { it >= 0 }?.let { activeChipIndexStart + it }
+        }
+        horizontal(buttons).apply {
+            setPadding(0, ui.dp(2), 0, ui.dp(8))
+            if (selectedIdx != null) addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+                val chip = buttons.getOrNull(selectedIdx) ?: return@addOnLayoutChangeListener
+                if (chip.right > scrollX + width || chip.left < scrollX) {
+                    scrollTo((chip.left - ui.dp(16)).coerceAtLeast(0), 0)
+                }
+            }
         }
     }
 
@@ -3063,9 +3190,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
                 }
             })
             add(MenuAction("Сортировка · ${trackOrder.label}", Symbol.FILTER) {
-                val hasDates = all.any { item -> item.addedAt != null }
-                val choices = TrackOrder.entries.filter { it !in setOf(TrackOrder.RECENT, TrackOrder.OLDEST) || hasDates }
-                choose("Сортировка", choices.map { it.label }, choices.indexOf(trackOrder)) { trackOrder = choices[it]; updateTrackFilter() }
+                chooseTrackOrder(all)
             })
             if (route.screen != Screen.DOWNLOADS) add(MenuAction(if (onlyDownloaded) "Показать все треки" else "Только скачанные", Symbol.DOWNLOAD) {
                 onlyDownloaded = !onlyDownloaded
@@ -3139,25 +3264,117 @@ class MainActivity : ComponentActivity(), Player.Listener {
         } else button(Symbol.CLOSE, "Готово", click = ::endSelection)
     }
 
-    private fun listHeader(tracks: List<Track>, context: PlayContext, symbol: Symbol?, loading: Boolean = false) = ui.column().apply {
-        gravity = Gravity.CENTER_HORIZONTAL
-        setPadding(ui.dp(16), ui.dp(8), ui.dp(16), ui.dp(16))
-        if (symbol != null) {
-            addView(ui.symbolCover(symbol, 168, 20), LinearLayout.LayoutParams(ui.dp(168), ui.dp(168)))
+    private fun listHeader(
+        tracks: List<Track>,
+        context: PlayContext,
+        symbol: Symbol?,
+        card: Card? = null,
+        loading: Boolean = false,
+        diskBytes: Long? = null,
+    ) = ui.column().apply {
+        val screen = route.screen
+        val isSystemList = screen in setOf(Screen.LIKES, Screen.DOWNLOADS, Screen.HISTORY, Screen.DISLIKES)
+        val kindLabel = when (screen) {
+            Screen.LIKES -> "Плейлист"
+            Screen.DOWNLOADS -> "На устройстве"
+            Screen.HISTORY -> "Вы слушали"
+            Screen.DISLIKES -> "Скрыто из рекомендаций"
+            Screen.ARTIST_TRACKS -> "Все треки"
+            Screen.ARTIST_COLLECTION, Screen.ARTIST_WAVE -> card?.title?.takeIf(String::isNotBlank) ?: context.name
+            else -> ""
+        }
+        val summaryText = when {
+            tracks.isEmpty() -> kindLabel.ifBlank { trackCount(0) }
+            screen == Screen.DOWNLOADS -> if (diskBytes != null && diskBytes > 0L) {
+                "${trackCount(tracks.size)} · ${fileSize(diskBytes)}"
+            } else {
+                trackCount(tracks.size)
+            }
+            else -> "${trackCount(tracks.size)} · ${durationSummary(tracks.sumOf { it.duration })}"
+        }
+        val metaColor = ColorUtils.setAlphaComponent(ui.palette.text, 153)
+        if (isSystemList) {
+            setPadding(ui.dp(16), ui.dp(8), ui.dp(16), ui.dp(10))
+            addView(ui.row().apply {
+                gravity = Gravity.CENTER_VERTICAL
+                symbol?.let {
+                    addView(ui.symbolCover(it, 82, 18).apply { elevation = ui.dp(6).toFloat() },
+                        LinearLayout.LayoutParams(ui.dp(82), ui.dp(82)))
+                }
+                addView(ui.column().apply {
+                    if (symbol != null) setPadding(ui.dp(14), 0, 0, 0)
+                    if (kindLabel.isNotBlank()) {
+                        addView(ui.line(kindLabel.uppercase(Locale.forLanguageTag("ru")), 11, metaColor, bold = true).apply {
+                            letterSpacing = .09f
+                        })
+                        addView(ui.space(4))
+                    }
+                    addView(ui.text(context.name, 24, bold = true).apply {
+                        id = DETAIL_HEADER_TITLE
+                        maxLines = 2
+                        ellipsize = android.text.TextUtils.TruncateAt.END
+                    })
+                    addView(ui.space(4))
+                    if (loading) addView(ui.loadingShape(), LinearLayout.LayoutParams(ui.dp(96), ui.dp(13)))
+                    else addView(ui.line(summaryText, 13, ui.palette.muted))
+                }, ui.weight())
+            }, ui.full())
+            addView(ui.space(12))
+            addView(if (loading) ui.loadingTrackControls() else ui.row().apply {
+                gravity = Gravity.CENTER
+                addTrackControls(this, tracks, context, downloaded = screen == Screen.DOWNLOADS) { visibleTracks(tracks) }
+            }, ui.full())
+        } else {
+            val gradient = SmoothGradientDrawable(ui.palette.panel, ui.palette.background)
+            background = gradient
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(ui.dp(16), ui.dp(8), ui.dp(16), ui.dp(10))
+            val isArtistCover = card?.kind == Kind.ARTIST ||
+                screen in setOf(Screen.ARTIST_TRACKS, Screen.ARTIST_COLLECTION, Screen.ARTIST_WAVE)
+            val coverUri = card?.cover?.takeIf(String::isNotBlank) ?: tracks.firstOrNull()?.cover
+            val coverSize = minOf(168, resources.configuration.screenWidthDp - 60).coerceAtLeast(100)
+            addView(ui.art(coverUri, 800, circle = isArtistCover, corner = 18) { tone ->
+                val top = if (ui.palette.light) ColorUtils.blendARGB(tone, ui.palette.background, .70f) else tone
+                gradient.setColors(top, ui.palette.background)
+                if (route.screen == screen && route.card?.key == card?.key) {
+                    detailTone = top
+                    updateDetailChrome()
+                }
+            }.apply {
+                elevation = ui.dp(11).toFloat()
+            }, LinearLayout.LayoutParams(ui.dp(coverSize), ui.dp(coverSize)))
             addView(ui.space(14))
-            addView(ui.text(context.name, 26, bold = true).apply {
+            if (kindLabel.isNotBlank()) {
+                addView(ui.text(kindLabel.uppercase(Locale.forLanguageTag("ru")), 11, metaColor, bold = true).apply {
+                    gravity = Gravity.CENTER
+                    letterSpacing = .09f
+                })
+                addView(ui.space(6))
+            }
+            val displayTitle = when (screen) {
+                Screen.ARTIST_TRACKS -> card?.title?.takeIf(String::isNotBlank) ?: context.name
+                Screen.ARTIST_COLLECTION, Screen.ARTIST_WAVE -> screen.label
+                else -> context.name
+            }
+            addView(ui.text(displayTitle, 26, bold = true).apply {
                 id = DETAIL_HEADER_TITLE
                 gravity = Gravity.CENTER
+                maxLines = 3
+                ellipsize = android.text.TextUtils.TruncateAt.END
             })
+            if (loading) {
+                addView(ui.space(6))
+                addView(ui.loadingShape(), LinearLayout.LayoutParams(ui.dp(102), ui.dp(13)))
+            } else if (tracks.isNotEmpty()) {
+                addView(ui.space(6))
+                addView(ui.text(summaryText, 13, ui.palette.muted).apply { gravity = Gravity.CENTER })
+            }
+            addView(ui.space(14))
+            addView(if (loading) ui.loadingTrackControls() else ui.row().apply {
+                gravity = Gravity.CENTER
+                addTrackControls(this, tracks, context) { visibleTracks(tracks) }
+            }, ui.full())
         }
-        addView(ui.space(6))
-        if (loading) addView(ui.loadingShape(), LinearLayout.LayoutParams(ui.dp(76), ui.dp(13)))
-        else addView(ui.text(trackCount(tracks.size), 13, ui.palette.muted).apply { gravity = Gravity.CENTER })
-        addView(ui.space(14))
-        addView(if (loading) ui.loadingTrackControls() else ui.row().apply {
-            gravity = Gravity.CENTER
-            addTrackControls(this, tracks, context, downloaded = symbol == Symbol.DOWNLOAD) { visibleTracks(tracks) }
-        }, ui.full())
     }
 
     private fun addTrackControls(
@@ -5637,7 +5854,13 @@ class MainActivity : ComponentActivity(), Player.Listener {
         private val ROOM_ID = Regex("[a-zA-Z0-9_-]{1,150}")
         private val SHARED_LINK = Regex("""https://music\.yandex\.(?:ru|com|kz)/[^\s<>"»]+""")
         private val TUNE_LINK = Regex("""tune://[^\s<>"»]+""")
-        private val HEADER_FADE_SCREENS = setOf(Screen.DETAILS, Screen.LIKES, Screen.DISLIKES, Screen.DOWNLOADS, Screen.HISTORY)
+        private val HEADER_FADE_SCREENS = setOf(
+            Screen.DETAILS, Screen.LIKES, Screen.DISLIKES, Screen.DOWNLOADS, Screen.HISTORY,
+            Screen.ARTIST_TRACKS, Screen.ARTIST_COLLECTION, Screen.ARTIST_WAVE
+        )
+        private val TONE_CHROME_SCREENS = setOf(
+            Screen.DETAILS, Screen.ARTIST_TRACKS, Screen.ARTIST_COLLECTION, Screen.ARTIST_WAVE
+        )
         private val WAVE_SETTING_ORDER = listOf(
             "settingDiversity:favorite", "settingDiversity:discover", "settingDiversity:popular",
             "settingMoodEnergy:active", "settingMoodEnergy:fun", "settingMoodEnergy:calm", "settingMoodEnergy:sad",
