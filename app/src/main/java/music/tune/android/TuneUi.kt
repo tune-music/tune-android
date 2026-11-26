@@ -6,14 +6,10 @@ import android.content.res.ColorStateList
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.CornerPathEffect
-import android.graphics.LinearGradient
-import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.PixelFormat
-import android.graphics.RadialGradient
 import android.graphics.RectF
-import android.graphics.Shader
 import android.graphics.Typeface
 import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
@@ -622,77 +618,6 @@ internal class IconView(context: Context, var symbol: Symbol, var tint: Int) : V
             }
         }
         canvas.restore()
-    }
-}
-
-internal class WaveBackdrop(private val activity: MainActivity, private val backgroundColor: Int) : View(activity) {
-    private val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.DITHER_FLAG)
-    private val motion = activity.playbackMotion
-    private val visibleBounds = android.graphics.Rect()
-    private val density = resources.displayMetrics.density
-    private val speeds = doubleArrayOf(0.69, 0.42, 0.53)
-    private val matrix = Matrix()
-    private val glows = intArrayOf(0xffffb81f.toInt(), 0xffff6e14.toInt(), 0xffe8400d.toInt()).map { color ->
-        RadialGradient(0f, 0f, 1f, intArrayOf(ColorUtils.setAlphaComponent(color, 148),
-            ColorUtils.setAlphaComponent(color, 56), Color.TRANSPARENT), null, Shader.TileMode.CLAMP)
-    }
-    private var fade: LinearGradient? = null
-    private var lastFrame: Long? = null
-    private var phase = 0.0
-    init { motion.observe(this) }
-
-    var playing = false
-        set(value) {
-            if (field != value) {
-                field = value
-                lastFrame = null
-                invalidate()
-            }
-        }
-
-    override fun onSizeChanged(width: Int, height: Int, oldWidth: Int, oldHeight: Int) {
-        super.onSizeChanged(width, height, oldWidth, oldHeight)
-        fade = if (height > 0) LinearGradient(0f, 0f, 0f, height.toFloat(),
-            intArrayOf(backgroundColor, Color.TRANSPARENT, Color.TRANSPARENT, backgroundColor),
-            floatArrayOf(0f, .22f, .72f, 1f), Shader.TileMode.CLAMP) else null
-    }
-
-    fun resumeIfPlaying() {
-        if (playing) invalidate()
-    }
-
-    override fun onVisibilityAggregated(isVisible: Boolean) {
-        super.onVisibilityAggregated(isVisible)
-        lastFrame = null
-        if (isVisible) invalidate()
-    }
-
-    override fun onDraw(canvas: Canvas) {
-        val animated = playing && motion.enabled && !activity.hasOverlay && isShown && windowVisibility == VISIBLE && getLocalVisibleRect(visibleBounds)
-        if (animated) {
-            val now = android.os.SystemClock.uptimeMillis()
-            lastFrame?.let { phase += (now - it) / 1000.0 }
-            lastFrame = now
-        } else lastFrame = null
-        val radius = minOf(width * .53f, 208f * density)
-        for (index in glows.indices) {
-            val angle = phase * speeds[index] + index * 2.1
-            val x = width / 2f + kotlin.math.cos(angle).toFloat() * radius * .4f
-            val y = height * .44f + kotlin.math.sin(angle * 1.2).toFloat() * radius * .24f
-            val spread = radius * (.82f + .1f * kotlin.math.sin(angle + 1).toFloat())
-            matrix.setScale(spread, spread)
-            matrix.postTranslate(x, y)
-            val glow = glows[index]
-            glow.setLocalMatrix(matrix)
-            paint.shader = glow
-            canvas.drawCircle(x, y, spread, paint)
-        }
-        fade?.let {
-            paint.shader = it
-            canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), paint)
-        }
-        paint.shader = null
-        if (animated) postInvalidateOnAnimation()
     }
 }
 

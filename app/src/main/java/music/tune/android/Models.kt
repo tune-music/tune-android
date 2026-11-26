@@ -280,7 +280,13 @@ internal data class LyricsText(
     }
 }
 internal data class Stream(val urls: List<String>, val key: String? = null, val codec: String = "mp3")
-internal data class PlayContext(val kind: String = "various", val item: String? = null, val name: String = "", val wave: String? = null)
+internal data class PlayContext(
+    val kind: String = "various",
+    val item: String? = null,
+    val name: String = "",
+    val wave: String? = null,
+    val color: String? = null,
+)
 internal data class TrackFilter(val id: String, val name: String, val trackIds: Set<String>)
 
 internal fun selectTrackFilters(raw: List<TrackFilter>, catalogIds: Set<String>): List<TrackFilter> {

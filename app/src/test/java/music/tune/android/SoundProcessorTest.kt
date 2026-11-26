@@ -91,5 +91,31 @@ class SoundProcessorTest {
         assertTrue(diff.any { it > .15f } && diff.any { it < -.15f })
     }
 
+    @Test
+    fun audioMeterSamplesDryPcmWithoutAlteringOutput() {
+        AudioMeter.reset()
+        val processor = SoundProcessor { PcmTuning() }
+        processor.configure(AudioFormat(44100, 2, C.ENCODING_PCM_16BIT))
+        processor.flush()
+        val input = pcm(2048)
+        val expected = ShortArray(2048)
+        for (i in 0 until 1024) {
+            val sample = (sin(i * 2 * PI * 90 / 44100) * 18000).roundToInt().toShort()
+            expected[i * 2] = sample
+            expected[i * 2 + 1] = sample
+            input.putShort(sample)
+            input.putShort(sample)
+        }
+        input.flip()
+        processor.queueInput(input)
+        val output = processor.output
+        assertEquals(2048 * 2, output.remaining())
+        for (value in expected) assertEquals(value, output.short)
+        val (level, bass, live) = AudioMeter.snapshot()
+        assertTrue(live)
+        assertTrue(level > .1f)
+        assertTrue(bass > .05f)
+    }
+
     private fun pcm(samples: Int) = ByteBuffer.allocateDirect(samples * 2).order(ByteOrder.nativeOrder())
 }

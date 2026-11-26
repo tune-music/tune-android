@@ -73,7 +73,16 @@ internal class PlayerPanel(private val activity: MainActivity) {
         addView(lyricStatus, FrameLayout.LayoutParams(-1, -1))
     }
     private val elapsed = ui.text("0:00", 12, Palette.muted).apply { fontFeatureSettings = "tnum" }
-    private val duration = ui.text("0:00", 12, Palette.muted).apply { fontFeatureSettings = "tnum" }
+    private var showRemaining = store.preferences.getBoolean("playerRemainingTime", false)
+    private val duration = ui.text("0:00", 12, Palette.muted).apply {
+        fontFeatureSettings = "tnum"
+        setPadding(ui.dp(6), ui.dp(2), 0, ui.dp(2))
+        setOnClickListener {
+            showRemaining = !showRemaining
+            store.preferences.edit().putBoolean("playerRemainingTime", showRemaining).apply()
+            progress()
+        }
+    }
     private val seekLayers = LayerDrawable(arrayOf(
         ui.shape(0x38ffffff, 10),
         ClipDrawable(ui.shape(0x26ffffff, 10), Gravity.START, ClipDrawable.HORIZONTAL),
@@ -311,6 +320,9 @@ internal class PlayerPanel(private val activity: MainActivity) {
                 if (length > 0) {
                     val position = length * progress / 1000
                     elapsed.text = timeLabel(position)
+                    if (showRemaining) {
+                        duration.text = "-${timeLabel((length - position).coerceAtLeast(0))}"
+                    }
                     if (!dragging) player?.seekTo(position)
                 }
             }
@@ -397,14 +409,15 @@ internal class PlayerPanel(private val activity: MainActivity) {
     fun progress() {
         val player = player ?: return
         val length = player.duration.takeIf { it > 0 } ?: activity.currentTrack()?.duration ?: 0
-        val total = timeLabel(length)
-        if (duration.text != total) duration.text = total
+        val currentPos = player.currentPosition.coerceIn(0, length.coerceAtLeast(0))
+        val total = if (showRemaining && length > 0) "-${timeLabel((length - currentPos).coerceAtLeast(0))}" else timeLabel(length)
+        if (!dragging && duration.text != total) duration.text = total
         seek.isEnabled = length > 0 && player.isCurrentMediaItemSeekable
         if (!dragging) {
             val position = timeLabel(player.currentPosition)
             if (elapsed.text != position) elapsed.text = position
             seek.progress = if (length > 0) (player.currentPosition * 1000 / length).toInt().coerceIn(0, 1000) else 0
-            seek.secondaryProgress = if (length > 0) (player.bufferedPosition * 1000 / length).toInt().coerceIn(0, 1000) else 0
+            seek.secondaryProgress = if (length > 0) (player.bufferedPosition * 1000 / length).toInt().coerceAtLeast(0).coerceAtMost(1000) else 0
         }
         if (!showingLyrics || !timedLyrics) return
         val now = player.currentPosition + 250
@@ -877,7 +890,9 @@ internal class PlayerPanel(private val activity: MainActivity) {
                         }.apply { iconSize = 18 }, LinearLayout.LayoutParams(ui.dp(36), ui.dp(40)))
                         else addView(View(activity), LinearLayout.LayoutParams(ui.dp(36), ui.dp(40)))
                     } else {
-                        if (current) addView(PlayingBars(activity, Palette.accent).apply { running = player.isPlaying },
+                        if (current) addView(PlayingBars(activity, Palette.accent).apply {
+                            running = player.isPlaying || (player.playWhenReady && player.playbackState == Player.STATE_BUFFERING)
+                        },
                             LinearLayout.LayoutParams(ui.dp(18), ui.dp(18)).apply { marginStart = ui.dp(6) })
                         setOnClickListener { player.seekToDefaultPosition(position); player.play() }
                         setOnLongClickListener { queueMenu(position); true }

@@ -71,7 +71,7 @@ internal object QueueItems {
         val data = Bundle().apply {
             putString(TRACK, track.stored().toString())
             putString(CONTEXT, JSONObject().put("kind", source.kind).put("name", source.name)
-                .put("item", source.item).put("wave", source.wave).toString())
+                .put("item", source.item).put("wave", source.wave).put("color", source.color).toString())
         }
         val builder = MediaItem.Builder().setMediaId(track.id).setMediaMetadata(MediaMetadata.Builder()
             .setTitle(track.title).setArtist(track.artistText).setAlbumTitle(track.album?.title)
@@ -93,7 +93,7 @@ internal object QueueItems {
         synchronized(contextCache) { contextCache[raw] }?.let { return it }
         return (optional {
             val data = JSONObject(raw)
-            PlayContext(data.text("kind") ?: "various", data.text("item"), data.text("name").orEmpty(), data.text("wave"))
+            PlayContext(data.text("kind") ?: "various", data.text("item"), data.text("name").orEmpty(), data.text("wave"), data.text("color"))
         } ?: PlayContext()).also { parsed ->
             synchronized(contextCache) { contextCache[raw] = parsed }
         }
@@ -690,7 +690,7 @@ class PlaybackService : MediaLibraryService(), Player.Listener {
                 val track = Track.parse(JSONObject(entry.getString("track"))) ?: return@mapNotNull null
                 val source = JSONObject(entry.getString("context"))
                 QueueItems.make(track, PlayContext(source.text("kind") ?: "various", source.text("item"),
-                    source.text("name").orEmpty(), source.text("wave")), uid)
+                    source.text("name").orEmpty(), source.text("wave"), source.text("color")), uid)
             }
         }.orEmpty()
         if (items.isEmpty()) return
