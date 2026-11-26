@@ -566,8 +566,8 @@ class MainActivity : ComponentActivity(), Player.Listener {
             closeVideo()
             closePlayer()
             pageJob?.cancel()
-        downloadsDiskJob?.cancel()
-        downloadsDiskJob = null
+            downloadsDiskJob?.cancel()
+            downloadsDiskJob = null
             waveJob?.cancel()
             suggestionJob?.cancel()
             pendingPlayback = null
