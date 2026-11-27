@@ -36,6 +36,7 @@ internal data class Track(
     val historySource: String? = null,
     val addedAt: Long? = null,
     val uploaded: Boolean = false,
+    val catalog: Boolean = false,
 ) {
     val artistText get() = artists.joinToString(", ") { it.title }
     val isPodcastEpisode get() = mediaType == "podcast_episode" || album?.isPodcast == true
@@ -49,7 +50,7 @@ internal data class Track(
     fun stored() = JSONObject().put("id", id).put("title", title).put("coverUri", cover)
         .put("durationMs", duration).put("available", !unavailable)
         .put("contentWarning", if (explicit) "explicit" else null)
-        .put("alternate", alternate).put("batch", batch)
+        .put("alternate", alternate).put("catalog", catalog).put("batch", batch)
         .put("r128", JSONObject().put("i", loudness).put("tp", peak))
         .put("fade", fade?.stored()).put("mixFade", mixFade?.stored()).put("type", mediaType)
         .put("originalAvailable", originalAvailable)
@@ -60,7 +61,12 @@ internal data class Track(
         .put("albums", JSONArray(listOfNotNull(album?.stored())))
 
     companion object {
-        fun parse(data: JSONObject, alternate: Boolean = data.optBoolean("alternate"), batch: String? = data.text("batch")): Track? {
+        fun parse(
+            data: JSONObject,
+            alternate: Boolean = data.optBoolean("alternate"),
+            batch: String? = data.text("batch"),
+            catalog: Boolean = data.optBoolean("catalog"),
+        ): Track? {
             val id = data.text("id") ?: return null
             val name = data.text("title") ?: return null
             val album = data.arr("albums").optJSONObject(0)?.let { Card.album(it, requireTitle = false) }
@@ -69,7 +75,7 @@ internal data class Track(
                 id, if (version == null) name else "$name ($version)",
                 data.arr("artists").objects().mapNotNull(Card::artist),
                 data.text("coverUri") ?: album?.cover, data.optLong("durationMs").coerceAtLeast(0),
-                album, !data.optBoolean("available", true) && !alternate,
+                album, !data.optBoolean("available", true) && !alternate && !catalog,
                 data.text("contentWarning") == "explicit", alternate, batch,
                 data.obj("r128").optDouble("i").takeIf(Double::isFinite), data.obj("r128").optDouble("tp").takeIf(Double::isFinite),
                 FadePoints.parse(data.obj("fade")), FadePoints.parse(data.obj("mixFade")), data.text("type"),
@@ -77,6 +83,7 @@ internal data class Track(
                 data.text("historyDate"), data.text("historySource"),
                 data.optLong("addedAt", 0).takeIf { it > 0 },
                 data.text("trackSource")?.let { it == "UGC" } ?: id.any { !it.isDigit() },
+                catalog = catalog,
             )
         }
     }
@@ -157,13 +164,15 @@ internal data class Card(
         }
 
         fun playlist(value: JSONObject, fallbackOwner: String? = null): Card? {
-            val id = value.text("kind") ?: return null
+            val id = value.text("kind") ?: value.text("id") ?: return null
             val title = value.text("title") ?: return null
             val owner = value.obj("owner").text("uid") ?: value.text("uid") ?: fallbackOwner ?: return null
             val cover = value.obj("cover")
+            val count = value.optInt("trackCount", -1).takeIf { it >= 0 }
+                ?: value.optJSONArray("tracks")?.length() ?: 0
             return Card(Kind.PLAYLIST, id, title, value.obj("owner").text("name") ?: "Плейлист",
-                cover.text("uri") ?: cover.arr("itemsUri").opt(0).asId() ?: value.text("ogImage"), owner,
-                trackCount = value.optInt("trackCount", 0))
+                cover.text("uri") ?: cover.arr("itemsUri").opt(0).asId() ?: value.text("coverUri") ?: value.text("ogImage"),
+                owner, trackCount = count)
         }
 
         fun wave(value: JSONObject): Card? {
@@ -308,6 +317,7 @@ internal fun selectTrackFilters(raw: List<TrackFilter>, catalogIds: Set<String>)
 internal fun coverUrl(cover: String?, size: Int): String? {
     if (cover.isNullOrBlank()) return null
     if (cover.startsWith("tune-cover:")) return null
+    val trimmed = cover.trim()
     val side = when {
         size <= 100 -> 100
         size <= 200 -> 200
@@ -317,7 +327,11 @@ internal fun coverUrl(cover: String?, size: Int): String? {
         size <= 800 -> 800
         else -> 1000
     }
-    val url = cover.replace("%%", "${side}x$side").removePrefix("https://").removePrefix("http://").removePrefix("//")
+    if (trimmed.startsWith("https://", ignoreCase = true)) {
+        val resolved = if ("%%" in trimmed) trimmed.replace("%%", "${side}x$side") else trimmed
+        return "https://" + resolved.substring(8)
+    }
+    val url = trimmed.replace("%%", "${side}x$side").removePrefix("http://").removePrefix("HTTP://").removePrefix("//")
     return "https://$url"
 }
 

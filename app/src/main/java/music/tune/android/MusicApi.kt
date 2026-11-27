@@ -30,6 +30,9 @@ internal fun secureConnection(address: String, network: android.net.Network? = n
 internal class MusicApi(
     private val token: String,
     private val versions: AlternateVersions,
+    private val catalogLibrary: CatalogLibraryStore? = null,
+    private val activeUid: String? = null,
+    private val catalogEnabled: () -> Boolean = { true },
     private val metadata: (String, String) -> MetadataOverride = { _, _ -> MetadataOverride() },
 ) {
     private fun request(
@@ -94,9 +97,15 @@ internal class MusicApi(
         request(path, params.toMap(), values.toString(), "application/json")
 
     private fun track(value: JSONObject, batch: String? = null): Track? {
-        val custom = value.text("id")?.let { metadata("track", it) } ?: MetadataOverride()
-        val parsed = if (custom.usePlugin) Track.parse(versions.patch(value, Kind.ALBUM, track = true), versions.hasAudio(value.text("id")), batch)
-            else Track.parse(value, alternate = false, batch = batch)
+        val id = value.text("id")
+        val custom = id?.let { metadata("track", it) } ?: MetadataOverride()
+        val isCatalog = custom.usePlugin && versions.isCatalogTrack(id)
+        val isFck = custom.usePlugin && versions.hasFckAudio(id)
+        val parsed = if (custom.usePlugin) {
+            Track.parse(versions.patch(value, Kind.ALBUM, track = true), alternate = isFck, batch = batch, catalog = isCatalog)
+        } else {
+            Track.parse(value, alternate = false, batch = batch, catalog = false)
+        }
         if (parsed == null) return null
         return overrideTrack(parsed.copy(originalAvailable = value.opt("available") as? Boolean))
     }
@@ -140,12 +149,17 @@ internal class MusicApi(
         post("account/settings", "aiContentReductionEnabled" to value.toString())
     }
 
-    internal fun rawTracks(ids: List<String>): List<JSONObject> =
-        if (ids.isEmpty()) emptyList() else form("tracks", "track-ids" to ids.joinToString(",")).objectList()
+    internal fun rawTracks(ids: List<String>): List<JSONObject> {
+        val yandexIds = ids.filterNot(versions::isSyntheticTrackId)
+        return if (yandexIds.isEmpty()) emptyList() else form("tracks", "track-ids" to yandexIds.joinToString(",")).objectList()
+    }
 
     fun tracks(ids: List<String>): List<Track> = ids.chunked(100).flatMap { chunk ->
-        val found = form("tracks", "track-ids" to chunk.joinToString(",")).objectList()
-            .mapNotNull { track(it) }.associateBy { it.id }
+        val yandexIds = chunk.map { it.substringBefore(':') }.filterNot(versions::isSyntheticTrackId).distinct()
+        val found = if (yandexIds.isEmpty()) emptyMap() else {
+            form("tracks", "track-ids" to yandexIds.joinToString(",")).objectList()
+                .mapNotNull { track(it) }.associateBy { it.id }
+        }
         chunk.mapNotNull { reference ->
             val id = reference.substringBefore(':')
             found[id] ?: restoredTrack(id)
@@ -168,22 +182,59 @@ internal class MusicApi(
     }
 
     private fun libraryEntries(uid: String, dislike: Boolean): List<Pair<String, Long?>> {
-        if (!dislike) optional { fullLikedEntries() }?.let { return it }
+        val local = if (catalogEnabled()) {
+            if (dislike) catalogLibrary?.dislikedTracks(uid).orEmpty().map { it to null }
+            else catalogLibrary?.likedTrackEntries(uid).orEmpty()
+        } else emptyList()
+        if (!dislike) optional { fullLikedEntries() }?.let { return (local + it).distinctBy { entry -> entry.first } }
         val list = if (dislike) "dislikes" else "likes"
-        return get("users/${segment(uid)}/$list/tracks").objectValue()
+        val remote = get("users/${segment(uid)}/$list/tracks").objectValue()
             .obj("library").arr("tracks").objects().mapNotNull { it.text("id")?.let { id -> id to entryDate(it.text("timestamp")) } }
+        return (local + remote).distinctBy { it.first }
     }
 
-    fun dislikedArtists(uid: String): List<Card> = get("users/${segment(uid)}/dislikes/artists").objectList().mapNotNull {
-        Card.artist(it.optJSONObject("artist") ?: it)
+    private fun catalogPlaylistCard(kind: String): Card? {
+        val (fields, trackIds) = versions.catalogPlaylist(kind) ?: return null
+        val title = fields.text("title") ?: return null
+        return Card(
+            Kind.PLAYLIST,
+            kind,
+            title,
+            "Каталог Tune",
+            fields.text("coverUri"),
+            AlternateVersions.CATALOG_OWNER,
+            trackCount = trackIds.size,
+        )
+    }
+
+    fun dislikedArtists(uid: String): List<Card> {
+        val local = if (catalogEnabled()) {
+            catalogLibrary?.dislikedArtists(uid).orEmpty().mapNotNull { id ->
+                versions.catalogArtist(id)?.first?.let(::artistCard)
+            }
+        } else emptyList()
+        val remote = get("users/${segment(uid)}/dislikes/artists").objectList().mapNotNull {
+            Card.artist(it.optJSONObject("artist") ?: it)
+        }
+        return (local + remote).distinctBy { it.key }
     }
 
     fun setArtistHidden(uid: String, id: String, hide: Boolean) {
+        if (versions.isSyntheticArtistId(id)) {
+            catalogLibrary?.mutate(uid) { it.setArtistDisliked(id, hide) }
+            return
+        }
         val path = "users/${segment(uid)}/dislikes/artists"
         if (hide) post("$path/add", "artist-id" to id) else post("$path/${segment(id)}/remove")
     }
 
     fun setTrackRating(uid: String, id: String, disliked: Boolean, add: Boolean) {
+        if (versions.isSyntheticTrackId(id)) {
+            catalogLibrary?.mutate(uid) {
+                if (disliked) it.setTrackDisliked(id, add) else it.setTrackLiked(id, add)
+            }
+            return
+        }
         val kind = if (disliked) "dislikes" else "likes"
         val path = "users/${segment(uid)}/$kind/tracks"
         if (add) post("$path/add", "track-id" to id) else post("$path/${segment(id)}/remove")
@@ -191,26 +242,61 @@ internal class MusicApi(
 
     fun playlists(uid: String, liked: Boolean = false): List<Card> {
         val path = if (liked) "likes/playlists" else "playlists/list"
-        return get("users/${segment(uid)}/$path").objectList().mapNotNull {
+        val remote = get("users/${segment(uid)}/$path").objectList().mapNotNull {
             Card.playlist(it.optJSONObject("playlist") ?: it, if (liked) null else uid)
+        }
+        if (liked) {
+            val local = if (catalogEnabled()) catalogLibrary?.likedPlaylists(uid).orEmpty().mapNotNull(::catalogPlaylistCard) else emptyList()
+            return (local + remote).distinctBy { it.key }
+        }
+        val libUid = activeUid ?: uid
+        return remote.map { card ->
+            val extraCount = if (catalogEnabled()) catalogLibrary?.playlistTracks(libUid, card.owner ?: uid, card.id)?.size ?: 0 else 0
+            if (extraCount > 0) card.copy(trackCount = card.trackCount + extraCount) else card
         }
     }
 
     fun likedCards(uid: String, kind: Kind): List<Card> = when (kind) {
         Kind.PLAYLIST -> playlists(uid, liked = true)
-        Kind.ALBUM -> get("users/${segment(uid)}/likes/albums", "rich" to "true").objectList()
-            .mapNotNull { album(it.optJSONObject("album") ?: it) }
-        Kind.ARTIST -> get("users/${segment(uid)}/likes/artists", "with-timestamps" to "false").objectList()
-            .mapNotNull { artistCard(it.optJSONObject("artist") ?: it) }
+        Kind.ALBUM -> {
+            val localIds = if (catalogEnabled()) catalogLibrary?.likedAlbums(uid).orEmpty() else emptyList()
+            val local = localIds.mapNotNull { id -> versions.catalogAlbum(id)?.let(::album) }
+            val remote = get("users/${segment(uid)}/likes/albums", "rich" to "true").objectList()
+                .mapNotNull { album(it.optJSONObject("album") ?: it) }
+            (local + remote).distinctBy { it.key }
+        }
+        Kind.ARTIST -> {
+            val localIds = if (catalogEnabled()) catalogLibrary?.likedArtists(uid).orEmpty() else emptyList()
+            val local = localIds.mapNotNull { id -> versions.catalogArtist(id)?.first?.let(::artistCard) }
+            val remote = get("users/${segment(uid)}/likes/artists", "with-timestamps" to "false").objectList()
+                .mapNotNull { artistCard(it.optJSONObject("artist") ?: it) }
+            (local + remote).distinctBy { it.key }
+        }
         else -> emptyList()
     }
 
     fun topArtists(): List<Card> = parseTopArtists(get("personal/top/artists/month").objectValue(), ::artistCard)
 
-    fun artistCover(id: String): String? =
-        artistCard(get("artists/${segment(id)}/brief-info").objectValue().obj("artist"))?.cover
+    fun artistCover(id: String): String? {
+        if (versions.isSyntheticArtistId(id)) return versions.catalogArtist(id)?.first?.let(::artistCard)?.cover
+        return artistCard(get("artists/${segment(id)}/brief-info").objectValue().obj("artist"))?.cover
+    }
 
     fun setCardLiked(uid: String, card: Card, add: Boolean) {
+        when {
+            card.kind == Kind.PLAYLIST && versions.isSyntheticPlaylistId(card.id, card.owner) -> {
+                catalogLibrary?.mutate(uid) { it.setPlaylistLiked(card.id, add) }
+                return
+            }
+            card.kind == Kind.ALBUM && versions.isSyntheticAlbumId(card.id) -> {
+                catalogLibrary?.mutate(uid) { it.setAlbumLiked(card.id, add) }
+                return
+            }
+            card.kind == Kind.ARTIST && versions.isSyntheticArtistId(card.id) -> {
+                catalogLibrary?.mutate(uid) { it.setArtistLiked(card.id, add) }
+                return
+            }
+        }
         val users = "users/${segment(uid)}/likes"
         when (card.kind) {
             Kind.PLAYLIST -> {
@@ -230,15 +316,39 @@ internal class MusicApi(
     private fun playlistPath(card: Card) = "users/${segment(requireNotNull(card.owner))}/playlists/${segment(card.id)}"
 
     fun playlist(card: Card): MusicPage {
+        if (versions.isSyntheticPlaylistId(card.id, card.owner)) {
+            val (fields, trackIds) = versions.catalogPlaylist(card.id) ?: throw MusicError("Плейлист не найден", 404)
+            val resolved = tracks(trackIds)
+            val parsed = Card(
+                Kind.PLAYLIST,
+                card.id,
+                fields.text("title") ?: card.title,
+                "Каталог Tune",
+                fields.text("coverUri") ?: card.cover,
+                AlternateVersions.CATALOG_OWNER,
+                trackCount = resolved.size,
+            )
+            return MusicPage(parsed, resolved, description = fields.text("description"), publicPlaylist = true)
+        }
         val value = get(playlistPath(card), "rich-tracks" to "true").objectValue()
         val parsed = Card.playlist(value, card.owner) ?: card
-        val tracks = value.arr("tracks").objects().mapNotNull { item ->
+        val libUid = activeUid ?: card.owner
+        val localIds = if (catalogEnabled() && libUid != null && card.owner != null) {
+            catalogLibrary?.playlistTracks(libUid, card.owner, card.id).orEmpty()
+        } else emptyList()
+        val localTracks = if (localIds.isEmpty()) emptyList() else optional { tracks(localIds) }.orEmpty()
+        val remoteTracks = value.arr("tracks").objects().mapNotNull { item ->
             val source = item.optJSONObject("track") ?: item
             val restored = track(source) ?: (source.text("id") ?: item.text("id") ?: item.text("trackId"))?.let { restoredTrack(it) }
             restored?.copy(addedAt = entryDate(item.text("timestamp") ?: item.text("addedAt")))
         }
-        return MusicPage(parsed, tracks, description = value.text("description"),
-            publicPlaylist = value.text("visibility")?.let { it == "public" })
+        val mergedTracks = (localTracks + remoteTracks).distinctBy { it.id }
+        return MusicPage(
+            parsed.copy(trackCount = mergedTracks.size),
+            mergedTracks,
+            description = value.text("description"),
+            publicPlaylist = value.text("visibility")?.let { it == "public" },
+        )
     }
 
     fun createPlaylist(uid: String, name: String) =
@@ -286,36 +396,66 @@ internal class MusicApi(
 
     fun deletePlaylist(card: Card) {
         post("${playlistPath(card)}/delete")
+        val libUid = activeUid ?: card.owner
+        if (libUid != null && card.owner != null) {
+            catalogLibrary?.mutate(libUid) { it.clearPlaylist("${card.owner}:${card.id}") }
+        }
     }
 
     fun editPlaylist(card: Card, tracks: List<Track>, remove: Boolean = false) {
         if (tracks.isEmpty()) return
+        val (synthetic, native) = tracks.partition { versions.isSyntheticTrackId(it.id) }
+        val libUid = activeUid ?: card.owner
+        if (synthetic.isNotEmpty() && libUid != null && card.owner != null) {
+            val key = "${card.owner}:${card.id}"
+            catalogLibrary?.mutate(libUid) { data ->
+                if (remove) data.removePlaylistTracks(key, synthetic.map { it.id }.toSet())
+                else data.addPlaylistTracks(key, synthetic.map { it.id })
+            }
+        }
+        if (native.isEmpty()) return
         val path = playlistPath(card)
         val value = get(path, "rich-tracks" to "true").objectValue()
         val operations = if (remove) {
-            val wanted = tracks.associateBy { it.id }.toMutableMap()
+            val wanted = native.associateBy { it.id }.toMutableMap()
             val rows = value.arr("tracks").objects().mapIndexedNotNull { index, row ->
                 val track = wanted.remove((row.optJSONObject("track") ?: row).text("id")) ?: return@mapIndexedNotNull null
                 JSONObject().put("op", "delete").put("from", index).put("to", index + 1)
                     .put("tracks", JSONArray().put(trackReference(track)))
             }
             rows.asReversed()
-        } else listOf(JSONObject().put("op", "insert").put("at", 0).put("tracks", JSONArray(tracks.map(::trackReference))))
+        } else listOf(JSONObject().put("op", "insert").put("at", 0).put("tracks", JSONArray(native.map(::trackReference))))
         if (operations.isEmpty()) return
         changePlaylist(path, value, operations)
     }
 
     fun movePlaylistTrack(card: Card, expected: List<Track>, from: Int, to: Int) {
+        if (from !in expected.indices || to !in expected.indices || from == to) return
+        val moving = expected[from]
+        val libUid = activeUid ?: card.owner
+        if (versions.isSyntheticTrackId(moving.id)) {
+            if (libUid != null && card.owner != null) {
+                catalogLibrary?.mutate(libUid) { it.movePlaylistTrack("${card.owner}:${card.id}", moving.id, from, to) }
+            }
+            return
+        }
         val path = playlistPath(card)
         val value = get(path, "rich-tracks" to "true").objectValue()
         val ids = value.arr("tracks").objects().map { row ->
             row.optJSONObject("track")?.text("id") ?: row.text("id")
         }
-        if (ids != expected.map(Track::id)) throw MusicError("Порядок плейлиста изменился. Повторите перестановку")
-        val reference = JSONArray().put(trackReference(expected[from]))
+        val expectedNative = expected.map(Track::id).filterNot(versions::isSyntheticTrackId)
+        if (ids != expectedNative) throw MusicError("Порядок плейлиста изменился. Повторите перестановку")
+        val localPrefix = if (catalogEnabled() && libUid != null && card.owner != null) {
+            catalogLibrary?.playlistTracks(libUid, card.owner, card.id)?.size ?: 0
+        } else 0
+        val nativeFrom = expected.take(from).count { !versions.isSyntheticTrackId(it.id) }
+        val nativeTo = (to - localPrefix).coerceIn(0, (ids.size - 1).coerceAtLeast(0))
+        if (nativeFrom == nativeTo) return
+        val reference = JSONArray().put(trackReference(moving))
         changePlaylist(path, value, listOf(
-            JSONObject().put("op", "delete").put("from", from).put("to", from + 1).put("tracks", reference),
-            JSONObject().put("op", "insert").put("at", to).put("tracks", reference)
+            JSONObject().put("op", "delete").put("from", nativeFrom).put("to", nativeFrom + 1).put("tracks", reference),
+            JSONObject().put("op", "insert").put("at", nativeTo).put("tracks", reference)
         ))
     }
 
@@ -326,11 +466,48 @@ internal class MusicApi(
         form("$path/change-relative", "diff" to JSONArray(operations).toString(), "revision" to revision)
     }
 
+    private fun catalogAlbumPage(card: Card): MusicPage? {
+        val value = versions.catalogAlbum(card.id) ?: return null
+        val parsed = (album(value) ?: return null).let {
+            if (card.isPodcast) it.copy(releaseType = "podcast") else it
+        }
+        val volumes = versions.albumVolumes(card.id)
+        val flat = volumes.flatten()
+        val resolved = if (flat.isEmpty()) emptyMap() else tracks(flat).associateBy { it.id }
+        val orderedDisks = volumes.map { disk ->
+            disk.mapNotNull { id ->
+                (resolved[id] ?: restoredTrack(id, parsed))?.let {
+                    if (it.album == null) it.copy(album = parsed) else it
+                }
+            }
+        }.filter { it.isNotEmpty() }
+        val byArtist = value.arr("artists").objects().firstNotNullOfOrNull(::artistCard)
+        val more = byArtist?.let { author ->
+            if (versions.isSyntheticArtistId(author.id)) {
+                versions.catalogArtist(author.id)?.third?.filterNot { it == card.id }?.let(::albumCards).orEmpty()
+            } else {
+                optional {
+                    get("artists/${segment(author.id)}/brief-info").objectValue().arr("albums").objects()
+                        .mapNotNull(::album).filterNot { it.id == card.id }.take(12)
+                }.orEmpty()
+            }
+        }.orEmpty()
+        val label = if (parsed.isPodcast) value.text("shortDescription") ?: value.text("description")
+            else value.arr("labels").opt(0).let { item -> (item as? JSONObject)?.text("name") ?: item.asId() }
+        return MusicPage(parsed, orderedDisks.flatten(), listOf(Shelf("Ещё от исполнителя", more)), label, disks = orderedDisks.map(List<Track>::size))
+    }
+
     fun album(card: Card): MusicPage {
+        if (versions.isSyntheticAlbumId(card.id)) {
+            return catalogAlbumPage(card) ?: throw MusicError("Альбом не найден", 404)
+        }
         val value = try { get("albums/${segment(card.id)}/with-tracks").objectValue() }
         catch (error: MusicError) {
             if (error.status in setOf(401, 429)) throw error
-            versions.catalogAlbum(card.id) ?: throw error
+            return catalogAlbumPage(card) ?: throw error
+        }
+        if (value.text("error") == "not-found") {
+            return catalogAlbumPage(card) ?: throw MusicError("Альбом не найден", 404)
         }
         val parsed = (album(value) ?: throw MusicError("Альбом не найден")).let {
             if (card.isPodcast) it.copy(releaseType = "podcast") else it
@@ -346,29 +523,71 @@ internal class MusicApi(
         }
         val available = disks.flatten()
         val custom = metadata("album", parsed.id).tracks
-        val order = custom.ifEmpty { if (metadata("album", card.id).usePlugin) versions.albumTracks(card.id) else emptyList() }
-        val versions = value.arr("duplicates").objects().mapNotNull(::album).filterNot { it.id == card.id }
+        val want = when {
+            custom.isNotEmpty() -> listOf(custom)
+            metadata("album", card.id).usePlugin -> versions.albumVolumes(card.id)
+            else -> emptyList()
+        }
+        val versionsList = value.arr("duplicates").objects().mapNotNull(::album).filterNot { it.id == card.id }
         val byArtist = value.arr("artists").objects().firstNotNullOfOrNull(::artistCard)
         val more = byArtist?.let { author -> optional {
             get("artists/${segment(author.id)}/brief-info").objectValue().arr("albums").objects()
                 .mapNotNull(::album).filterNot { it.id == card.id }.take(12)
         } }.orEmpty()
-        val shelves = listOf(Shelf("Другие версии", versions), Shelf("Ещё от исполнителя", more))
+        val shelves = listOf(Shelf("Другие версии", versionsList), Shelf("Ещё от исполнителя", more))
         val label = if (parsed.isPodcast) value.text("shortDescription") ?: value.text("description")
             else value.arr("labels").opt(0).let { item -> (item as? JSONObject)?.text("name") ?: item.asId() }
-        if (order.isEmpty()) return MusicPage(parsed, available, shelves, label, disks = disks.map(List<Track>::size))
-        val known = available.associateBy { it.id }
-        val missing = order.filterNot(known::containsKey)
-        val extra = try { tracks(missing) } catch (_: IOException) { emptyList() }
-        val all = known + extra.associateBy { it.id }
-        val reordered = order.mapNotNull { all[it] ?: restoredTrack(it, parsed) }
-        return MusicPage(parsed, reordered + if (custom.isEmpty()) available.filterNot { it.id in order } else emptyList(), shelves, label)
+        if (want.isEmpty()) return MusicPage(parsed, available, shelves, label, disks = disks.map(List<Track>::size))
+        val known = available.associateByTo(LinkedHashMap()) { it.id }
+        val missing = want.flatten().filterNot(known::containsKey)
+        if (missing.isNotEmpty()) {
+            (try { tracks(missing) } catch (_: IOException) { emptyList() }).forEach { known.putIfAbsent(it.id, it) }
+        }
+        val mergedDisks = want.map { disk ->
+            disk.mapNotNull { id ->
+                (known.remove(id) ?: restoredTrack(id, parsed))?.let {
+                    if (it.album == null) it.copy(album = parsed) else it
+                }
+            }.toMutableList()
+        }.toMutableList()
+        if (custom.isEmpty() && known.isNotEmpty()) {
+            if (mergedDisks.isEmpty()) mergedDisks.add(known.values.toMutableList())
+            else mergedDisks.last().addAll(known.values)
+        }
+        val nonEmptyDiskSizes = mergedDisks.map { it.size }.filter { it > 0 }
+        return MusicPage(parsed, mergedDisks.flatten(), shelves, label, disks = nonEmptyDiskSizes)
+    }
+
+    private fun catalogArtistPage(id: String): MusicPage? {
+        val (raw, trackIds, albumIds) = versions.catalogArtist(id) ?: return null
+        val parsed = artistCard(raw) ?: return null
+        val custom = metadata("artist", id)
+        val popular = tracks((custom.tracks + trackIds).distinct())
+        val allReleases = albumCards((custom.albums + albumIds).distinct())
+        val (singles, albums) = allReleases.partition { it.releaseType == "single" }
+        return MusicPage(
+            parsed,
+            popular,
+            listOf(Shelf("Альбомы", albums), Shelf("Синглы и EP", singles)),
+            raw.text("description"),
+            latestRelease = allReleases.firstOrNull(),
+        )
     }
 
     fun artist(card: Card): MusicPage {
-        val value = get("artists/${segment(card.id)}/brief-info").objectValue()
+        if (versions.isSyntheticArtistId(card.id)) {
+            return catalogArtistPage(card.id) ?: throw MusicError("Исполнитель не найден", 404)
+        }
+        val value = try { get("artists/${segment(card.id)}/brief-info").objectValue() }
+        catch (error: MusicError) {
+            if (error.status in setOf(401, 429)) throw error
+            return catalogArtistPage(card.id) ?: throw error
+        }
         val artist = value.obj("artist")
-        val parsed = artistCard(artist) ?: throw MusicError("Исполнитель не найден")
+        if (artist.text("error") == "not-found") {
+            return catalogArtistPage(card.id) ?: throw MusicError("Исполнитель не найден", 404)
+        }
+        val parsed = artistCard(artist) ?: return catalogArtistPage(card.id) ?: throw MusicError("Исполнитель не найден")
         val listeners = value.obj("stats").optLong("lastMonthListeners").takeIf { it > 0 }
         val custom = metadata("artist", card.id)
         val insertions = versions.artistInsertions(card.id)
@@ -410,20 +629,29 @@ internal class MusicApi(
     }
 
     private fun albumCards(ids: List<String>): List<Card> = ids.chunked(100).flatMap { part ->
-        val remote = optional { form("albums", "album-ids" to part.joinToString(",")).objectList().mapNotNull(::album) }.orEmpty()
-            .associateBy { it.id }
+        val yandexPart = part.filterNot(versions::isSyntheticAlbumId)
+        val remote = if (yandexPart.isEmpty()) emptyMap() else {
+            optional { form("albums", "album-ids" to yandexPart.joinToString(",")).objectList().mapNotNull(::album) }.orEmpty()
+                .associateBy { it.id }
+        }
         part.mapNotNull { id -> remote[id] ?: versions.catalogAlbum(id)?.let(::album) }
     }
 
     fun artistTracks(id: String): List<Track> {
         val inserted = metadata("artist", id).tracks + versions.artistInsertions(id).first
+        if (versions.isSyntheticArtistId(id)) {
+            val catalogIds = versions.catalogArtist(id)?.second.orEmpty()
+            return tracks((inserted + catalogIds).distinct())
+        }
         val standard = get("artists/${segment(id)}/tracks", "page-size" to "200").objectValue()
             .arr("tracks").objects().mapNotNull { track(it) }
         return ((optional { tracks(inserted.distinct()) }.orEmpty()) + standard).distinctBy { it.id }
     }
 
     fun trackFilters(ids: List<String>): List<TrackFilter> {
-        val catalogIds = ids.asSequence().filter { it.isNotBlank() && it.all(Char::isDigit) }.distinct().toList()
+        val catalogIds = ids.asSequence()
+            .filter { it.isNotBlank() && it.all(Char::isDigit) && !versions.isSyntheticTrackId(it) }
+            .distinct().toList()
         if (catalogIds.size < 4) return emptyList()
         val value = json("filters/tracks", JSONObject().put("trackIds", JSONArray(catalogIds))).objectValue()
         val parsed = value.arr("filters").objects().mapNotNull { filter ->
@@ -436,6 +664,7 @@ internal class MusicApi(
     }
 
     fun artistFamiliar(id: String, wave: Boolean): List<Track> {
+        if (versions.isSyntheticArtistId(id)) return emptyList()
         val block = if (wave) "wave" else "collection"
         val response = get("artists/${segment(id)}/familiar-you",
             "waveTracksLimit" to if (wave) "50" else "0", "collectionTracksLimit" to if (wave) "0" else "50",
@@ -452,8 +681,11 @@ internal class MusicApi(
         .arr("suggestions").items().mapNotNull(Any?::asId)
 
     fun search(text: String, type: String, page: Int): SearchResults {
-        val includeTracks = page == 0 && type != "podcast" && (type.contains(',') || type == "track")
-        val includeAlbums = page == 0 && type != "podcast" && (type.contains(',') || type == "album")
+        val isFirst = page == 0 && type != "podcast"
+        val includeTracks = isFirst && (type.contains(',') || type == "track")
+        val includeAlbums = isFirst && (type.contains(',') || type == "album")
+        val includeArtists = isFirst && (type.contains(',') || type == "artist")
+        val includePlaylists = isFirst && (type.contains(',') || type == "playlist")
         if (includeTracks || includeAlbums) versions.ensureRestored(network = true, ::rawTracks)
         val localTracks = if (includeTracks) {
             versions.search(text).filter { metadata("track", it.id).usePlugin }.map(::overrideTrack)
@@ -461,14 +693,31 @@ internal class MusicApi(
         val localAlbums = if (includeAlbums) {
             versions.searchAlbums(text).filter { it.text("id")?.let { id -> metadata("album", id).usePlugin } ?: true }.mapNotNull(::album)
         } else emptyList()
+        val localArtists = if (includeArtists) {
+            versions.searchArtists(text).mapNotNull(::artistCard)
+        } else emptyList()
+        val localPlaylists = if (includePlaylists) {
+            versions.searchPlaylists(text).mapNotNull { (kind, fields) ->
+                val title = fields.text("title") ?: return@mapNotNull null
+                Card(
+                    Kind.PLAYLIST,
+                    kind,
+                    title,
+                    "Каталог Tune",
+                    fields.text("coverUri"),
+                    AlternateVersions.CATALOG_OWNER,
+                    trackCount = fields.arr("tracks").length(),
+                )
+            }
+        } else emptyList()
         val filter = if (type == "podcast") arrayOf("filter" to "podcast") else emptyArray()
         val types = if (type == "podcast") "album,artist,playlist,track,wave,podcast,podcast_episode" else type
         val value = try {
             get("search/instant/mixed", "text" to text, "type" to types, "page" to page.toString(),
                 "pageSize" to "36", *filter).objectValue()
         } catch (error: MusicError) {
-            if (error.status != 401 && (localTracks.isNotEmpty() || localAlbums.isNotEmpty())) {
-                return mergeSearchResults(text, emptyList(), emptyList(), null, false, localTracks, localAlbums)
+            if (error.status != 401 && (localTracks.isNotEmpty() || localAlbums.isNotEmpty() || localArtists.isNotEmpty() || localPlaylists.isNotEmpty())) {
+                return mergeSearchResults(text, emptyList(), emptyList(), null, false, localTracks, localAlbums, localArtists, localPlaylists)
             }
             throw error
         }
@@ -496,7 +745,7 @@ internal class MusicApi(
             }
         }
         val hasMore = if (value.has("lastPage")) !value.optBoolean("lastPage") && value.arr("results").length() > 0 else null
-        return mergeSearchResults(text, tracks, cards, best, hasMore, localTracks, localAlbums)
+        return mergeSearchResults(text, tracks, cards, best, hasMore, localTracks, localAlbums, localArtists, localPlaylists)
     }
 
     fun history(limit: Int = 200, includeSources: Boolean = limit > 20): List<Track> {
@@ -728,6 +977,7 @@ internal class MusicApi(
     }
 
     fun waveFeedback(session: String, kind: String, track: Track? = null, played: Double? = null) {
+        if (track != null && versions.isSyntheticTrackId(track.id)) return
         val event = JSONObject().put("type", kind).put("timestamp", now())
         if (track == null) event.put("from", FROM)
         else event.put("trackId", track.fullId).put("totalPlayedSeconds", played)
@@ -736,10 +986,12 @@ internal class MusicApi(
     }
 
     fun report(play: JSONObject) {
+        if (versions.isSyntheticTrackId(play.text("trackId"))) return
         json("plays", JSONObject().put("plays", JSONArray().put(play)), "clientNow" to now())
     }
 
     fun file(track: String, quality: String, transport: String): Stream {
+        if (versions.isSyntheticTrackId(track)) throw MusicError("Трек из каталога Tune недоступен")
         val stamp = Instant.now().epochSecond.toString()
         val codecs = listOf("flac-mp4", "aac-mp4", "he-aac-mp4", "mp3")
         val sign = sign("$stamp$track$quality${codecs.joinToString("")}$transport").removeSuffix("=")
@@ -751,6 +1003,7 @@ internal class MusicApi(
     }
 
     fun lyrics(track: String): LyricsText {
+        if (versions.isSyntheticTrackId(track)) return LyricsText()
         for (format in listOf("LRC", "TEXT")) {
             val stamp = Instant.now().epochSecond.toString()
             val value = try {
@@ -820,14 +1073,16 @@ internal fun mergeSearchResults(
     hasMore: Boolean?,
     localTracks: List<Track>,
     localAlbums: List<Card>,
+    localArtists: List<Card> = emptyList(),
+    localPlaylists: List<Card> = emptyList(),
 ): SearchResults {
     val remoteTrackIds = remoteTracks.mapTo(HashSet()) { it.id }
-    val remoteAlbumIds = remoteCards.asSequence().filter { it.kind == Kind.ALBUM && !it.isPodcast }.mapTo(HashSet()) { it.id }
+    val remoteCardKeys = remoteCards.mapTo(HashSet()) { it.key }
     val addedTracks = localTracks.filterNot { it.id in remoteTrackIds }
-    val addedAlbums = localAlbums.filterNot { it.id in remoteAlbumIds }
+    val addedCards = (localArtists + localAlbums + localPlaylists).filterNot { it.key in remoteCardKeys }
     val tracks = (addedTracks + remoteTracks).distinctBy { it.id }
-    val cards = (addedAlbums + remoteCards).distinctBy { it.key }
-    val localBest = addedTracks.firstOrNull()?.let(SearchBest::Song) ?: addedAlbums.firstOrNull()?.let(SearchBest::Entry)
+    val cards = (addedCards + remoteCards).distinctBy { it.key }
+    val localBest = addedTracks.firstOrNull()?.let(SearchBest::Song) ?: addedCards.firstOrNull()?.let(SearchBest::Entry)
     val best = when {
         localBest == null -> remoteBest
         remoteBest == null -> localBest

@@ -68,7 +68,7 @@ internal class WaveExtras(private val store: MusicStore) {
     fun prefetch(session: String?, queue: List<Track>) {
         if (wave != session) resetWords(session)
         if (session == null || !store.preferences.getBoolean("waveWords", true) || store.offline || wordJob?.isActive == true) return
-        val ids = queue.take(10).filterNot { it.uploaded }.map { it.id }
+        val ids = queue.take(10).filterNot { it.uploaded || store.versions.isSyntheticTrackId(it.id) }.map { it.id }
             .filter { it.all(Char::isDigit) && it.isNotBlank() && it !in asked }.distinct()
         if (ids.isEmpty()) return
         asked += ids

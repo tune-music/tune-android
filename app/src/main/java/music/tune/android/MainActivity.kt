@@ -445,6 +445,27 @@ class MainActivity : ComponentActivity(), Player.Listener {
                 launch { store.likes.collect { refreshCollection(); updatePlaying() } }
                 launch { store.dislikes.collect { refreshCollection(); playerPanel?.update() } }
                 launch { store.savedCards.collect { refreshCollection() } }
+                var lastCatalogVersion = store.catalogVersion.value
+                launch {
+                    store.catalogVersion.collect { ver ->
+                        if (ver == lastCatalogVersion) return@collect
+                        lastCatalogVersion = ver
+                        searchPages.clear()
+                        home = null
+                        homeLoaded = false
+                        refreshCollection()
+                        if (route.screen == Screen.SEARCH && searchText.isNotBlank()) loadSearch(refreshFirstPage = true)
+                        else if (route.screen in setOf(
+                                Screen.DETAILS, Screen.LIKES, Screen.DISLIKES, Screen.ALBUMS,
+                                Screen.ARTISTS, Screen.HIDDEN_ARTISTS, Screen.ARTIST_TRACKS, Screen.ARTIST_COLLECTION
+                            ) && !reordering && !selecting
+                        ) {
+                            load()
+                        }
+                        playerPanel?.update()
+                        updatePlaying()
+                    }
+                }
                 launch { store.ownPlaylists.collect {
                     if (route.screen == Screen.LIBRARY && userId != null) library()
                 } }
@@ -2413,15 +2434,10 @@ class MainActivity : ComponentActivity(), Player.Listener {
             listOf(Row.Layout { listHeader(emptyList(), context, symbol, loading = true) }, Row.Layout { ui.loadingRows() })
         }) { showCached ->
             val onCached = showCached?.let { display -> { cached: List<Track> -> display(trackRowsForPage(cached)) } }
-            val tracks = if (screen == Screen.LIKES) {
-                store.likedTracks(onCached)
-            } else {
-                val key = if (screen == Screen.DISLIKES) "dislikes" else "history"
-                store.cachedTracks(key, onCached) {
-                    store.online {
-                        if (screen == Screen.DISLIKES) tracks(libraryIds(uid, dislike = true)) else history()
-                    }
-                }
+            val tracks = when (screen) {
+                Screen.LIKES -> store.likedTracks(onCached)
+                Screen.DISLIKES -> store.dislikedTracksList()
+                else -> store.cachedTracks("history", onCached) { store.online { history() } }
             }
             trackRowsForPage(tracks)
         }
@@ -2524,7 +2540,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
         val cards = store.online { dislikedArtists(uid) }
         cards.map { card ->
             shortcut(Symbol.PERSON_MINUS, card.title, "Вернуть в рекомендации") {
-                action { store.online { setArtistHidden(uid, card.id, false) }; if (route.screen == Screen.HIDDEN_ARTISTS) hiddenArtists() }
+                action { store.hideArtist(card.id, false); if (route.screen == Screen.HIDDEN_ARTISTS) hiddenArtists() }
             }
         }.ifEmpty { listOf(note("Вы ещё не скрывали исполнителей")) }
     }
@@ -2606,7 +2622,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
                             }
                             addView(ui.text("${trackCount(page.tracks.size)} · ${durationSummary(page.tracks.sumOf { it.duration })}",
                                 13, ui.palette.muted))
-                            if (page.tracks.any { it.alternate }) {
+                            if (page.tracks.any { it.alternate && !it.catalog }) {
                                 addView(ui.space(6))
                                 addView(ui.row().apply {
                                     gravity = Gravity.CENTER_VERTICAL
@@ -2769,8 +2785,10 @@ class MainActivity : ComponentActivity(), Player.Listener {
                     if (liked) ui.palette.accent else ui.palette.text) { action { store.save(card) } })
                 gap(this, 14)
                 addView(playPill({ activeChipTracks()?.let { ids -> page.tracks.filter { it.id in ids } } ?: page.tracks }, readyContext))
-                gap(this, 14)
-                addView(roundIcon(Symbol.WAVE, "Волна исполнителя") { startWave(listOf("artist:${card.id}"), card.title) })
+                if (!store.versions.isSyntheticArtistId(card.id)) {
+                    gap(this, 14)
+                    addView(roundIcon(Symbol.WAVE, "Волна исполнителя") { startWave(listOf("artist:${card.id}"), card.title) })
+                }
             } else addTrackControls(this, page.tracks, readyContext) { visibleTracks(page.tracks) }
         }, ui.full())
     }
@@ -3267,7 +3285,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
         val own = details?.card?.takeIf { it.kind == Kind.PLAYLIST && it.owner == userId }
         if (own != null) button(Symbol.MINUS_CIRCLE, "Убрать", selected.isNotEmpty()) {
             action {
-                store.online { editPlaylist(own, selected, remove = true) }
+                store.editPlaylistTracks(own, selected, remove = true)
                 endSelection()
                 if (route.card?.key == own.key) loadDetails(own)
             }
@@ -3528,13 +3546,20 @@ class MainActivity : ComponentActivity(), Player.Listener {
         if (store.offline) { toast("Включён офлайн-режим"); return }
         val owner = userId ?: return
         if (page.card.owner != owner || page.card.kind != Kind.PLAYLIST) return
-        val changed = page.copy(tracks = page.tracks.toMutableList().apply { add(to, removeAt(from)) })
+        val localCount = page.tracks.count { store.versions.isSyntheticTrackId(it.id) }
+        val effectiveTo = if (from < localCount) {
+            to.coerceIn(0, (localCount - 1).coerceAtLeast(0))
+        } else {
+            to.coerceIn(localCount, page.tracks.lastIndex)
+        }
+        if (effectiveTo == from) return
+        val changed = page.copy(tracks = page.tracks.toMutableList().apply { add(effectiveTo, removeAt(from)) })
         pageJob?.cancel()
         details = changed
         rows(detailRows(changed), keepScroll = true)
         reorderJob = action {
             try {
-                store.movePlaylistTrack(page, changed, from, to)
+                store.movePlaylistTrack(page, changed, from, effectiveTo)
             } catch (error: Exception) {
                 if (error is CancellationException) throw error
                 if (details === changed && userId == owner) {
@@ -4114,7 +4139,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
                 var inserted = 0
                 try {
                     for (portion in tracks.chunked(100).asReversed()) {
-                        store.online { editPlaylist(playlist, portion) }
+                        store.editPlaylistTracks(playlist, portion)
                         inserted += portion.size
                     }
                 } catch (error: java.io.IOException) {
@@ -4305,8 +4330,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
             item("Удалить плейлист", Symbol.TRASH, destructive = true) {
                 confirm("Удалить «${card.title}»?", "Удалить") {
                     action {
-                        store.online { deletePlaylist(card) }
-                        store.changeLocalPlaylist(card, remove = true)
+                        store.deleteOwnedPlaylist(card)
                         if (route.card?.key == card.key) {
                             stack.removeLast()
                             render()
@@ -4347,7 +4371,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
         if (anchor == null) item("Устройства Яндекс Музыки", Symbol.SPEAKER, run = ::openDevices)
         item(if (liked) "Убрать из «Мне нравится»" else "Нравится", if (liked) Symbol.HEART_SLASH else Symbol.HEART) { rate(track) }
         item(if (disliked) "Снять дизлайк" else "Не нравится", Symbol.THUMB_DOWN) { rate(track, true) }
-        if (currentTrack()?.id == track.id && (userId?.let { store.allowsAlternate(it, track.id) && store.versions.hasAudio(track.id) } == true ||
+        if (currentTrack()?.id == track.id && (userId?.let { store.allowsPluginAudio(it, track.id) && store.versions.hasAudio(track.id) } == true ||
                 store.files.hasReplacement(track))) {
             item("Версия трека", Symbol.WAVE) { chooseVersion(track) }
         }
@@ -4372,16 +4396,17 @@ class MainActivity : ComponentActivity(), Player.Listener {
         if (QueueItems.context(controller?.currentMediaItem).kind == "radio") track.artists.firstOrNull { it.id.isNotBlank() }?.let { artist ->
             item("Не рекомендовать исполнителя", Symbol.PERSON_MINUS) {
                 action {
-                    val uid = store.requireUser().uid
-                    store.online { setArtistHidden(uid, artist.id, true) }
+                    store.hideArtist(artist.id, true)
                     toast("Исполнитель скрыт из рекомендаций")
                     if (currentTrack()?.id == track.id) next()
                 }
             }
         }
-        item("Волна по треку", Symbol.WAVE) {
-            closePlayer()
-            startWave(listOf("track:${track.id}"), "Волна по треку «${track.title}»")
+        if (!store.versions.isSyntheticTrackId(track.id)) {
+            item("Волна по треку", Symbol.WAVE) {
+                closePlayer()
+                startWave(listOf("track:${track.id}"), "Волна по треку «${track.title}»")
+            }
         }
         item("Поделиться", Symbol.SHARE) { share(track.url) }
         store.files.extension(track)?.let { ext ->
@@ -4392,7 +4417,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
             action { store.files.removeReplacement(track); toast("Подмена удалена") }
         }
         if (playlist != null) item("Убрать из плейлиста", Symbol.MINUS_CIRCLE, true) {
-            action { store.online { editPlaylist(playlist, listOf(track), remove = true) }; loadDetails(playlist) }
+            action { store.editPlaylistTracks(playlist, listOf(track), remove = true); loadDetails(playlist) }
         }
         if (anchor == null) trackActionsSheet(track, options) else actionMenu(anchor, options)
     }
@@ -4439,7 +4464,9 @@ class MainActivity : ComponentActivity(), Player.Listener {
         val options = buildList {
             add("Авто" to "auto")
             if (track.originalAvailable != false && !track.unavailable) add("Яндекс Музыка" to "original")
-            if (store.allowsAlternate(uid, track.id) && store.versions.hasAudio(track.id)) add("Без цензуры" to "alternate")
+            if (store.allowsPluginAudio(uid, track.id) && store.versions.hasAudio(track.id)) {
+                add((if (store.versions.isCatalogTrack(track.id)) "Каталог Tune" else "Без цензуры") to "alternate")
+            }
             if (store.files.hasReplacement(track)) add("Моя подмена" to "local")
         }
         val selected = options.indexOfFirst { it.second == current }.takeIf { it >= 0 } ?: 0
@@ -4464,6 +4491,22 @@ class MainActivity : ComponentActivity(), Player.Listener {
             if (store.alternateEnabled != enabled) return@action
             if (!ready) {
                 if (!store.offline) toast("Не удалось загрузить список треков без цензуры")
+                return@action
+            }
+            currentTrack()?.let { reloadVersion(it.id) }
+        }
+    }
+
+    private fun setCatalogEnabled(enabled: Boolean) {
+        store.catalogEnabled = enabled
+        home = null
+        homeLoaded = false
+        searchPages.clear()
+        action {
+            val ready = !enabled || store.refreshVersions(forceCatalog = true)
+            if (store.catalogEnabled != enabled) return@action
+            if (!ready) {
+                if (!store.offline) toast("Не удалось загрузить каталог Tune")
                 return@action
             }
             currentTrack()?.let { reloadVersion(it.id) }
@@ -4510,7 +4553,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
                         action {
                             val card = store.online { createPlaylist(uid, title) }
                             store.changeLocalPlaylist(card)
-                            store.online { editPlaylist(card, tracks) }
+                            store.editPlaylistTracks(card, tracks)
                             toast("Добавлено в «${card.title}»")
                             done()
                         }
@@ -4534,7 +4577,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
                     setOnClickListener {
                         sheet.dismiss()
                         action {
-                            store.online { editPlaylist(card, tracks) }
+                            store.editPlaylistTracks(card, tracks)
                             toast("Добавлено в «${card.title}»")
                             done()
                         }
@@ -4645,6 +4688,9 @@ class MainActivity : ComponentActivity(), Player.Listener {
             })
             add(settingsGroupView(footer = "Вместо версий с вырезанными словами играют оригинальные из списка FckCensor. Треки, удалённые из Яндекса, но оставшиеся в списке, снова доступны.") {
                 toggle("Без цензуры", store.alternateEnabled, change = ::setAlternateEnabled)
+            })
+            add(settingsGroupView(footer = "Дополнительные треки, альбомы, исполнители и плейлисты из каталога Tune. У таких треков значок T.") {
+                toggle("Каталог Tune", store.catalogEnabled, change = ::setCatalogEnabled)
             })
             add(settingsGroupView("Оформление") {
                 settingsPicker("Тема", appearance, appearanceOptions) {

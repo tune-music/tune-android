@@ -92,8 +92,23 @@ internal class MiniTrackPager(
         tracks = values
         tiles.forEachIndexed { index, tile -> tile.bind(values[index]) }
         contentDescription = current?.let {
+            val store = (context.applicationContext as? TuneApp)?.store
+            val uid = store?.profile?.value?.uid
+            val usePlugin = uid == null || store?.overrides?.read(uid, "track", it.id)?.usePlugin != false
+            val isCatalog = usePlugin && when {
+                store != null && store.versions.hasCatalogLoaded() -> store.versions.isCatalogTrack(it.id)
+                store != null -> store.catalogEnabled && it.catalog
+                else -> it.catalog
+            }
+            val isUncensored = usePlugin && !isCatalog && when {
+                store != null && store.versions.hasFckLoaded() -> store.versions.hasFckAudio(it.id)
+                store != null -> store.alternateEnabled && it.alternate
+                else -> it.alternate
+            }
             listOfNotNull(it.title, it.artistText.takeIf(String::isNotBlank),
-                "Ненормативная лексика".takeIf { _ -> it.explicit }, "Без цензуры".takeIf { _ -> it.alternate },
+                "Ненормативная лексика".takeIf { _ -> it.explicit },
+                "Без цензуры".takeIf { _ -> isUncensored },
+                "Каталог Tune".takeIf { _ -> isCatalog },
                 "Этот трек можете слушать только вы".takeIf { _ -> it.uploaded }).joinToString(", ")
         }
         if (changed) {

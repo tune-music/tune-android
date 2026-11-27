@@ -476,7 +476,7 @@ internal class MusicFiles(private val store: MusicStore) {
     fun resolve(uid: String, track: String, forceFile: Boolean): Uri {
         if (store.profile.value?.uid != uid) throw MusicError("Войдите через Яндекс", 401)
         val savedPreference = selectedVersion(uid, track)
-        val preference = if (savedPreference == "alternate" && !store.allowsAlternate(uid, track)) "auto" else savedPreference
+        val preference = if (savedPreference == "alternate" && !store.allowsPluginAudio(uid, track)) "auto" else savedPreference
         val offline = store.offline
         if (preference == "auto" || preference == "local") local(uid, track)?.let { return Uri.fromFile(it) }
         val alternatives = if (preference == "original") emptyList() else alternateSources(uid, track)
@@ -493,9 +493,9 @@ internal class MusicFiles(private val store: MusicStore) {
             return Uri.fromFile(it)
         }
         if (store.offline) throw MusicError("Включён офлайн-режим")
-        if (edition == AudioEdition.ALTERNATE && alternatives.isEmpty()) throw MusicError("Версия без цензуры недоступна")
+        if (edition == AudioEdition.ALTERNATE && alternatives.isEmpty()) throw MusicError("Версия недоступна")
         val info = if (edition == AudioEdition.ALTERNATE) Stream(alternatives) else originalSource(uid, track, quality)
-        if (!forceFile && edition == AudioEdition.ORIGINAL && info.key == null) {
+        if (!forceFile && info.key == null && (edition == AudioEdition.ORIGINAL || info.urls.size == 1)) {
             val address = info.urls.firstOrNull { it.startsWith("https://") } ?: throw MusicError("Неверная ссылка на трек")
             return Uri.parse(address)
         }
@@ -505,13 +505,14 @@ internal class MusicFiles(private val store: MusicStore) {
     }
 
     private fun alternateSources(uid: String, id: String): List<String> {
-        if (!store.allowsAlternate(uid, id)) return emptyList()
+        if (!store.allowsPluginAudio(uid, id)) return emptyList()
         store.versions.ensureLoaded(network = !store.offline)
         return store.versions.audio(id)
     }
 
     private fun originalSource(uid: String, id: String, quality: String): Stream {
         if (store.profile.value?.uid != uid) throw MusicError("Войдите через Яндекс", 401)
+        if (store.versions.isSyntheticTrackId(id)) throw MusicError("Трек из каталога Tune недоступен")
         val cacheKey = "$uid:$id:$quality"
         val now = SystemClock.elapsedRealtime()
         streamCache[cacheKey]?.takeIf { now - it.first < 90_000L }?.second?.let { return it }

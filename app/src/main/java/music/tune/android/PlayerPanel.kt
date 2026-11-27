@@ -422,18 +422,16 @@ internal class PlayerPanel(private val activity: MainActivity) {
         val track = activity.currentTrack() ?: return
         val uid = store.profile.value?.uid
         val edition = uid?.let { store.files.selectedVersion(it, track.id) } ?: "auto"
-        val hasUncensor = uid != null && (
-            (store.allowsAlternate(uid, track.id) && store.versions.hasAudio(track.id)) ||
-                track.alternate ||
-                store.files.hasReplacement(track)
-            )
+        val isCatalog = uid != null && store.allowsCatalog(uid, track.id) && store.versions.isCatalogTrack(track.id)
+        val isFck = uid != null && !isCatalog && store.allowsAlternate(uid, track.id) && store.versions.hasFckAudio(track.id)
+        val hasLocal = store.files.hasReplacement(track)
+        val hasUncensor = isFck || isCatalog || (!store.versions.hasCatalogLoaded() && track.alternate) || hasLocal
         val uncensored = when (edition) {
             "original" -> false
             "alternate", "local" -> hasUncensor
             else -> hasUncensor
         }
         val canSwitch = track.originalAvailable != false && !track.unavailable
-        val hasLocal = store.files.hasReplacement(track)
         val soundActive = soundIsAdjusted(store.preferences)
         val speed = store.preferences.getFloat("speed", 1f).coerceIn(.5f, 2f)
         val speedChanged = abs(speed - 1f) > 0.001f
@@ -477,12 +475,17 @@ internal class PlayerPanel(private val activity: MainActivity) {
         }
 
         if (hasUncensor) {
+            val labelText = when {
+                !uncensored -> "Версия Яндекса"
+                isCatalog -> "Каталог Tune"
+                else -> "Версия без цензуры"
+            }
             addPill(
                 if (uncensored) Symbol.UNLOCK else Symbol.LOCK,
                 null,
                 active = uncensored,
                 enabled = canSwitch || hasLocal,
-                label = if (uncensored) "Версия без цензуры" else "Версия Яндекса",
+                label = labelText,
             ) {
                 if (hasLocal) {
                     activity.chooseVersion(track)
@@ -1060,7 +1063,7 @@ internal class PlayerPanel(private val activity: MainActivity) {
                     val uid = store.requireUser().uid
                     val playlist = store.online { createPlaylist(uid, title) }
                     store.changeLocalPlaylist(playlist)
-                    store.online { editPlaylist(playlist, tracks) }
+                    store.editPlaylistTracks(playlist, tracks)
                     activity.toast("Очередь сохранена")
                 }
             }
