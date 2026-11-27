@@ -38,7 +38,8 @@ internal class WaveMix(private val store: MusicStore) {
             val catalog = if (restored) {
                 val ids = (artists + likedArtists).flatMap { store.versions.artistInsertions(it).first } +
                     likes.filter { store.versions.hasAudio(it) }
-                ids.asSequence().distinct().filter { it !in excluded && now - seen.optLong(it) > week }
+                ids.asSequence().distinct()
+                    .filter { !store.versions.isSyntheticTrackId(it) && it !in excluded && now - seen.optLong(it) > week }
                     .mapNotNull { store.versions.synthetic(it) }.take(100).toList()
             } else emptyList()
             own + catalog

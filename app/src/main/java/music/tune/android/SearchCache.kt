@@ -9,8 +9,15 @@ import java.util.Locale
 internal class SearchCache(cacheDir: File) {
     private val directory = File(cacheDir, "search")
 
-    internal data class Key(val account: String, val query: String, val type: String, val uncensored: Boolean) {
-        fun fileName() = digest(JSONArray(listOf(account, query.lowercase(Locale.ROOT), type, if (uncensored) "v2" else false)).toString()) + ".json"
+    internal data class Key(
+        val account: String,
+        val query: String,
+        val type: String,
+        val uncensored: Boolean,
+        val catalog: Boolean = true,
+        val catalogVersion: String = "",
+    ) {
+        fun fileName() = digest(JSONArray(listOf(account, query.lowercase(Locale.ROOT), type, if (uncensored) "v2" else false, catalog, catalogVersion)).toString()) + ".json"
     }
 
     @Synchronized

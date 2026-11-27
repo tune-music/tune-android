@@ -13,8 +13,10 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -48,7 +50,8 @@ internal data class SleepState(val stopAtMs: Long? = null, val afterTrack: Boole
 internal class MusicStore(val context: Context) {
     val preferences: SharedPreferences = context.getSharedPreferences("tune", Context.MODE_PRIVATE)
     val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
-    val versions = AlternateVersions(context) { alternateEnabled }
+    val versions = AlternateVersions(context, { alternateEnabled }, { catalogEnabled })
+    val catalogLibrary = CatalogLibraryStore(context.filesDir)
     val overrides = MetadataOverrides(context)
     private val vault = TokenVault(context)
     private val updates = Mutex()
@@ -67,6 +70,13 @@ internal class MusicStore(val context: Context) {
     val ownPlaylists = _ownPlaylists.asStateFlow()
     private val _savedPlaylists = MutableStateFlow<List<Card>>(emptyList())
     val savedPlaylists = _savedPlaylists.asStateFlow()
+    private val _catalogVersion = MutableStateFlow(0L)
+    val catalogVersion = _catalogVersion.asStateFlow()
+    private var baseLikes = emptySet<String>()
+    private var baseDislikes = emptySet<String>()
+    private var baseSavedCards = emptySet<String>()
+    private var baseOwnPlaylists = emptyList<Card>()
+    private var baseSavedPlaylists = emptyList<Card>()
     private val _sleepTimer = MutableStateFlow(SleepState())
     val sleepTimer = _sleepTimer.asStateFlow()
     private val _message = kotlinx.coroutines.flow.MutableSharedFlow<String>(extraBufferCapacity = 4)
@@ -87,10 +97,8 @@ internal class MusicStore(val context: Context) {
         if (token != null) {
             _profile.value = preferences.getString("profile", null)?.let { raw -> optional { decodeProfile(JSONObject(raw)) } }
             _profile.value?.let { user ->
-                _likes.value = applyRestoredLikes(preferences.getStringSet("likes:${user.uid}", emptySet()).orEmpty(), pendingRestoredLikes(user.uid))
-                _dislikes.value = preferences.getStringSet("dislikes:${user.uid}", emptySet()).orEmpty().toSet()
-                _savedCards.value = preferences.getStringSet("cards:${user.uid}", emptySet()).orEmpty().toSet()
-                loadSavedPlaylists(user.uid)
+                loadUserBaseState(user.uid)
+                applyCatalogLibraryOverlay(user.uid)
                 files.switchUser(user.uid)
                 waveExtras.resetUser(user.uid)
                 uploads.resume()
@@ -104,7 +112,13 @@ internal class MusicStore(val context: Context) {
                 }
             }
         }
-        scope.launch { refreshVersions() }
+        scope.launch {
+            refreshVersions(forceCatalog = true)
+            while (isActive) {
+                delay(120_000L)
+                refreshCatalogPeriodic()
+            }
+        }
     }
 
     var offline: Boolean
@@ -119,7 +133,20 @@ internal class MusicStore(val context: Context) {
 
     var alternateEnabled: Boolean
         get() = preferences.getBoolean("alternate", false)
-        set(value) { preferences.edit().putBoolean("alternate", value).apply() }
+        set(value) {
+            if (value == alternateEnabled) return
+            preferences.edit().putBoolean("alternate", value).apply()
+            _catalogVersion.value++
+        }
+
+    var catalogEnabled: Boolean
+        get() = preferences.getBoolean("catalog", true)
+        set(value) {
+            if (value == catalogEnabled) return
+            preferences.edit().putBoolean("catalog", value).apply()
+            profile.value?.uid?.let(::applyCatalogLibraryOverlay)
+            _catalogVersion.value++
+        }
 
     var wifiOnly: Boolean
         get() = preferences.getBoolean("wifiOnly", false)
@@ -140,21 +167,44 @@ internal class MusicStore(val context: Context) {
     fun message(text: String) { _message.tryEmit(text) }
     fun setSleepState(state: SleepState) { _sleepTimer.value = state }
 
-    suspend fun refreshVersions(): Boolean = withContext(Dispatchers.IO) {
-        val ready = versions.refresh(network = !offline)
-        if (ready && !offline) token?.let { credential ->
+    suspend fun refreshVersions(forceCatalog: Boolean = false): Boolean = withContext(Dispatchers.IO) {
+        val beforeSig = versions.catalogSignature()
+        val ready = versions.refresh(network = !offline, forceCatalog = forceCatalog)
+        if (ready && !offline && alternateEnabled) token?.let { credential ->
             val client = MusicApi(credential, versions)
             versions.ensureRestored(network = true, client::rawTracks)
+        }
+        val afterSig = versions.catalogSignature()
+        if (beforeSig != afterSig) {
+            profile.value?.uid?.let(::applyCatalogLibraryOverlay)
+            _catalogVersion.value++
         }
         ready
     }
 
+    private suspend fun refreshCatalogPeriodic() = withContext(Dispatchers.IO) {
+        if (offline || !catalogEnabled) return@withContext
+        val (_, changed) = versions.refreshCatalog(network = true, force = false)
+        if (changed) {
+            profile.value?.uid?.let(::applyCatalogLibraryOverlay)
+            _catalogVersion.value++
+        }
+    }
+
     fun allowsAlternate(uid: String, id: String) = alternateEnabled && overrides.read(uid, "track", id).usePlugin
+    fun allowsCatalog(uid: String, id: String) = catalogEnabled && overrides.read(uid, "track", id).usePlugin
+    fun allowsPluginAudio(uid: String, id: String) = (alternateEnabled || catalogEnabled) && overrides.read(uid, "track", id).usePlugin
 
     fun api(): MusicApi {
         if (offline) throw MusicError("Включён офлайн-режим")
         val uid = profile.value?.uid
-        return MusicApi(token ?: throw MusicError("Войдите через Яндекс", 401), versions) { type, id ->
+        return MusicApi(
+            token = token ?: throw MusicError("Войдите через Яндекс", 401),
+            versions = versions,
+            catalogLibrary = catalogLibrary,
+            activeUid = uid,
+            catalogEnabled = { catalogEnabled },
+        ) { type, id ->
             uid?.let { overrides.read(it, type, id) } ?: MetadataOverride()
         }
     }
@@ -237,6 +287,11 @@ internal class MusicStore(val context: Context) {
         offline = false
         preferences.edit().remove("profile").remove("activeAccount").apply()
         _profile.value = null
+        baseLikes = emptySet()
+        baseDislikes = emptySet()
+        baseSavedCards = emptySet()
+        baseOwnPlaylists = emptyList()
+        baseSavedPlaylists = emptyList()
         _likes.value = emptySet()
         _dislikes.value = emptySet()
         _savedCards.value = emptySet()
@@ -252,14 +307,72 @@ internal class MusicStore(val context: Context) {
         return Profile(uid, value.text("name") ?: "Яндекс", value.optBoolean("plus"), value.text("login").orEmpty())
     }
 
+    private fun isSyntheticCardKey(key: String): Boolean = when {
+        key.startsWith("ALBUM::") -> versions.isSyntheticAlbumId(key.removePrefix("ALBUM::"))
+        key.startsWith("ARTIST::") -> versions.isSyntheticArtistId(key.removePrefix("ARTIST::"))
+        key.startsWith("PLAYLIST:${AlternateVersions.CATALOG_OWNER}:") -> true
+        else -> false
+    }
+
+    private fun catalogPlaylistCard(kind: String): Card? {
+        val (fields, trackIds) = versions.catalogPlaylist(kind) ?: return null
+        val title = fields.text("title") ?: return null
+        return Card(
+            Kind.PLAYLIST,
+            kind,
+            title,
+            "Каталог Tune",
+            fields.text("coverUri"),
+            AlternateVersions.CATALOG_OWNER,
+            trackCount = trackIds.size,
+        )
+    }
+
+    private fun loadUserBaseState(uid: String) {
+        baseLikes = applyRestoredLikes(
+            preferences.getStringSet("likes:$uid", emptySet()).orEmpty().filterNot(versions::isSyntheticTrackId).toSet(),
+            pendingRestoredLikes(uid),
+        )
+        baseDislikes = preferences.getStringSet("dislikes:$uid", emptySet()).orEmpty()
+            .filterNot(versions::isSyntheticTrackId).toSet()
+        baseSavedCards = preferences.getStringSet("cards:$uid", emptySet()).orEmpty()
+            .filterNot(::isSyntheticCardKey).toSet()
+        loadSavedPlaylists(uid)
+    }
+
+    private fun applyCatalogLibraryOverlay(uid: String) {
+        if (profile.value?.uid != uid) return
+        if (!catalogEnabled) {
+            _likes.value = baseLikes
+            _dislikes.value = baseDislikes
+            _savedCards.value = baseSavedCards
+            _ownPlaylists.value = baseOwnPlaylists
+            _savedPlaylists.value = baseSavedPlaylists
+            return
+        }
+        val lib = catalogLibrary.snapshot(uid)
+        _likes.value = baseLikes + lib.likedTracks
+        _dislikes.value = baseDislikes + lib.dislikedTracks
+        val localKeys = buildSet {
+            lib.likedAlbums.forEach { add("ALBUM::$it") }
+            lib.likedArtists.forEach { add("ARTIST::$it") }
+            lib.likedPlaylists.forEach { add("PLAYLIST:${AlternateVersions.CATALOG_OWNER}:$it") }
+        }
+        _savedCards.value = baseSavedCards + localKeys
+        _ownPlaylists.value = baseOwnPlaylists.map { card ->
+            val extra = lib.playlistTracks["${card.owner}:${card.id}"]?.size ?: 0
+            if (extra > 0) card.copy(trackCount = card.trackCount + extra) else card
+        }
+        val localPlaylists = lib.likedPlaylists.mapNotNull(::catalogPlaylistCard)
+        _savedPlaylists.value = (localPlaylists + baseSavedPlaylists).distinctBy { it.key }
+    }
+
     private fun setProfile(account: Profile) {
         if (_profile.value?.uid != account.uid) {
-            _likes.value = applyRestoredLikes(preferences.getStringSet("likes:${account.uid}", emptySet()).orEmpty(), pendingRestoredLikes(account.uid))
-            _dislikes.value = preferences.getStringSet("dislikes:${account.uid}", emptySet()).orEmpty().toSet()
-            _savedCards.value = preferences.getStringSet("cards:${account.uid}", emptySet()).orEmpty().toSet()
-            loadSavedPlaylists(account.uid)
+            loadUserBaseState(account.uid)
         }
         _profile.value = account
+        applyCatalogLibraryOverlay(account.uid)
         files.switchUser(account.uid)
         waveExtras.resetUser(account.uid)
         val saved = accounts().filterNot { it.uid == account.uid } + account
@@ -287,15 +400,26 @@ internal class MusicStore(val context: Context) {
             if (token != credential) return@coroutineScope
             val syncedLikes = syncRestoredLikes(account.uid, credential)
             if (token != credential) return@coroutineScope
-            (syncedLikes ?: likedIds)?.let { _likes.value = applyRestoredLikes(it, pendingRestoredLikes(account.uid)) }
-            dislikedIds?.let { _dislikes.value = it }
-            _savedCards.value = cardSets.fold(_savedCards.value) { existing, (kind, entries) ->
-                if (entries == null) existing else existing.filterNot { it.startsWith(kind.name + ":") }.toSet() + entries.map { it.key }
+            (syncedLikes ?: likedIds)?.let {
+                baseLikes = applyRestoredLikes(it.filterNot(versions::isSyntheticTrackId).toSet(), pendingRestoredLikes(account.uid))
             }
-            own?.let { _ownPlaylists.value = it }
+            dislikedIds?.let { baseDislikes = it.filterNot(versions::isSyntheticTrackId).toSet() }
+            baseSavedCards = cardSets.fold(baseSavedCards) { existing, (kind, entries) ->
+                if (entries == null) existing
+                else existing.filterNot { it.startsWith(kind.name + ":") }.toSet() +
+                    entries.map { it.key }.filterNot(::isSyntheticCardKey)
+            }
+            own?.let { serverOwned ->
+                val lib = catalogLibrary.snapshot(account.uid)
+                baseOwnPlaylists = serverOwned.map { card ->
+                    val extra = if (catalogEnabled) lib.playlistTracks["${card.owner}:${card.id}"]?.size ?: 0 else 0
+                    if (extra > 0) card.copy(trackCount = (card.trackCount - extra).coerceAtLeast(0)) else card
+                }
+            }
             cardSets.firstOrNull { it.first == Kind.PLAYLIST }?.second?.let {
-                _savedPlaylists.value = it.filterNot { card -> card.owner == account.uid }
+                baseSavedPlaylists = it.filterNot { card -> card.owner == account.uid || card.owner == AlternateVersions.CATALOG_OWNER }
             }
+            applyCatalogLibraryOverlay(account.uid)
             savePlaylists(account.uid)
             saveRatings(account.uid)
             refreshAutomaticDownloads()
@@ -305,6 +429,16 @@ internal class MusicStore(val context: Context) {
 
     suspend fun rate(track: Track, dislike: Boolean = false): Boolean = updates.withLock {
         val account = requireUser()
+        if (versions.isSyntheticTrackId(track.id)) {
+            val state = if (dislike) _dislikes else _likes
+            val add = track.id !in state.value
+            catalogLibrary.mutate(account.uid) {
+                if (dislike) it.setTrackDisliked(track.id, add) else it.setTrackLiked(track.id, add)
+            }
+            applyCatalogLibraryOverlay(account.uid)
+            if (!dislike && add) refreshAutomaticDownloads()
+            return@withLock add
+        }
         val state = if (dislike) _dislikes else _likes
         val add = track.id !in state.value
         val credential = token ?: throw MusicError("Войдите через Яндекс", 401)
@@ -312,14 +446,16 @@ internal class MusicStore(val context: Context) {
         if (!dislike && (track.id in pending || track.alternate && track.originalAvailable == false)) {
             val date = if (add) System.currentTimeMillis() else 0L
             saveRestoredLikes(account.uid, pending + (track.id to date))
-            _likes.value = applyRestoredLikes(_likes.value, mapOf(track.id to date))
+            baseLikes = applyRestoredLikes(baseLikes, mapOf(track.id to date))
+            applyCatalogLibraryOverlay(account.uid)
             saveRatings(account.uid)
             scope.launch {
                 updates.withLock sync@{
                     if (token != credential) return@sync
                     val confirmed = syncRestoredLikes(account.uid, credential)
                     if (confirmed != null && token == credential) {
-                        _likes.value = applyRestoredLikes(confirmed, pendingRestoredLikes(account.uid))
+                        baseLikes = applyRestoredLikes(confirmed.filterNot(versions::isSyntheticTrackId).toSet(), pendingRestoredLikes(account.uid))
+                        applyCatalogLibraryOverlay(account.uid)
                         saveRatings(account.uid)
                     }
                 }
@@ -329,15 +465,25 @@ internal class MusicStore(val context: Context) {
         }
         online { setTrackRating(account.uid, track.id, dislike, add) }
         if (token == credential) {
-            state.value = if (add) state.value + track.id else state.value - track.id
+            if (dislike) {
+                baseDislikes = if (add) baseDislikes + track.id else baseDislikes - track.id
+            } else {
+                baseLikes = if (add) baseLikes + track.id else baseLikes - track.id
+            }
             if (add) {
-                val other = if (dislike) _likes else _dislikes
-                if (track.id in other.value && optional {
+                val otherIsLikes = dislike
+                val otherSet = if (otherIsLikes) baseLikes else baseDislikes
+                if (track.id in otherSet && optional {
                     online { setTrackRating(account.uid, track.id, !dislike, false) }
                     true
-                } == true && token == credential) other.value = other.value - track.id
+                } == true && token == credential) {
+                    if (otherIsLikes) baseLikes = baseLikes - track.id else baseDislikes = baseDislikes - track.id
+                }
             }
-            if (token == credential) saveRatings(account.uid)
+            if (token == credential) {
+                applyCatalogLibraryOverlay(account.uid)
+                saveRatings(account.uid)
+            }
         }
         if (!dislike && add) refreshAutomaticDownloads()
         add
@@ -375,12 +521,21 @@ internal class MusicStore(val context: Context) {
         val uid = requireUser().uid
         fun includePending(tracks: List<Track>): List<Track> {
             val pending = pendingRestoredLikes(uid)
+            val localEntries = if (catalogEnabled) catalogLibrary.likedTrackEntries(uid) else emptyList()
+            val localIds = localEntries.mapTo(HashSet()) { it.first }
             val byId = tracks.associateBy { it.id }
-            val added = pending.entries.filter { it.value > 0 }.sortedByDescending { it.value }.mapNotNull { (id, date) ->
+            val localAdded = localEntries.mapNotNull { (id, date) ->
+                val track = byId[id] ?: versions.synthetic(id)
+                track?.copy(addedAt = date)
+            }
+            val pendingAdded = pending.entries.filter { it.value > 0 && it.key !in localIds }.sortedByDescending { it.value }.mapNotNull { (id, date) ->
                 val track = byId[id] ?: versions.synthetic(id)?.takeIf { allowsAlternate(uid, id) }
                 track?.copy(addedAt = date)
             }
-            return added + tracks.filterNot { it.id in pending }
+            val filtered = tracks.filterNot {
+                it.id in pending || it.id in localIds || (!catalogEnabled && versions.isSyntheticTrackId(it.id))
+            }
+            return localAdded + pendingAdded + filtered
         }
         var cacheHasTracks = false
         var firstPage: List<Track>? = null
@@ -411,52 +566,138 @@ internal class MusicStore(val context: Context) {
         }
     }
 
+    suspend fun dislikedTracksList(): List<Track> {
+        val uid = requireUser().uid
+        val localIds = if (catalogEnabled) catalogLibrary.dislikedTracks(uid) else emptyList()
+        val remote = cachedTracks("dislikes") {
+            online { tracks(libraryIds(uid, dislike = true)) }
+        }
+        if (!catalogEnabled) return remote.filterNot { versions.isSyntheticTrackId(it.id) }
+        val byId = remote.associateBy { it.id }
+        val local = localIds.mapNotNull { id -> byId[id] ?: versions.synthetic(id) }
+        return (local + remote).distinctBy { it.id }
+    }
+
     suspend fun save(card: Card) = updates.withLock {
         val account = requireUser()
-        val credential = token
         val add = card.key !in _savedCards.value
+        when {
+            card.kind == Kind.ALBUM && versions.isSyntheticAlbumId(card.id) -> {
+                catalogLibrary.mutate(account.uid) { it.setAlbumLiked(card.id, add) }
+                applyCatalogLibraryOverlay(account.uid)
+                return@withLock add
+            }
+            card.kind == Kind.ARTIST && versions.isSyntheticArtistId(card.id) -> {
+                catalogLibrary.mutate(account.uid) { it.setArtistLiked(card.id, add) }
+                applyCatalogLibraryOverlay(account.uid)
+                return@withLock add
+            }
+            card.kind == Kind.PLAYLIST && versions.isSyntheticPlaylistId(card.id, card.owner) -> {
+                catalogLibrary.mutate(account.uid) { it.setPlaylistLiked(card.id, add) }
+                applyCatalogLibraryOverlay(account.uid)
+                return@withLock add
+            }
+        }
+        val credential = token
         online { setCardLiked(account.uid, card, add) }
         if (token == credential) {
-            _savedCards.value = if (add) _savedCards.value + card.key else _savedCards.value - card.key
+            baseSavedCards = if (add) baseSavedCards + card.key else baseSavedCards - card.key
             if (card.kind == Kind.PLAYLIST) {
-                _savedPlaylists.value = if (add) listOf(card) + _savedPlaylists.value else _savedPlaylists.value.filterNot { it.key == card.key }
+                baseSavedPlaylists = if (add) listOf(card) + baseSavedPlaylists else baseSavedPlaylists.filterNot { it.key == card.key }
                 savePlaylists(account.uid)
             }
+            applyCatalogLibraryOverlay(account.uid)
             saveRatings(account.uid)
         }
         add
     }
 
+    suspend fun hideArtist(id: String, hide: Boolean) = updates.withLock {
+        val account = requireUser()
+        if (versions.isSyntheticArtistId(id)) {
+            catalogLibrary.mutate(account.uid) { it.setArtistDisliked(id, hide) }
+            applyCatalogLibraryOverlay(account.uid)
+            return@withLock
+        }
+        online { setArtistHidden(account.uid, id, hide) }
+        if (hide) {
+            val key = Card(Kind.ARTIST, id, "").key
+            if (key in baseSavedCards) {
+                baseSavedCards = baseSavedCards - key
+                saveRatings(account.uid)
+                applyCatalogLibraryOverlay(account.uid)
+            }
+        }
+    }
+
+    suspend fun editPlaylistTracks(card: Card, tracks: List<Track>, remove: Boolean = false) {
+        val uid = requireUser().uid
+        val (synthetic, native) = tracks.partition { versions.isSyntheticTrackId(it.id) }
+        if (native.isNotEmpty()) {
+            online { editPlaylist(card, native, remove) }
+        }
+        if (synthetic.isNotEmpty() && card.owner != null) {
+            val key = "${card.owner}:${card.id}"
+            catalogLibrary.mutate(uid) { data ->
+                if (remove) data.removePlaylistTracks(key, synthetic.map { it.id }.toSet())
+                else data.addPlaylistTracks(key, synthetic.map { it.id })
+            }
+        }
+        if (native.isNotEmpty()) {
+            val delta = if (remove) -native.size else native.size
+            val idx = baseOwnPlaylists.indexOfFirst { it.key == card.key }
+            if (idx >= 0) {
+                val updated = baseOwnPlaylists.toMutableList()
+                updated[idx] = updated[idx].copy(trackCount = (updated[idx].trackCount + delta).coerceAtLeast(0))
+                baseOwnPlaylists = updated
+                savePlaylists(uid)
+            }
+        }
+        applyCatalogLibraryOverlay(uid)
+    }
+
+    suspend fun deleteOwnedPlaylist(card: Card) {
+        val uid = requireUser().uid
+        online { deletePlaylist(card) }
+        changeLocalPlaylist(card, remove = true)
+    }
+
     private fun saveRatings(uid: String) {
-        preferences.edit().putStringSet("likes:$uid", _likes.value).putStringSet("dislikes:$uid", _dislikes.value)
-            .putStringSet("cards:$uid", _savedCards.value).apply()
+        preferences.edit().putStringSet("likes:$uid", baseLikes).putStringSet("dislikes:$uid", baseDislikes)
+            .putStringSet("cards:$uid", baseSavedCards).apply()
     }
 
     fun changeLocalPlaylist(card: Card, remove: Boolean = false) {
         val uid = _profile.value?.uid ?: return
         if (card.owner != uid) return
-        val index = _ownPlaylists.value.indexOfFirst { it.key == card.key }
-        _ownPlaylists.value = _ownPlaylists.value.toMutableList().apply {
+        val index = baseOwnPlaylists.indexOfFirst { it.key == card.key }
+        val localCount = catalogLibrary.playlistTracks(uid, uid, card.id).size
+        val baseCard = if (catalogEnabled && localCount > 0) {
+            card.copy(trackCount = (card.trackCount - localCount).coerceAtLeast(0))
+        } else card
+        baseOwnPlaylists = baseOwnPlaylists.toMutableList().apply {
             when {
                 remove && index >= 0 -> removeAt(index)
-                !remove && index >= 0 -> set(index, card)
-                !remove -> add(0, card)
+                !remove && index >= 0 -> set(index, baseCard)
+                !remove -> add(0, baseCard)
             }
         }
+        if (remove) catalogLibrary.mutate(uid) { it.clearPlaylist("${card.owner}:${card.id}") }
         savePlaylists(uid)
+        applyCatalogLibraryOverlay(uid)
     }
 
     private fun loadSavedPlaylists(uid: String) {
         fun read(key: String): List<Card> = optional {
             JSONArray(preferences.getString("$key:$uid", "[]")).objects().mapNotNull(Card::fromCache)
         }.orEmpty()
-        _ownPlaylists.value = read("ownPlaylists")
-        _savedPlaylists.value = read("savedPlaylists")
+        baseOwnPlaylists = read("ownPlaylists")
+        baseSavedPlaylists = read("savedPlaylists").filterNot { it.owner == AlternateVersions.CATALOG_OWNER }
     }
 
     private fun savePlaylists(uid: String) {
-        preferences.edit().putString("ownPlaylists:$uid", JSONArray(_ownPlaylists.value.map(Card::cached)).toString())
-            .putString("savedPlaylists:$uid", JSONArray(_savedPlaylists.value.map(Card::cached)).toString()).apply()
+        preferences.edit().putString("ownPlaylists:$uid", JSONArray(baseOwnPlaylists.map(Card::cached)).toString())
+            .putString("savedPlaylists:$uid", JSONArray(baseSavedPlaylists.map(Card::cached)).toString()).apply()
     }
 
     private fun automaticKey() = profile.value?.uid?.let { "automaticDownloads:$it" }
@@ -483,7 +724,8 @@ internal class MusicStore(val context: Context) {
             if ("likes" in targets) {
                 val tracks = optional {
                     online {
-                        val ids = applyRestoredLikes(libraryIds(user.uid).toSet(), pendingRestoredLikes(user.uid))
+                        val local = if (catalogEnabled) catalogLibrary.likedTracks(user.uid) else emptyList()
+                        val ids = (local + applyRestoredLikes(libraryIds(user.uid).toSet(), pendingRestoredLikes(user.uid))).distinct()
                         tracks(ids.filterNot(files::hasId))
                     }
                 }
@@ -585,8 +827,24 @@ internal class MusicStore(val context: Context) {
 
     suspend fun collection(kind: Kind, onCached: ((List<Card>) -> Unit)? = null): List<Card> {
         val uid = requireUser().uid
-        return cached("collection:${kind.name}", { JSONObject().put("cards", JSONArray(it.map(Card::cached))) },
-            { it.arr("cards").objects().mapNotNull(Card::fromCache) }, onCached) { online { likedCards(uid, kind) } }
+        fun withLocal(cards: List<Card>): List<Card> {
+            val nonSynthetic = cards.filterNot { card ->
+                (kind == Kind.ALBUM && versions.isSyntheticAlbumId(card.id)) ||
+                    (kind == Kind.ARTIST && versions.isSyntheticArtistId(card.id))
+            }
+            if (!catalogEnabled) return nonSynthetic
+            val local = when (kind) {
+                Kind.ALBUM -> catalogLibrary.likedAlbums(uid).mapNotNull { id -> versions.catalogAlbum(id)?.let { Card.album(it) } }
+                Kind.ARTIST -> catalogLibrary.likedArtists(uid).mapNotNull { id -> versions.catalogArtist(id)?.first?.let(Card::artist) }
+                else -> emptyList()
+            }
+            return (local + nonSynthetic).distinctBy { it.key }
+        }
+        return withLocal(cached("collection:${kind.name}", { JSONObject().put("cards", JSONArray(it.map(Card::cached))) },
+            { it.arr("cards").objects().mapNotNull(Card::fromCache) },
+            onCached?.let { display -> { cachedCards -> display(withLocal(cachedCards)) } }) {
+            online { likedCards(uid, kind) }
+        })
     }
 
     suspend fun topArtists(onCached: ((List<Card>) -> Unit)? = null): List<Card> {
@@ -635,15 +893,16 @@ internal class MusicStore(val context: Context) {
     }
 
     suspend fun cachedSearch(query: String, type: String): SearchResults? {
-        val key = SearchCache.Key(requireUser().uid, query, type, alternateEnabled)
+        val key = SearchCache.Key(requireUser().uid, query, type, alternateEnabled, catalogEnabled, versions.catalogSignature())
         return withContext(Dispatchers.IO) { searchCache.read(key) }
     }
 
     suspend fun searchPage(query: String, type: String, page: Int): SearchResults {
-        val key = SearchCache.Key(requireUser().uid, query, type, alternateEnabled)
+        val key = SearchCache.Key(requireUser().uid, query, type, alternateEnabled, catalogEnabled, versions.catalogSignature())
         return online {
             search(query, type, page).also { results ->
                 if (page == 0 && type != "lyrics" && profile.value?.uid == key.account && alternateEnabled == key.uncensored &&
+                    catalogEnabled == key.catalog && versions.catalogSignature() == key.catalogVersion &&
                     (!key.uncensored || versions.hasRestoredIndex())) {
                     searchCache.write(key, results)
                 }

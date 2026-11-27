@@ -577,7 +577,8 @@ class PlaybackService : MediaLibraryService(), Player.Listener {
         levels?.cancel()
         if (crossfade?.mixing == true) return
         player.volume = baseVolume(track)
-        if (!store.preferences.getBoolean("normalize", true) || track == null || track.loudness != null || store.offline) return
+        if (!store.preferences.getBoolean("normalize", true) || track == null || track.loudness != null || store.offline ||
+            store.versions.isSyntheticTrackId(track.id)) return
         levels = scope.launch {
             val updated = optional { store.online { tracks(listOf(track.id)) } }?.firstOrNull() ?: return@launch
             if (player.currentMediaItem?.mediaId == track.id && crossfade?.mixing != true) player.volume = baseVolume(updated)

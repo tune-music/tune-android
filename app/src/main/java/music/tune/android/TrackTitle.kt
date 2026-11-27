@@ -29,12 +29,18 @@ internal class TrackTitle(
         background = ui.shape(surface, 3)
         contentDescription = "Без цензуры"
     }
+    private val catalogTrack = ui.text("T", (badgeSize * .68f).toInt(), ink, bold = true).apply {
+        typeface = Typeface.create("sans-serif-black", Typeface.NORMAL)
+        gravity = Gravity.CENTER
+        background = ui.shape(surface, 3)
+        contentDescription = "Каталог Tune"
+    }
     private val privateTrack = IconView(context, Symbol.EYE_OFF, if (onDark) 0x99ffffff.toInt() else ui.palette.muted).apply {
         iconSize = (badgeSize * .86f).toInt()
         contentDescription = "Этот трек можете слушать только вы"
     }
     private val badges = ui.row().apply {
-        listOf(explicit, uncensored, privateTrack).forEach { badge ->
+        listOf(explicit, uncensored, catalogTrack, privateTrack).forEach { badge ->
             addView(badge, LinearLayout.LayoutParams(ui.dp(badgeSize), ui.dp(badgeSize)).apply { marginStart = ui.dp(4) })
         }
     }
@@ -48,10 +54,24 @@ internal class TrackTitle(
     fun bind(track: Track?) {
         val name = track?.title.orEmpty()
         if (label.text != name) label.text = name
+        val store = (context.applicationContext as? TuneApp)?.store
+        val uid = store?.profile?.value?.uid
+        val usePlugin = track != null && (uid == null || store?.overrides?.read(uid, "track", track.id)?.usePlugin != false)
+        val isCatalog = track != null && usePlugin && when {
+            store != null && store.versions.hasCatalogLoaded() -> store.versions.isCatalogTrack(track.id)
+            store != null -> store.catalogEnabled && track.catalog
+            else -> track.catalog
+        }
+        val isUncensored = track != null && usePlugin && !isCatalog && when {
+            store != null && store.versions.hasFckLoaded() -> store.versions.hasFckAudio(track.id)
+            store != null -> store.alternateEnabled && track.alternate
+            else -> track.alternate
+        }
         explicit.visibility = visible(track?.explicit == true)
-        uncensored.visibility = visible(track?.alternate == true)
+        uncensored.visibility = visible(isUncensored)
+        catalogTrack.visibility = visible(isCatalog)
         privateTrack.visibility = visible(track?.uploaded == true)
-        badges.visibility = visible(track?.let { it.explicit || it.alternate || it.uploaded } == true)
+        badges.visibility = visible(track?.let { it.explicit || isUncensored || isCatalog || it.uploaded } == true)
     }
 
     private fun visible(value: Boolean) = if (value) View.VISIBLE else View.GONE
