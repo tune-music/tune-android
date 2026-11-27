@@ -55,6 +55,24 @@ internal class MusicStore(val context: Context) {
     val overrides = MetadataOverrides(context)
     private val vault = TokenVault(context)
     private val updates = Mutex()
+    private val syncMutex = Mutex()
+    private val syncStateLock = Any()
+    private var syncDirtyUid: String? = null
+    private var syncJob: kotlinx.coroutines.Job? = null
+    private val tuneCoverJpeg: ByteArray? by lazy {
+        optional {
+            val bitmap = android.graphics.BitmapFactory.decodeResource(context.resources, R.drawable.tune_icon)
+                ?: return@optional null
+            try {
+                java.io.ByteArrayOutputStream().use { out ->
+                    bitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 92, out)
+                    out.toByteArray()
+                }
+            } finally {
+                bitmap.recycle()
+            }
+        }
+    }
     private var automaticDownloads: kotlinx.coroutines.Job? = null
     private val _profile = MutableStateFlow<Profile?>(null)
     val profile = _profile.asStateFlow()
@@ -94,6 +112,7 @@ internal class MusicStore(val context: Context) {
     @Volatile private var token: String? = preferences.getString("activeAccount", null)?.let(vault::read) ?: vault.read()
 
     init {
+        catalogLibrary.onLocalMutate = { uid -> scheduleCatalogSync(uid) }
         if (token != null) {
             _profile.value = preferences.getString("profile", null)?.let { raw -> optional { decodeProfile(JSONObject(raw)) } }
             _profile.value?.let { user ->
@@ -128,7 +147,10 @@ internal class MusicStore(val context: Context) {
             preferences.edit().putBoolean("offline", value).apply()
             files.updateNetworkPolicy()
             ynison.reconnect()
-            if (!value) refreshAutomaticDownloads()
+            if (!value) {
+                refreshAutomaticDownloads()
+                profile.value?.uid?.let(::scheduleCatalogSync)
+            }
         }
 
     var alternateEnabled: Boolean
@@ -195,17 +217,197 @@ internal class MusicStore(val context: Context) {
     fun allowsCatalog(uid: String, id: String) = catalogEnabled && overrides.read(uid, "track", id).usePlugin
     fun allowsPluginAudio(uid: String, id: String) = (alternateEnabled || catalogEnabled) && overrides.read(uid, "track", id).usePlugin
 
-    fun api(): MusicApi {
-        if (offline) throw MusicError("Включён офлайн-режим")
+    private fun rawApi(credential: String, triggerSync: Boolean): MusicApi {
         val uid = profile.value?.uid
         return MusicApi(
-            token = token ?: throw MusicError("Войдите через Яндекс", 401),
+            token = credential,
             versions = versions,
             catalogLibrary = catalogLibrary,
             activeUid = uid,
             catalogEnabled = { catalogEnabled },
+            onSyncShards = if (triggerSync) ({ shardUid, shards -> onRemoteSyncShards(shardUid, shards) }) else null,
         ) { type, id ->
             uid?.let { overrides.read(it, type, id) } ?: MetadataOverride()
+        }
+    }
+
+    fun api(): MusicApi {
+        if (offline) throw MusicError("Включён офлайн-режим")
+        val credential = token ?: throw MusicError("Войдите через Яндекс", 401)
+        return rawApi(credential, triggerSync = true)
+    }
+
+    private fun shardSlot(shard: RemoteSyncShard): Int {
+        TuneSync.parseEnvelope(shard.description)?.let { return it.part - 1 }
+        if (shard.title == TuneSync.TITLE_PRIMARY) return 0
+        val num = shard.title.removePrefix("Tune Sync ").toIntOrNull()
+        return if (num != null && num >= 2) num - 1 else Int.MAX_VALUE
+    }
+
+    private fun decodeRemoteShards(shards: List<RemoteSyncShard>, uid: String): Pair<CatalogLibraryData?, Boolean> {
+        if (shards.isEmpty()) return null to false
+        val descriptions = shards.map { it.description }
+        val envelopes = descriptions.mapNotNull(TuneSync::parseEnvelope)
+        if (envelopes.isEmpty()) return null to false
+        val assembled = TuneSync.assembleShards(descriptions)
+        if (assembled != null) {
+            val decoded = CatalogLibraryData.decodePayload(assembled, uid)
+            return if (decoded != null) decoded to false else null to true
+        }
+        if (envelopes.any { it.total > 1 }) return null to true
+        var combined: CatalogLibraryData? = null
+        for (env in envelopes) {
+            val decoded = CatalogLibraryData.decodePayload(env.chunk, uid) ?: return null to true
+            combined = combined?.mergeWith(decoded, uid) ?: decoded
+        }
+        return combined to false
+    }
+
+    private fun onRemoteSyncShards(uid: String, shards: List<RemoteSyncShard>) {
+        if (offline || profile.value?.uid != uid) return
+        val (remoteData, partialOrCorrupted) = decodeRemoteShards(shards, uid)
+        if (!partialOrCorrupted && remoteData != null) {
+            val changed = catalogLibrary.applyMerged(uid) { local -> local.mergeWith(remoteData, uid) }
+            if (changed) {
+                scope.launch {
+                    updates.withLock {
+                        applyCatalogLibraryOverlay(uid)
+                        _catalogVersion.value++
+                    }
+                }
+            }
+        }
+        val nowSec = System.currentTimeMillis() / 1000L
+        val payload = catalogLibrary.snapshot(uid).encodePayload(uid, nowSec)
+        val needsPush = if (payload.isEmpty()) {
+            !partialOrCorrupted && shards.isNotEmpty()
+        } else {
+            val expected = TuneSync.splitShards(payload)
+            if (shards.size != expected.size) {
+                true
+            } else {
+                val bySlot = shards.associateBy(::shardSlot)
+                expected.indices.any { idx ->
+                    val existing = bySlot[idx]
+                    existing == null ||
+                        existing.title != expected[idx].title ||
+                        !existing.isPrivate ||
+                        !existing.hasCustomCover ||
+                        existing.description != expected[idx].description
+                }
+            }
+        }
+        if (needsPush) scheduleCatalogSync(uid)
+    }
+
+    internal fun scheduleCatalogSync(uid: String) {
+        if (offline) return
+        val credential = token ?: return
+        if (profile.value?.uid != uid) return
+        synchronized(syncStateLock) {
+            syncDirtyUid = uid
+            if (syncJob?.isActive == true) return
+            syncJob = scope.launch(Dispatchers.IO) {
+                runPendingCatalogSync(credential)
+            }
+        }
+    }
+
+    private suspend fun runPendingCatalogSync(initialCredential: String) {
+        while (true) {
+            val uid = synchronized(syncStateLock) {
+                val target = syncDirtyUid
+                syncDirtyUid = null
+                if (target == null) {
+                    syncJob = null
+                    return
+                }
+                target
+            }
+            if (offline || token != initialCredential || profile.value?.uid != uid) {
+                synchronized(syncStateLock) { syncJob = null }
+                return
+            }
+            delay(150L)
+            syncMutex.withLock {
+                if (!offline && token == initialCredential && profile.value?.uid == uid) {
+                    optional { performCatalogSyncPush(uid, initialCredential) }
+                }
+            }
+        }
+    }
+
+    private suspend fun performCatalogSyncPush(uid: String, credential: String) {
+        versions.ensureLoaded(network = true)
+        val client = rawApi(credential, triggerSync = false)
+        val (_, initialShards) = client.playlistsWithSync(uid)
+        val (remoteData, partialOrCorrupted) = decodeRemoteShards(initialShards, uid)
+        if (!partialOrCorrupted && remoteData != null) {
+            val changed = catalogLibrary.applyMerged(uid) { local -> local.mergeWith(remoteData, uid) }
+            if (changed) {
+                scope.launch {
+                    updates.withLock {
+                        applyCatalogLibraryOverlay(uid)
+                        _catalogVersion.value++
+                    }
+                }
+            }
+        }
+        if (offline || token != credential || profile.value?.uid != uid) return
+        val nowSec = System.currentTimeMillis() / 1000L
+        val payload = catalogLibrary.snapshot(uid).encodePayload(uid, nowSec)
+        val targetShards = TuneSync.splitShards(payload)
+        val sortedShards = initialShards.sortedWith(
+            compareBy<RemoteSyncShard> { it.kind.toLongOrNull() ?: Long.MAX_VALUE }.thenBy { it.kind },
+        )
+        if (targetShards.isEmpty()) {
+            if (!partialOrCorrupted || initialShards.all { TuneSync.parseEnvelope(it.description) == null }) {
+                for (shard in sortedShards) {
+                    optional { client.deletePlaylistRaw(uid, shard.kind) }
+                }
+            }
+            return
+        }
+        val pool = sortedShards.toMutableList()
+        val assigned = arrayOfNulls<RemoteSyncShard>(targetShards.size)
+        for (i in targetShards.indices) {
+            val idx = pool.indexOfFirst { shardSlot(it) == i }
+            if (idx >= 0) assigned[i] = pool.removeAt(idx)
+        }
+        for (i in targetShards.indices) {
+            if (assigned[i] == null && pool.isNotEmpty()) {
+                assigned[i] = pool.removeAt(0)
+            }
+        }
+        for ((i, spec) in targetShards.withIndex()) {
+            val existing = assigned[i]
+            val card = if (existing != null) {
+                Card(Kind.PLAYLIST, existing.kind, existing.title, owner = uid)
+            } else {
+                client.createPlaylist(uid, spec.title)
+            }
+            if (existing != null && existing.title != spec.title) {
+                client.renamePlaylist(card, spec.title)
+            }
+            if (existing != null && !existing.isPrivate) {
+                client.setPlaylistPublic(card, false)
+            }
+            if (existing == null || !existing.hasCustomCover) {
+                val jpeg = tuneCoverJpeg
+                if (jpeg != null) {
+                    try {
+                        client.uploadPlaylistCover(card, jpeg)
+                    } catch (error: Throwable) {
+                        android.util.Log.w("TuneSync", "Failed to upload cover for ${card.id}: ${error.message}")
+                    }
+                }
+            }
+            if (existing == null || existing.description != spec.description) {
+                client.editPlaylistDetails(card, spec.description)
+            }
+        }
+        for (extra in pool) {
+            optional { client.deletePlaylistRaw(uid, extra.kind) }
         }
     }
 
@@ -248,8 +450,17 @@ internal class MusicStore(val context: Context) {
         refreshInBackground()
     }
 
+    private fun cancelPendingCatalogSync() {
+        synchronized(syncStateLock) {
+            syncDirtyUid = null
+            syncJob?.cancel()
+            syncJob = null
+        }
+    }
+
     private fun activate(account: Profile, value: String) {
         automaticDownloads?.cancel()
+        cancelPendingCatalogSync()
         trackFiltersMemory.clear()
         token = value
         setProfile(account)
@@ -271,6 +482,7 @@ internal class MusicStore(val context: Context) {
         val remaining = accounts().filterNot { it.uid == current }
         token = null
         automaticDownloads?.cancel()
+        cancelPendingCatalogSync()
         vault.clear()
         current?.let(vault::clear)
         preferences.edit().putString("accounts", JSONArray(remaining.map(::encodeProfile)).toString()).apply()
@@ -691,8 +903,10 @@ internal class MusicStore(val context: Context) {
         fun read(key: String): List<Card> = optional {
             JSONArray(preferences.getString("$key:$uid", "[]")).objects().mapNotNull(Card::fromCache)
         }.orEmpty()
-        baseOwnPlaylists = read("ownPlaylists")
-        baseSavedPlaylists = read("savedPlaylists").filterNot { it.owner == AlternateVersions.CATALOG_OWNER }
+        baseOwnPlaylists = read("ownPlaylists").filterNot { TuneSync.isSyncPlaylist(it.title, null) }
+        baseSavedPlaylists = read("savedPlaylists").filterNot {
+            it.owner == AlternateVersions.CATALOG_OWNER || TuneSync.isSyncPlaylist(it.title, null)
+        }
     }
 
     private fun savePlaylists(uid: String) {

@@ -33,6 +33,7 @@ internal class MusicApi(
     private val catalogLibrary: CatalogLibraryStore? = null,
     private val activeUid: String? = null,
     private val catalogEnabled: () -> Boolean = { true },
+    private val onSyncShards: ((String, List<RemoteSyncShard>) -> Unit)? = null,
     private val metadata: (String, String) -> MetadataOverride = { _, _ -> MetadataOverride() },
 ) {
     private fun request(
@@ -240,20 +241,55 @@ internal class MusicApi(
         if (add) post("$path/add", "track-id" to id) else post("$path/${segment(id)}/remove")
     }
 
-    fun playlists(uid: String, liked: Boolean = false): List<Card> {
-        val path = if (liked) "likes/playlists" else "playlists/list"
-        val remote = get("users/${segment(uid)}/$path").objectList().mapNotNull {
-            Card.playlist(it.optJSONObject("playlist") ?: it, if (liked) null else uid)
-        }
-        if (liked) {
-            val local = if (catalogEnabled()) catalogLibrary?.likedPlaylists(uid).orEmpty().mapNotNull(::catalogPlaylistCard) else emptyList()
-            return (local + remote).distinctBy { it.key }
+    fun playlistsWithSync(uid: String): Pair<List<Card>, List<RemoteSyncShard>> {
+        val raw = get("users/${segment(uid)}/playlists/list").objectList()
+        val syncShards = mutableListOf<RemoteSyncShard>()
+        val cards = mutableListOf<Card>()
+        for (item in raw) {
+            val obj = item.optJSONObject("playlist") ?: item
+            val title = obj.text("title")
+            val description = obj.text("description")
+            val kind = obj.text("kind") ?: obj.text("id")
+            if (TuneSync.isSyncPlaylist(title, description)) {
+                if (kind != null && title != null) {
+                    val cover = obj.optJSONObject("cover")
+                    val hasCustomCover = cover != null && (
+                        cover.optBoolean("custom", false) ||
+                            (cover.text("type") == "pic" && !cover.text("uri").isNullOrBlank())
+                        )
+                    syncShards += RemoteSyncShard(
+                        kind = kind,
+                        title = title,
+                        description = description,
+                        hasCustomCover = hasCustomCover,
+                        isPrivate = obj.text("visibility") == "private",
+                    )
+                }
+                continue
+            }
+            Card.playlist(obj, uid)?.let(cards::add)
         }
         val libUid = activeUid ?: uid
-        return remote.map { card ->
+        val visible = cards.map { card ->
             val extraCount = if (catalogEnabled()) catalogLibrary?.playlistTracks(libUid, card.owner ?: uid, card.id)?.size ?: 0 else 0
             if (extraCount > 0) card.copy(trackCount = card.trackCount + extraCount) else card
         }
+        return visible to syncShards
+    }
+
+    fun playlists(uid: String, liked: Boolean = false): List<Card> {
+        if (liked) {
+            val remote = get("users/${segment(uid)}/likes/playlists").objectList().mapNotNull { item ->
+                val obj = item.optJSONObject("playlist") ?: item
+                if (TuneSync.isSyncPlaylist(obj.text("title"), obj.text("description"))) return@mapNotNull null
+                Card.playlist(obj, null)
+            }
+            val local = if (catalogEnabled()) catalogLibrary?.likedPlaylists(uid).orEmpty().mapNotNull(::catalogPlaylistCard) else emptyList()
+            return (local + remote).distinctBy { it.key }
+        }
+        val (visible, syncShards) = playlistsWithSync(uid)
+        onSyncShards?.invoke(uid, syncShards)
+        return visible
     }
 
     fun likedCards(uid: String, kind: Kind): List<Card> = when (kind) {
@@ -400,6 +436,10 @@ internal class MusicApi(
         if (libUid != null && card.owner != null) {
             catalogLibrary?.mutate(libUid) { it.clearPlaylist("${card.owner}:${card.id}") }
         }
+    }
+
+    fun deletePlaylistRaw(uid: String, kind: String) {
+        post("users/${segment(uid)}/playlists/${segment(kind)}/delete")
     }
 
     fun editPlaylist(card: Card, tracks: List<Track>, remove: Boolean = false) {
@@ -598,7 +638,9 @@ internal class MusicApi(
         val allReleases = (addedAlbums + releases.mapNotNull(::album)).distinctBy { it.id }
         val (singles, albums) = allReleases.partition { it.releaseType == "single" }
         val also = value.arr("alsoAlbums").objects().mapNotNull(::album)
-        val playlists = value.arr("playlists").objects().mapNotNull { Card.playlist(it) }
+        val playlists = value.arr("playlists").objects()
+            .filterNot { TuneSync.isSyncPlaylist(it.text("title"), it.text("description")) }
+            .mapNotNull { Card.playlist(it) }
         val similar = value.arr("similarArtists").objects().mapNotNull(::artistCard)
         val today = LocalDate.now(ZoneOffset.UTC).toString()
         val latest = value.arr("lastReleases").objects().firstNotNullOfOrNull(::album)
@@ -735,7 +777,9 @@ internal class MusicApi(
                 val card = when (kind) {
                     "album" -> album(item.obj("album"))
                     "artist" -> artistCard(item.obj("artist"))
-                    "playlist" -> Card.playlist(item.obj("playlist"))
+                    "playlist" -> item.obj("playlist")
+                        .takeUnless { TuneSync.isSyncPlaylist(it.text("title"), it.text("description")) }
+                        ?.let { Card.playlist(it) }
                     "clip" -> clip(item.obj("clip"))
                     "podcast" -> album(item.obj("podcast"))?.copy(releaseType = "podcast")
                     else -> null
@@ -813,7 +857,8 @@ internal class MusicApi(
             }
         val cards = items.mapNotNull { item ->
             val data = item.optJSONObject("data") ?: item
-            Card.playlist(data.obj("playlist")) ?: artistCard(data.obj("artist")) ?:
+            val pl = data.obj("playlist").takeUnless { TuneSync.isSyncPlaylist(it.text("title"), it.text("description")) }
+            (pl?.let { Card.playlist(it) }) ?: artistCard(data.obj("artist")) ?:
                 album(data.obj("album")) ?: Card.wave(data) ?: clip(data.obj("clip"))
         }
         val releases = value.arr("newReleases").objects().mapNotNull { item ->
