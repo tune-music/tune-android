@@ -456,7 +456,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
                         refreshCollection()
                         if (route.screen == Screen.SEARCH && searchText.isNotBlank()) loadSearch(refreshFirstPage = true)
                         else if (route.screen in setOf(
-                                Screen.DETAILS, Screen.LIKES, Screen.DISLIKES, Screen.ALBUMS,
+                                Screen.DETAILS, Screen.LIKES, Screen.DISLIKES, Screen.HISTORY, Screen.ALBUMS,
                                 Screen.ARTISTS, Screen.HIDDEN_ARTISTS, Screen.ARTIST_TRACKS, Screen.ARTIST_COLLECTION
                             ) && !reordering && !selecting
                         ) {
@@ -2236,7 +2236,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
             }
             action {
                 val tracks = store.likedTracks()
-                val playable = tracks.indices.filter { !tracks[it].unavailable || store.files.hasReplacement(tracks[it]) || store.files.has(tracks[it]) }
+                val playable = tracks.indices.filter { store.canPlay(tracks[it]) }
                 val start = if (shuffled) playable.randomOrNull() else playable.firstOrNull()
                 if (start != null) playTracks(tracks, start, ctx, shuffle = shuffled) else toast("Нет доступных треков")
             }
@@ -2655,6 +2655,10 @@ class MainActivity : ComponentActivity(), Player.Listener {
                     add(if (shelf.cards.size > 3) section(shelf.title, "Все") { openShelf(shelf) } else heading(shelf.title))
                     add(shelfRow(shelf.cards))
                 }
+            }
+            if (page.card.kind == Kind.ARTIST && page.extraTracks.isNotEmpty()) {
+                add(if (page.extraTracks.size > 5) section("Добавленные треки", "Все") { push(Screen.ARTIST_TRACKS, page.card) } else heading("Добавленные треки"))
+                addAll(trackRows(page.extraTracks, context).take(5))
             }
             if (page.card.kind == Kind.ARTIST) page.description?.takeIf(String::isNotBlank)?.let { about ->
                 add(heading("Об исполнителе"))
@@ -3421,7 +3425,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
         gap(row, 14)
         row.addView(roundIcon(Symbol.SHUFFLE, "Перемешать") {
             val current = playTracks().ifEmpty { tracks }
-            val playable = current.indices.filter { !current[it].unavailable || store.files.hasReplacement(current[it]) || store.files.has(current[it]) }
+            val playable = current.indices.filter { store.canPlay(current[it]) }
             playable.randomOrNull()?.let { playTracks(current, it, context, shuffle = true) } ?: toast("Нет доступных треков")
         }.apply { isEnabled = tracks.isNotEmpty(); alpha = if (isEnabled) 1f else .4f })
     }
@@ -3477,7 +3481,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
             setOnClickListener {
                 if (isActive()) toggle() else {
                     val current = tracks()
-                    val start = current.indexOfFirst { !it.unavailable || store.files.hasReplacement(it) || store.files.has(it) }
+                    val start = current.indexOfFirst { store.canPlay(it) }
                     if (start >= 0) playTracks(current, start, context, shuffle = false) else toast("Нет доступных треков")
                 }
             }
@@ -5447,11 +5451,11 @@ class MainActivity : ComponentActivity(), Player.Listener {
 
     internal fun playTracks(tracks: List<Track>, index: Int, source: PlayContext, shuffle: Boolean? = null) {
         val track = tracks.getOrNull(index) ?: return
-        if (track.unavailable && !store.files.hasReplacement(track) && !store.files.has(track)) {
+        if (!store.canPlay(track)) {
             toast("Трек недоступен")
             return
         }
-        val selected = tracks.withIndex().filter { !it.value.unavailable || store.files.hasReplacement(it.value) || store.files.has(it.value) }
+        val selected = tracks.withIndex().filter { store.canPlay(it.value) }
         val start = selected.indexOfFirst { it.index == index }.coerceAtLeast(0)
         val items = selected.map { QueueItems.make(it.value, source) }
         withPlayer {
@@ -5471,7 +5475,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
     private fun enqueue(track: Track, next: Boolean) = enqueue(listOf(track), next)
 
     private fun enqueue(tracks: List<Track>, next: Boolean) {
-        val available = tracks.filter { !it.unavailable || store.files.hasReplacement(it) || store.files.has(it) }
+        val available = tracks.filter { store.canPlay(it) }
         if (available.isEmpty()) { toast("Нет доступных треков"); return }
         withPlayer {
             if (mediaItemCount == 0) playTracks(available, 0, PlayContext(name = "Очередь"))
@@ -5834,7 +5838,7 @@ class MainActivity : ComponentActivity(), Player.Listener {
             playback.running = playing && controller?.isPlaying == true
             leading.layoutParams = LinearLayout.LayoutParams(ui.dp(if (row.number == null || selecting) 50 else 30), ui.dp(50))
             val saved = store.files.has(track)
-            val unavailable = track.unavailable && !store.files.hasReplacement(track) && !saved
+            val unavailable = !store.canPlay(track)
             val disliked = route.screen != Screen.DISLIKES && track.id in store.dislikes.value
             view.alpha = if (unavailable || disliked) .4f else 1f
             title.label.setTextColor(when {

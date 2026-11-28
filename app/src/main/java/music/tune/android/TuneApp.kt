@@ -100,6 +100,8 @@ internal class MusicStore(val context: Context) {
     private val _message = kotlinx.coroutines.flow.MutableSharedFlow<String>(extraBufferCapacity = 4)
     val messages = _message
     val files = MusicFiles(this)
+    val audioProfiles = AudioProfileStore(context) { id -> versions.catalogAudioProfile(id) }
+    val waveTaste = WaveTaste(context)
     val waveExtras = WaveExtras(this)
     val listening = ListeningHistory(context)
     val ynison = Ynison(this)
@@ -216,6 +218,12 @@ internal class MusicStore(val context: Context) {
     fun allowsAlternate(uid: String, id: String) = alternateEnabled && overrides.read(uid, "track", id).usePlugin
     fun allowsCatalog(uid: String, id: String) = catalogEnabled && overrides.read(uid, "track", id).usePlugin
     fun allowsPluginAudio(uid: String, id: String) = (alternateEnabled || catalogEnabled) && overrides.read(uid, "track", id).usePlugin
+
+    fun canPlay(track: Track): Boolean {
+        if (!track.unavailable || files.hasReplacement(track) || files.has(track)) return true
+        val uid = profile.value?.uid ?: return false
+        return allowsPluginAudio(uid, track.id) && versions.hasAudio(track.id)
+    }
 
     private fun rawApi(credential: String, triggerSync: Boolean): MusicApi {
         val uid = profile.value?.uid
@@ -641,6 +649,9 @@ internal class MusicStore(val context: Context) {
 
     suspend fun rate(track: Track, dislike: Boolean = false): Boolean = updates.withLock {
         val account = requireUser()
+        val reactionKind: (Boolean, Boolean) -> String = { isDislike, added ->
+            if (isDislike) { if (added) "dislike" else "undislike" } else { if (added) "like" else "unlike" }
+        }
         if (versions.isSyntheticTrackId(track.id)) {
             val state = if (dislike) _dislikes else _likes
             val add = track.id !in state.value
@@ -648,6 +659,7 @@ internal class MusicStore(val context: Context) {
                 if (dislike) it.setTrackDisliked(track.id, add) else it.setTrackLiked(track.id, add)
             }
             applyCatalogLibraryOverlay(account.uid)
+            waveTaste.react(reactionKind(dislike, add), track)
             if (!dislike && add) refreshAutomaticDownloads()
             return@withLock add
         }
@@ -655,12 +667,13 @@ internal class MusicStore(val context: Context) {
         val add = track.id !in state.value
         val credential = token ?: throw MusicError("Войдите через Яндекс", 401)
         val pending = pendingRestoredLikes(account.uid)
-        if (!dislike && (track.id in pending || track.alternate && track.originalAvailable == false)) {
+        if (!dislike && (track.id in pending || (track.alternate || track.catalog) && track.originalAvailable == false)) {
             val date = if (add) System.currentTimeMillis() else 0L
             saveRestoredLikes(account.uid, pending + (track.id to date))
             baseLikes = applyRestoredLikes(baseLikes, mapOf(track.id to date))
             applyCatalogLibraryOverlay(account.uid)
             saveRatings(account.uid)
+            waveTaste.react(reactionKind(false, add), track)
             scope.launch {
                 updates.withLock sync@{
                     if (token != credential) return@sync
@@ -697,6 +710,7 @@ internal class MusicStore(val context: Context) {
                 saveRatings(account.uid)
             }
         }
+        waveTaste.react(reactionKind(dislike, add), track)
         if (!dislike && add) refreshAutomaticDownloads()
         add
     }
@@ -731,23 +745,23 @@ internal class MusicStore(val context: Context) {
 
     suspend fun likedTracks(onPreview: ((List<Track>) -> Unit)? = null): List<Track> {
         val uid = requireUser().uid
+        withContext(Dispatchers.IO) { versions.ensureLoaded(network = false) }
         fun includePending(tracks: List<Track>): List<Track> {
             val pending = pendingRestoredLikes(uid)
             val localEntries = if (catalogEnabled) catalogLibrary.likedTrackEntries(uid) else emptyList()
             val localIds = localEntries.mapTo(HashSet()) { it.first }
             val byId = tracks.associateBy { it.id }
-            val localAdded = localEntries.mapNotNull { (id, date) ->
+            val localTimed = localEntries.mapNotNull { (id, date) ->
                 val track = byId[id] ?: versions.synthetic(id)
-                track?.copy(addedAt = date)
+                track?.copy(addedAt = date)?.let { it to date as Long? }
+            } + pending.entries.filter { it.value > 0 && it.key !in localIds }.mapNotNull { (id, date) ->
+                val track = byId[id] ?: versions.synthetic(id)?.takeIf { allowsPluginAudio(uid, id) }
+                track?.copy(addedAt = date)?.let { it to date as Long? }
             }
-            val pendingAdded = pending.entries.filter { it.value > 0 && it.key !in localIds }.sortedByDescending { it.value }.mapNotNull { (id, date) ->
-                val track = byId[id] ?: versions.synthetic(id)?.takeIf { allowsAlternate(uid, id) }
-                track?.copy(addedAt = date)
-            }
-            val filtered = tracks.filterNot {
+            val remoteTimed = tracks.filterNot {
                 it.id in pending || it.id in localIds || (!catalogEnabled && versions.isSyntheticTrackId(it.id))
-            }
-            return localAdded + pendingAdded + filtered
+            }.map { it to it.addedAt }
+            return mergeTimedDesc(localTimed, remoteTimed) { it.id }
         }
         var cacheHasTracks = false
         var firstPage: List<Track>? = null
@@ -957,7 +971,16 @@ internal class MusicStore(val context: Context) {
         val uid = requireUser().uid
         val cache = AtomicFile(File(context.cacheDir, "tracks-${digest("$uid:$key")}.json"))
         suspend fun readTracks() = readCache(cache) { raw ->
-            val tracks = JSONArray(raw).objects().mapNotNull { Track.parse(it) }
+            val tracks = JSONArray(raw).objects().mapNotNull { obj ->
+                val track = Track.parse(obj) ?: return@mapNotNull null
+                if (allowsPluginAudio(uid, track.id) && versions.hasAudio(track.id)) {
+                    val isCatalog = allowsCatalog(uid, track.id) && versions.isCatalogTrack(track.id)
+                    val isFck = !isCatalog && allowsAlternate(uid, track.id) && versions.hasFckAudio(track.id)
+                    track.copy(unavailable = false, catalog = isCatalog, alternate = isFck)
+                } else {
+                    track
+                }
+            }
             when (key) {
                 "likes" -> tracks.filter { it.id in likes.value }
                 "dislikes" -> tracks.filter { it.id in dislikes.value }
@@ -1126,6 +1149,7 @@ internal class MusicStore(val context: Context) {
 
     private fun encodePage(page: MusicPage) =
         JSONObject().put("card", page.card.cached()).put("tracks", JSONArray(page.tracks.map(Track::stored)))
+            .put("extraTracks", JSONArray(page.extraTracks.map(Track::stored)))
             .put("description", page.description).put("disks", JSONArray(page.disks)).put("publicPlaylist", page.publicPlaylist)
             .put("latestRelease", page.latestRelease?.cached())
             .put("shelves", encodeShelves(page.shelves))
@@ -1150,9 +1174,10 @@ internal class MusicStore(val context: Context) {
     suspend fun details(card: Card, onCached: ((MusicPage) -> Unit)? = null): MusicPage = cached("page:${card.key}", ::encodePage, { value ->
         val savedCard = Card.fromCache(value.obj("card")) ?: return@cached null
         val tracks = value.arr("tracks").objects().mapNotNull { Track.parse(it) }
+        val extraTracks = value.arr("extraTracks").objects().mapNotNull { Track.parse(it) }
         val shelves = decodeShelves(value.arr("shelves"))
         MusicPage(savedCard, tracks, shelves, value.text("description"), value.arr("disks").items().mapNotNull { (it as? Number)?.toInt() },
-            value.opt("publicPlaylist") as? Boolean, value.optJSONObject("latestRelease")?.let(Card::fromCache))
+            value.opt("publicPlaylist") as? Boolean, value.optJSONObject("latestRelease")?.let(Card::fromCache), extraTracks = extraTracks)
     }, onCached) {
         online {
             when (card.kind) {

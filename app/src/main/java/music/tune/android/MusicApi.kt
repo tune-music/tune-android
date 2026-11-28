@@ -15,6 +15,65 @@ import java.util.Base64
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
+internal fun <T> mergeTimedOrdered(
+    local: List<Pair<T, Long?>>,
+    remote: List<Pair<T, Long?>>,
+    ascending: Boolean,
+    idOf: (T) -> String,
+): List<T> {
+    val seen = HashSet<String>(local.size + remote.size)
+    val out = ArrayList<T>(local.size + remote.size)
+    var li = 0
+    var ri = 0
+    var lastRemoteTs: Long? = null
+    fun push(item: T) {
+        if (seen.add(idOf(item))) out.add(item)
+    }
+    while (li < local.size && ri < remote.size) {
+        val localTs = local[li].second ?: if (ascending) Long.MAX_VALUE else Long.MIN_VALUE
+        val remoteTs = remote[ri].second ?: lastRemoteTs
+        val takeRemote = remoteTs != null && if (ascending) remoteTs < localTs else remoteTs > localTs
+        if (takeRemote) {
+            val (item, ts) = remote[ri++]
+            if (ts != null) lastRemoteTs = ts
+            push(item)
+        } else {
+            push(local[li++].first)
+        }
+    }
+    while (li < local.size) push(local[li++].first)
+    while (ri < remote.size) push(remote[ri++].first)
+    return out
+}
+
+internal fun <T> mergeTimedDesc(
+    local: List<Pair<T, Long?>>,
+    remote: List<Pair<T, Long?>>,
+    idOf: (T) -> String,
+): List<T> {
+    val sortedLocal = local.sortedWith(
+        compareByDescending<Pair<T, Long?>> { it.second ?: Long.MIN_VALUE }.thenBy { idOf(it.first) }
+    )
+    return mergeTimedOrdered(sortedLocal, remote, ascending = false, idOf = idOf)
+}
+
+internal fun <T> mergeTimedPlaylist(
+    local: List<Pair<T, Long?>>,
+    remote: List<Pair<T, Long?>>,
+    forceDesc: Boolean,
+    idOf: (T) -> String,
+): List<T> {
+    val firstTs = remote.firstOrNull { it.second != null }?.second
+    val lastTs = remote.lastOrNull { it.second != null }?.second
+    val ascending = !forceDesc && firstTs != null && lastTs != null && firstTs < lastTs
+    val sortedLocal = if (ascending) {
+        local.sortedWith(compareBy<Pair<T, Long?>> { it.second ?: Long.MAX_VALUE }.thenBy { idOf(it.first) })
+    } else {
+        local.sortedWith(compareByDescending<Pair<T, Long?>> { it.second ?: Long.MIN_VALUE }.thenBy { idOf(it.first) })
+    }
+    return mergeTimedOrdered(sortedLocal, remote, ascending = ascending, idOf = idOf)
+}
+
 internal class MusicError(message: String, val status: Int = 0, cause: Throwable? = null, val details: JSONObject? = null) :
     IOException(message, cause)
 
@@ -187,11 +246,32 @@ internal class MusicApi(
             if (dislike) catalogLibrary?.dislikedTracks(uid).orEmpty().map { it to null }
             else catalogLibrary?.likedTrackEntries(uid).orEmpty()
         } else emptyList()
-        if (!dislike) optional { fullLikedEntries() }?.let { return (local + it).distinctBy { entry -> entry.first } }
+        if (!dislike) {
+            val full = optional { fullLikedEntries() }
+            if (full != null) {
+                var enriched = full
+                if (full.isNotEmpty() && full.all { it.second == null }) {
+                    val fallback = optional {
+                        get("users/${segment(uid)}/likes/tracks").objectValue()
+                            .obj("library").arr("tracks").objects()
+                            .mapNotNull { it.text("id")?.let { id -> id to entryDate(it.text("timestamp")) } }
+                    }.orEmpty().mapNotNull { (id, ts) -> ts?.let { id to it } }.toMap()
+                    if (fallback.isNotEmpty()) {
+                        enriched = full.map { (id, _) -> id to fallback[id] }
+                    }
+                }
+                val tsMap = HashMap<String, Long>()
+                (enriched + local).forEach { (id, ts) -> if (ts != null) tsMap.putIfAbsent(id, ts) }
+                return mergeTimedDesc(local, enriched) { it }.map { it to tsMap[it] }
+            }
+        }
         val list = if (dislike) "dislikes" else "likes"
         val remote = get("users/${segment(uid)}/$list/tracks").objectValue()
             .obj("library").arr("tracks").objects().mapNotNull { it.text("id")?.let { id -> id to entryDate(it.text("timestamp")) } }
-        return (local + remote).distinctBy { it.first }
+        if (dislike) return (local + remote).distinctBy { it.first }
+        val tsMap = HashMap<String, Long>()
+        (remote + local).forEach { (id, ts) -> if (ts != null) tsMap.putIfAbsent(id, ts) }
+        return mergeTimedDesc(local, remote) { it }.map { it to tsMap[it] }
     }
 
     private fun catalogPlaylistCard(kind: String): Card? {
@@ -369,16 +449,26 @@ internal class MusicApi(
         val value = get(playlistPath(card), "rich-tracks" to "true").objectValue()
         val parsed = Card.playlist(value, card.owner) ?: card
         val libUid = activeUid ?: card.owner
-        val localIds = if (catalogEnabled() && libUid != null && card.owner != null) {
-            catalogLibrary?.playlistTracks(libUid, card.owner, card.id).orEmpty()
+        val localTimed = if (catalogEnabled() && libUid != null && card.owner != null) {
+            val playlistTimed = catalogLibrary?.playlistTrackEntries(libUid, card.owner, card.id).orEmpty()
+            if (card.id == "3" && card.owner == libUid) {
+                (catalogLibrary?.likedTrackEntries(libUid).orEmpty() + playlistTimed).distinctBy { it.first }
+            } else {
+                playlistTimed
+            }
         } else emptyList()
-        val localTracks = if (localIds.isEmpty()) emptyList() else optional { tracks(localIds) }.orEmpty()
+        val localTsMap = localTimed.toMap()
+        val localTracks = if (localTimed.isEmpty()) emptyList() else {
+            optional { tracks(localTimed.map { it.first }) }.orEmpty()
+                .map { t -> t.copy(addedAt = localTsMap[t.id]) to localTsMap[t.id] }
+        }
         val remoteTracks = value.arr("tracks").objects().mapNotNull { item ->
             val source = item.optJSONObject("track") ?: item
             val restored = track(source) ?: (source.text("id") ?: item.text("id") ?: item.text("trackId"))?.let { restoredTrack(it) }
-            restored?.copy(addedAt = entryDate(item.text("timestamp") ?: item.text("addedAt")))
+            val date = entryDate(item.text("timestamp") ?: item.text("addedAt"))
+            restored?.copy(addedAt = date)?.let { it to date }
         }
-        val mergedTracks = (localTracks + remoteTracks).distinctBy { it.id }
+        val mergedTracks = mergeTimedPlaylist(localTracks, remoteTracks, forceDesc = (card.id == "3" && card.owner == libUid)) { it.id }
         return MusicPage(
             parsed.copy(trackCount = mergedTracks.size),
             mergedTracks,
@@ -632,7 +722,9 @@ internal class MusicApi(
         val custom = metadata("artist", card.id)
         val insertions = versions.artistInsertions(card.id)
         val added = optional { tracks((custom.tracks + insertions.first).distinct()) }.orEmpty()
-        val popular = (added + value.arr("popularTracks").objects().mapNotNull { track(it) }).distinctBy { it.id }
+        val popular = value.arr("popularTracks").objects().mapNotNull { track(it) }.distinctBy { it.id }
+        val popularIds = popular.map { it.id }.toSet()
+        val extraTracks = added.filterNot { it.id in popularIds }
         val releases = value.arr("albums").objects()
         val addedAlbums = albumCards((custom.albums + insertions.second).distinct())
         val allReleases = (addedAlbums + releases.mapNotNull(::album)).distinctBy { it.id }
@@ -667,7 +759,13 @@ internal class MusicApi(
         val subtitle = listeners?.let { "${java.text.NumberFormat.getIntegerInstance(java.util.Locale.forLanguageTag("ru")).format(it)} слушателей за месяц" }.orEmpty()
         return MusicPage(parsed.copy(subtitle = subtitle), popular, listOf(Shelf("Альбомы", albums), Shelf("Синглы и EP", singles),
             Shelf("Сборники и участие", also), Shelf("Плейлисты", playlists), Shelf("Клипы", clips), Shelf("Концерты", concerts),
-            Shelf("Похожие исполнители", similar)), artist.obj("description").text("text"), latestRelease = latest)
+            Shelf("Похожие исполнители", similar)), artist.obj("description").text("text"), latestRelease = latest, extraTracks = extraTracks)
+    }
+
+    fun similarArtistIds(id: String): List<String> {
+        if (versions.isSyntheticArtistId(id)) return emptyList()
+        return get("artists/${segment(id)}/similar").objectValue()
+            .arr("similarArtists").objects().mapNotNull { it.text("id") }
     }
 
     private fun albumCards(ids: List<String>): List<Card> = ids.chunked(100).flatMap { part ->
@@ -687,7 +785,7 @@ internal class MusicApi(
         }
         val standard = get("artists/${segment(id)}/tracks", "page-size" to "200").objectValue()
             .arr("tracks").objects().mapNotNull { track(it) }
-        return ((optional { tracks(inserted.distinct()) }.orEmpty()) + standard).distinctBy { it.id }
+        return (standard + optional { tracks(inserted.distinct()) }.orEmpty()).distinctBy { it.id }
     }
 
     fun trackFilters(ids: List<String>): List<TrackFilter> {
@@ -793,27 +891,38 @@ internal class MusicApi(
     }
 
     fun history(limit: Int = 200, includeSources: Boolean = limit > 20): List<Track> {
-        val value = get("music-history", "fullModelsCount" to if (includeSources) limit.toString() else "0").objectValue()
-        val entries = linkedMapOf<String, Pair<String?, String?>>()
-        for (tab in value.arr("historyTabs").objects()) {
-            val date = tab.text("date")?.take(10)
-            for (item in tab.arr("items").objects()) {
-                val context = item.obj("context")
-                val full = context.obj("data").obj("fullModel")
-                val source = when (val kind = context.text("type")) {
-                    "wave", "playlist", "album" -> full.obj(kind).text("title") ?: when (kind) {
-                        "wave" -> "Моя волна"; "playlist" -> "Плейлист"; else -> "Альбом"
+        val catalogEntries = if (catalogEnabled()) activeUid?.let { catalogLibrary?.historyEntries(it) }.orEmpty() else emptyList()
+        val remoteEntries = mutableListOf<Triple<String, String?, String?>>()
+        try {
+            val value = get("music-history", "fullModelsCount" to if (includeSources) limit.toString() else "0").objectValue()
+            for (tab in value.arr("historyTabs").objects()) {
+                val date = tab.text("date")?.take(10)
+                for (item in tab.arr("items").objects()) {
+                    val context = item.obj("context")
+                    val full = context.obj("data").obj("fullModel")
+                    val source = when (val kind = context.text("type")) {
+                        "wave", "playlist", "album" -> full.obj(kind).text("title") ?: when (kind) {
+                            "wave" -> "Моя волна"; "playlist" -> "Плейлист"; else -> "Альбом"
+                        }
+                        "artist" -> full.obj(kind).text("name") ?: "Исполнитель"
+                        "search" -> "Поиск"
+                        else -> null
                     }
-                    "artist" -> full.obj(kind).text("name") ?: "Исполнитель"
-                    "search" -> "Поиск"
-                    else -> null
-                }
-                item.arr("tracks").objects().forEach { row ->
-                    val id = row.obj("data").obj("itemId").text("trackId") ?: return@forEach
-                    if (entries.size < limit) entries.putIfAbsent(id, date to source)
+                    item.arr("tracks").objects().forEach { row ->
+                        val id = row.obj("data").obj("itemId").text("trackId") ?: return@forEach
+                        remoteEntries += Triple(id, date, source)
+                    }
                 }
             }
+        } catch (error: MusicError) {
+            if (error.status == 401 || catalogEntries.isEmpty()) throw error
         }
+        val entries = mergeCatalogHistory(
+            remote = remoteEntries,
+            catalog = catalogEntries,
+            limit = limit,
+            catalogSource = if (includeSources) "Каталог Tune" else null,
+        )
         return tracks(entries.keys.toList()).map { track ->
             val (date, source) = entries[track.id] ?: (null to null)
             track.copy(historyDate = date, historySource = source)
@@ -1108,6 +1217,51 @@ internal class MusicApi(
                 card.copy(subtitle = subtitle)
             }
     }
+}
+
+internal fun mergeCatalogHistory(
+    remote: List<Triple<String, String?, String?>>,
+    catalog: List<Pair<String, Long>>,
+    limit: Int,
+    catalogSource: String?,
+    zone: java.time.ZoneId = java.time.ZoneId.systemDefault(),
+): LinkedHashMap<String, Pair<String?, String?>> {
+    val entries = linkedMapOf<String, Pair<String?, String?>>()
+    if (limit <= 0) return entries
+    if (catalog.isEmpty()) {
+        for ((id, date, source) in remote) {
+            if (entries.size >= limit) break
+            entries.putIfAbsent(id, date to source)
+        }
+        return entries
+    }
+    val catalogByDate = linkedMapOf<String, MutableList<String>>()
+    for ((id, tsSec) in catalog) {
+        val date = java.time.Instant.ofEpochSecond(tsSec).atZone(zone).toLocalDate().toString()
+        catalogByDate.getOrPut(date, ::mutableListOf).add(id)
+    }
+    val remoteByDate = linkedMapOf<String, MutableList<Pair<String, String?>>>()
+    val undated = mutableListOf<Pair<String, String?>>()
+    for ((id, date, source) in remote) {
+        if (date.isNullOrBlank()) undated += id to source
+        else remoteByDate.getOrPut(date, ::mutableListOf).add(id to source)
+    }
+    val dates = (catalogByDate.keys + remoteByDate.keys).sortedDescending()
+    for (date in dates) {
+        catalogByDate[date]?.forEach { id ->
+            if (entries.size >= limit) return entries
+            entries.putIfAbsent(id, date to catalogSource)
+        }
+        remoteByDate[date]?.forEach { (id, source) ->
+            if (entries.size >= limit) return entries
+            entries.putIfAbsent(id, date to source)
+        }
+    }
+    for ((id, source) in undated) {
+        if (entries.size >= limit) break
+        entries.putIfAbsent(id, null to source)
+    }
+    return entries
 }
 
 internal fun mergeSearchResults(

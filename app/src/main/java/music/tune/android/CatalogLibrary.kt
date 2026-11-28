@@ -30,6 +30,7 @@ internal object TuneSync {
     const val TS_EPOCH_OFFSET = 1_700_000_000L
     const val TOMBSTONE_TTL_SEC = 2_592_000L // 30 days
     const val MAX_DESCRIPTION_LEN = 490
+    const val MAX_HISTORY_ENTRIES = 100
     const val TITLE_PRIMARY = "Tune Sync"
 
     private const val HEADER_PRIMARY =
@@ -152,7 +153,9 @@ internal data class CatalogLibraryData(
     val dislikedArtists: MutableList<String> = mutableListOf(),
     val likedPlaylists: MutableList<String> = mutableListOf(),
     val playlistTracks: MutableMap<String, MutableList<String>> = mutableMapOf(),
+    val playlistTrackDates: MutableMap<String, MutableMap<String, Long>> = mutableMapOf(),
     val pins: MutableList<String> = mutableListOf(),
+    val history: MutableMap<String, Long> = mutableMapOf(),
     val likedTracksSync: MutableMap<String, SyncEntry> = mutableMapOf(),
     val dislikedTracksSync: MutableMap<String, SyncEntry> = mutableMapOf(),
     val likedAlbumsSync: MutableMap<String, SyncEntry> = mutableMapOf(),
@@ -171,7 +174,9 @@ internal data class CatalogLibraryData(
         dislikedArtists = dislikedArtists.toMutableList(),
         likedPlaylists = likedPlaylists.toMutableList(),
         playlistTracks = playlistTracks.mapValues { (_, v) -> v.toMutableList() }.toMutableMap(),
+        playlistTrackDates = playlistTrackDates.mapValues { (_, v) -> v.toMutableMap() }.toMutableMap(),
         pins = pins.toMutableList(),
+        history = history.toMutableMap(),
         likedTracksSync = likedTracksSync.toMutableMap(),
         dislikedTracksSync = dislikedTracksSync.toMutableMap(),
         likedAlbumsSync = likedAlbumsSync.toMutableMap(),
@@ -270,9 +275,11 @@ internal data class CatalogLibraryData(
     fun addPlaylistTracks(key: String, trackIds: List<String>, nowMs: Long = System.currentTimeMillis()) {
         if (trackIds.isEmpty()) return
         val list = playlistTracks.getOrPut(key) { mutableListOf() }
+        val dates = playlistTrackDates.getOrPut(key) { mutableMapOf() }
         val distinctNew = trackIds.distinct()
         list.removeAll(distinctNew.toSet())
         list.addAll(0, distinctNew)
+        distinctNew.forEach { dates[it] = nowMs }
         playlistSync[key] = PlaylistSyncEntry(nowMs / 1000L, list.toList())
     }
 
@@ -284,7 +291,11 @@ internal data class CatalogLibraryData(
         if (trackIds.isEmpty()) return
         val list = playlistTracks[key] ?: return
         val changed = list.removeAll { it in trackIds }
-        if (list.isEmpty()) playlistTracks.remove(key)
+        playlistTrackDates[key]?.let { dates -> trackIds.forEach { dates.remove(it) } }
+        if (list.isEmpty()) {
+            playlistTracks.remove(key)
+            playlistTrackDates.remove(key)
+        }
         if (changed) playlistSync[key] = PlaylistSyncEntry(nowMs / 1000L, list.toList())
     }
 
@@ -302,6 +313,7 @@ internal data class CatalogLibraryData(
 
     fun clearPlaylist(key: String, nowMs: Long = System.currentTimeMillis()) {
         val hadLocal = playlistTracks.remove(key) != null
+        playlistTrackDates.remove(key)
         if (hadLocal || key in playlistSync) {
             playlistSync[key] = PlaylistSyncEntry(nowMs / 1000L, emptyList())
         }
@@ -318,6 +330,20 @@ internal data class CatalogLibraryData(
         }
     }
 
+    fun recordHistory(id: String, nowMs: Long = System.currentTimeMillis()) {
+        val tsSec = nowMs / 1000L
+        val prev = history[id]
+        if (prev == null || tsSec > prev) {
+            history[id] = tsSec
+        }
+        trimHistoryMap(history)
+    }
+
+    fun historyEntries(): List<Pair<String, Long>> = history.entries
+        .sortedWith(compareByDescending<Map.Entry<String, Long>> { it.value }.thenBy { it.key })
+        .take(TuneSync.MAX_HISTORY_ENTRIES)
+        .map { it.key to it.value }
+
     fun encodePayload(uid: String? = null, nowSec: Long = System.currentTimeMillis() / 1000L): String {
         val sections = mutableListOf<String>()
         encodeSetSection("L", likedTracksSync, TuneSync.TRACK_BASE, nowSec)?.let(sections::add)
@@ -328,7 +354,15 @@ internal data class CatalogLibraryData(
         encodeSetSection("Q", likedPlaylistsSync, TuneSync.PLAYLIST_BASE, nowSec)?.let(sections::add)
         encodePlaylistSection(uid, nowSec)?.let(sections::add)
         encodePinSection(nowSec)?.let(sections::add)
+        encodeHistorySection()?.let(sections::add)
         return sections.joinToString(";")
+    }
+
+    private fun encodeHistorySection(): String? {
+        val entries = historyEntries().map { (id, ts) ->
+            "${TuneSync.encodeId(id, TuneSync.TRACK_BASE)}@${TuneSync.encodeTs(ts)}"
+        }
+        return if (entries.isEmpty()) null else "H:${entries.joinToString(",")}"
     }
 
     private fun encodeSetSection(
@@ -440,8 +474,22 @@ internal data class CatalogLibraryData(
             merged.playlistSync[key] = entry
             if (entry.tracks.isNotEmpty()) {
                 merged.playlistTracks[key] = entry.tracks.toMutableList()
+                val dates = mutableMapOf<String, Long>()
+                val localMap = playlistTrackDates[key].orEmpty()
+                val remoteMap = remote.playlistTrackDates[key].orEmpty()
+                entry.tracks.forEach { tid ->
+                    dates[tid] = maxOf(localMap[tid] ?: 0L, remoteMap[tid] ?: 0L).takeIf { it > 0L } ?: (entry.ts * 1000L)
+                }
+                merged.playlistTrackDates[key] = dates
             }
         }
+        for ((id, ts) in history) {
+            merged.history[id] = maxOf(merged.history[id] ?: Long.MIN_VALUE, ts)
+        }
+        for ((id, ts) in remote.history) {
+            merged.history[id] = maxOf(merged.history[id] ?: Long.MIN_VALUE, ts)
+        }
+        trimHistoryMap(merged.history)
         return merged
     }
 
@@ -452,6 +500,14 @@ internal data class CatalogLibraryData(
         playlistTracks.forEach { (key, ids) ->
             if (ids.isNotEmpty()) playlists.put(key, JSONArray(ids))
         }
+        val plDatesObj = JSONObject()
+        playlistTrackDates.forEach { (key, map) ->
+            if (map.isNotEmpty()) {
+                plDatesObj.put(key, JSONObject().apply { map.forEach { (tid, ts) -> put(tid, ts) } })
+            }
+        }
+        val historyObj = JSONObject()
+        history.forEach { (id, ts) -> historyObj.put(id, ts) }
         val syncObj = JSONObject()
             .put("L", encodeSyncMapJson(likedTracksSync))
             .put("D", encodeSyncMapJson(dislikedTracksSync))
@@ -471,11 +527,22 @@ internal data class CatalogLibraryData(
             .put("dislikedArtists", JSONArray(dislikedArtists))
             .put("likedPlaylists", JSONArray(likedPlaylists))
             .put("playlistTracks", playlists)
+            .put("playlistTrackDates", plDatesObj)
             .put("pins", JSONArray(pins))
+            .put("history", historyObj)
             .put("sync", syncObj)
     }
 
     companion object {
+        private fun trimHistoryMap(map: MutableMap<String, Long>) {
+            if (map.size <= TuneSync.MAX_HISTORY_ENTRIES) return
+            val keep = map.entries
+                .sortedWith(compareByDescending<Map.Entry<String, Long>> { it.value }.thenBy { it.key })
+                .take(TuneSync.MAX_HISTORY_ENTRIES)
+                .map { it.key to it.value }
+            map.clear()
+            keep.forEach { (id, ts) -> map[id] = ts }
+        }
         private fun pushFront(list: MutableList<String>, id: String) {
             list.removeAll { it == id }
             list.add(0, id)
@@ -610,6 +677,7 @@ internal data class CatalogLibraryData(
                     "Q" -> if (!parseSetSection(body, TuneSync.PLAYLIST_BASE, data.likedPlaylistsSync)) return null
                     "P" -> if (!parsePlaylistSection(body, uid, data.playlistSync, data.playlistTracks)) return null
                     "N" -> if (!parsePinSection(body, data.pinsSync)) return null
+                    "H" -> if (!parseHistorySection(body, data.history)) return null
                     else -> Unit // ignore unknown forward-compatible section codes
                 }
             }
@@ -623,7 +691,24 @@ internal data class CatalogLibraryData(
             for (id in data.likedTracks) {
                 data.likedTrackDates[id] = (data.likedTracksSync[id]?.ts ?: 0L) * 1000L
             }
+            trimHistoryMap(data.history)
             return data
+        }
+
+        private fun parseHistorySection(body: String, out: MutableMap<String, Long>): Boolean {
+            for (item in body.split(',')) {
+                if (item.isEmpty()) continue
+                val at = item.lastIndexOf('@')
+                if (at <= 0 || at >= item.lastIndex) return false
+                val idTok = item.substring(0, at)
+                val tsTok = item.substring(at + 1)
+                val id = TuneSync.decodeId(idTok, TuneSync.TRACK_BASE) ?: return false
+                val ts = TuneSync.decodeTs(tsTok) ?: return false
+                val prev = out[id]
+                if (prev == null || ts > prev) out[id] = ts
+            }
+            trimHistoryMap(out)
+            return true
         }
 
         private fun parseSetSection(body: String, base: Long, out: MutableMap<String, SyncEntry>): Boolean {
@@ -729,7 +814,29 @@ internal data class CatalogLibraryData(
                     if (ids.isNotEmpty()) playlistTracks[key] = ids
                 }
             }
+            val playlistTrackDates = mutableMapOf<String, MutableMap<String, Long>>()
+            val plDatesObj = value.optJSONObject("playlistTrackDates")
+            if (plDatesObj != null) {
+                plDatesObj.keys().forEach { key ->
+                    val inner = plDatesObj.optJSONObject(key) ?: return@forEach
+                    val map = mutableMapOf<String, Long>()
+                    inner.keys().forEach { tid ->
+                        val ts = inner.optLong(tid, -1L)
+                        if (ts >= 0L) map[tid] = ts
+                    }
+                    if (map.isNotEmpty()) playlistTrackDates[key] = map
+                }
+            }
             val pins = stringList(value.optJSONArray("pins"))
+            val historyObj = value.optJSONObject("history")
+            val history = mutableMapOf<String, Long>()
+            if (historyObj != null) {
+                historyObj.keys().forEach { id ->
+                    val ts = historyObj.optLong(id, -1L)
+                    if (ts >= 0L) history[id] = ts
+                }
+                trimHistoryMap(history)
+            }
 
             val syncObj = value.optJSONObject("sync")
             val likedTracksSync: MutableMap<String, SyncEntry>
@@ -772,7 +879,9 @@ internal data class CatalogLibraryData(
                 dislikedArtists = dislikedArtists,
                 likedPlaylists = likedPlaylists,
                 playlistTracks = playlistTracks,
+                playlistTrackDates = playlistTrackDates,
                 pins = pins,
+                history = history,
                 likedTracksSync = likedTracksSync,
                 dislikedTracksSync = dislikedTracksSync,
                 likedAlbumsSync = likedAlbumsSync,
@@ -852,7 +961,10 @@ internal class CatalogLibraryStore(private val directory: File) {
     }
 
     fun likedTrackEntries(uid: String): List<Pair<String, Long?>> = snapshot(uid).let { data ->
-        data.likedTracks.map { id -> id to data.likedTrackDates[id] }
+        data.likedTracks.map { id ->
+            val ms = data.likedTrackDates[id] ?: data.likedTracksSync[id]?.ts?.times(1000L)
+            id to ms
+        }
     }
 
     fun likedTracks(uid: String): List<String> = snapshot(uid).likedTracks
@@ -869,4 +981,13 @@ internal class CatalogLibraryStore(private val directory: File) {
 
     fun playlistTracks(uid: String, owner: String, kind: String): List<String> =
         snapshot(uid).playlistTracks["$owner:$kind"].orEmpty()
+
+    fun playlistTrackEntries(uid: String, owner: String, kind: String): List<Pair<String, Long?>> = snapshot(uid).let { data ->
+        val key = "$owner:$kind"
+        val fallback = data.playlistSync[key]?.ts?.times(1000L)
+        val dates = data.playlistTrackDates[key].orEmpty()
+        data.playlistTracks[key].orEmpty().map { id -> id to (dates[id] ?: fallback) }
+    }
+
+    fun historyEntries(uid: String): List<Pair<String, Long>> = snapshot(uid).historyEntries()
 }

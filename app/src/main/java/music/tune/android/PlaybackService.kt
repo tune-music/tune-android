@@ -278,7 +278,7 @@ class PlaybackService : MediaLibraryService(), Player.Listener {
                     else -> libraryTracks(id.substringBeforeLast('/'))
                 }
                 val target = id.substringAfterLast('/', "")
-                val playable = tracks.filter { !it.unavailable || store.files.has(it) || store.files.hasReplacement(it) }
+                val playable = tracks.filter { store.canPlay(it) }
                 if (activeUser != uid || playable.isEmpty()) throw MusicError("Нет доступных треков")
                 val position = playable.indexOfFirst { it.id == target }.coerceAtLeast(0)
                 MediaSession.MediaItemsWithStartPosition(playable.map { QueueItems.make(it, context, uid) }, position, 0)
@@ -562,7 +562,10 @@ class PlaybackService : MediaLibraryService(), Player.Listener {
             DefaultAudioSink.Builder(context)
                 .setEnableFloatOutput(false)
                 .setEnableAudioTrackPlaybackParams(enableAudioTrackPlaybackParams)
-                .setAudioProcessors(arrayOf(SoundProcessor { effects }))
+                .setAudioProcessors(arrayOf(
+                    AudioProfileProcessor(store.audioProfiles) { QueueItems.track(player.currentMediaItem)?.id },
+                    SoundProcessor { effects },
+                ))
                 .build()
     }
 
@@ -629,6 +632,13 @@ class PlaybackService : MediaLibraryService(), Player.Listener {
         if (listen != null) return
         val current = Listen(track, QueueItems.context(item), optional { store.api() }, activeUser, position = player.currentPosition)
         listen = current
+        activeUser?.let { uid ->
+            if (store.catalogEnabled && (store.versions.isSyntheticTrackId(track.id) || store.versions.isCatalogTrack(track.id))) {
+                store.scope.launch(Dispatchers.IO) {
+                    optional { store.catalogLibrary.mutate(uid) { it.recordHistory(track.id) } }
+                }
+            }
+        }
         report(current, first = true, finished = false)
     }
 
@@ -654,6 +664,7 @@ class PlaybackService : MediaLibraryService(), Player.Listener {
         val feedback = if (first) "trackStarted" else if (finished) "trackFinished" else "skip"
         val played = if (first) 0.0 else listen.played / 1000.0
         store.scope.launch(Dispatchers.IO) {
+            if (!first) store.waveTaste.react(feedback, listen.track, played)
             optional { api.report(play) }
             listen.source.wave?.let { optional { api.waveFeedback(it, feedback, listen.track, played) } }
         }

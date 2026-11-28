@@ -490,7 +490,7 @@ internal class Ynison(private val store: MusicStore) {
             }
         } else {
             val ids = playback.songs.map { it.id }.filter(String::isNotBlank).distinct()
-            val found = store.online { tracks(ids) }.filter { !it.unavailable || store.files.has(it) }.associateBy { it.id }
+            val found = store.online { tracks(ids) }.filter { store.canPlay(it) }.associateBy { it.id }
             val available = playback.songs.mapIndexedNotNull { index, song -> found[song.id]?.let { index to it } }
             val target = available.indexOfFirst { it.first == playback.index }
             if (target < 0) throw MusicError("Трек «${original.title}» недоступен")

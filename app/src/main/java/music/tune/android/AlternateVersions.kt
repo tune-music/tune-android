@@ -347,6 +347,14 @@ internal class AlternateVersions(
 
     fun searchPlaylists(query: String): List<Pair<String, JSONObject>> = catalogOnly()?.let { searchCatalogPlaylists(it, query) }.orEmpty()
 
+    fun catalogWaveTrackIds(): List<String> =
+        catalogOnly()?.audio?.keys?.toList().orEmpty()
+
+    fun catalogAudioProfile(id: String): AudioProfile? {
+        val cat = catalogOnly() ?: return null
+        return AudioProfile.fromJson(cat.tracks[id]?.optJSONObject("audioProfile"))
+    }
+
     fun synthetic(id: String, album: Card? = null): Track? {
         val list = active() ?: return null
         val isCatalog = isCatalogTrack(id)

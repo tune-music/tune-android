@@ -432,4 +432,157 @@ class TuneCatalogTest {
             dir.deleteRecursively()
         }
     }
+
+    @Test
+    fun syncHistoryCodecMergeCapAndDateMerge() {
+        val tsSec = 1_795_795_000L
+        val data = CatalogLibraryData()
+        data.recordHistory("9000000046", nowMs = (tsSec - 10L) * 1000L)
+        data.recordHistory("555", nowMs = tsSec * 1000L)
+        val wire = data.encodePayload(uid = "42", nowSec = tsSec)
+        assertEquals("H:~555@1l17w8,1a@1l17vy", wire)
+
+        val decoded = requireNotNull(CatalogLibraryData.decodePayload(wire, uid = "42"))
+        assertEquals(listOf("555" to tsSec, "9000000046" to (tsSec - 10L)), decoded.historyEntries())
+
+        val older = CatalogLibraryData()
+        older.recordHistory("9000000046", nowMs = (tsSec - 5L) * 1000L)
+        older.recordHistory("555", nowMs = (tsSec - 100L) * 1000L)
+        val merged = older.mergeWith(decoded, uid = "42", nowSec = tsSec)
+        assertEquals(listOf("555" to tsSec, "9000000046" to (tsSec - 5L)), merged.historyEntries())
+
+        val capped = CatalogLibraryData()
+        for (i in 1..120) {
+            capped.recordHistory((9_000_000_000L + i).toString(), nowMs = (tsSec + i) * 1000L)
+        }
+        val entries = capped.historyEntries()
+        assertEquals(TuneSync.MAX_HISTORY_ENTRIES, entries.size)
+        assertEquals("9000000120", entries.first().first)
+        assertEquals("9000000021", entries.last().first)
+
+        val jsonRoundtrip = CatalogLibraryData.fromJson(capped.toJson())
+        assertEquals(entries, jsonRoundtrip.historyEntries())
+
+        val zone = java.time.ZoneOffset.UTC
+        val day28Ts = java.time.LocalDate.of(2026, 11, 28).atStartOfDay(zone).toEpochSecond() + 3600L
+        val day26Ts = java.time.LocalDate.of(2026, 11, 26).atStartOfDay(zone).toEpochSecond() + 3600L
+        val mergedHistory = mergeCatalogHistory(
+            remote = listOf(
+                Triple("100", "2026-11-28", "Поиск"),
+                Triple("200", "2026-11-28", "Поиск"),
+                Triple("300", "2026-11-27", "Моя волна"),
+            ),
+            catalog = listOf("9000000046" to day28Ts, "200" to day28Ts, "9000000099" to day26Ts),
+            limit = 10,
+            catalogSource = "Каталог Tune",
+            zone = zone,
+        )
+        assertEquals(
+            listOf("9000000046", "200", "100", "300", "9000000099"),
+            mergedHistory.keys.toList(),
+        )
+        assertEquals("2026-11-28" to "Каталог Tune", mergedHistory["9000000046"])
+        assertEquals("2026-11-28" to "Каталог Tune", mergedHistory["200"])
+        assertEquals("2026-11-28" to "Поиск", mergedHistory["100"])
+    }
+
+    @Test
+    fun timedMergeInterleavesLikesAndPlaylistsChronologically() {
+        val localLikes = listOf("9001" to 2000L, "9002" to 1000L)
+        val remoteLikes = listOf("1" to 3000L, "2" to 1500L, "3" to 500L)
+        val mergedLikes = mergeTimedDesc(localLikes, remoteLikes) { it }
+        assertEquals(listOf("1", "9001", "2", "9002", "3"), mergedLikes)
+
+        val ascPlaylist = mergeTimedPlaylist(
+            local = listOf("9001" to 2500L),
+            remote = listOf("10" to 1000L, "20" to 2000L, "30" to 3000L),
+            forceDesc = false,
+        ) { it }
+        assertEquals(listOf("10", "20", "9001", "30"), ascPlaylist)
+
+        val likesPlaylist = mergeTimedPlaylist(
+            local = listOf("9001" to 2500L),
+            remote = listOf("30" to 3000L, "20" to 2000L, "10" to 1000L),
+            forceDesc = true,
+        ) { it }
+        assertEquals(listOf("30", "9001", "20", "10"), likesPlaylist)
+    }
+
+    @Test
+    fun audioAnalyzerAndWaveTasteFilterByMoodBassAndArtistName() {
+        val sr = 16_000
+        val calmAnalyzer = StreamingAudioAnalyzer(1, sr)
+        for (i in 0 until 12 * sr) {
+            calmAnalyzer.pushSample(0.05f * kotlin.math.sin(2.0 * Math.PI * 330.0 * i / sr).toFloat())
+        }
+        val calmProfile = requireNotNull(calmAnalyzer.finalizeProfile())
+        assertTrue("Expected low bass on calm sine, got ${calmProfile.bass}", calmProfile.bass < 0.40f)
+        assertTrue("Expected calm/sad mood, got ${calmProfile.mood}", calmProfile.mood == AudioMood.CALM || calmProfile.mood == AudioMood.SAD)
+
+        val heavyAnalyzer = StreamingAudioAnalyzer(1, sr)
+        for (i in 0 until 12 * sr) {
+            val beat = 0.65f * kotlin.math.sin(2.0 * Math.PI * 65.0 * i / sr).toFloat()
+            val edge = 0.15f * kotlin.math.sin(2.0 * Math.PI * 3200.0 * i / sr).toFloat()
+            heavyAnalyzer.pushSample((beat + edge).coerceIn(-1f, 1f))
+        }
+        val heavyProfile = requireNotNull(heavyAnalyzer.finalizeProfile())
+        assertTrue("Expected heavy bass, got ${heavyProfile.bass}", heavyProfile.bass > 0.50f)
+
+        val dir = Files.createTempDirectory("tune-wave-taste").toFile()
+        val taste = WaveTaste(dir)
+        val sadCtx = WaveContext.fromSeeds(listOf("settingMoodEnergy:sad"), listOf(calmProfile))
+        assertEquals(AudioMood.SAD, sadCtx.targetMood)
+
+        // Heavy bass track is filtered out in SAD wave, calm track passes if liked
+        assertNull(
+            taste.scoreWaveCandidateLocked(
+                at = 10_000L,
+                trackId = "ugc-bass",
+                artistIdList = listOf("a1"),
+                artistNameList = listOf("DJ Bass"),
+                likedTrack = true,
+                inHistory = false,
+                isUgc = true,
+                profile = heavyProfile,
+                ctx = sadCtx,
+                recentArtistIds = emptySet(),
+                recentArtistNames = emptySet(),
+                likedArtistIds = emptyList(),
+            )
+        )
+        val calmScore = taste.scoreWaveCandidateLocked(
+            at = 10_000L,
+            trackId = "ugc-calm",
+            artistIdList = listOf("a2"),
+            artistNameList = listOf("Acoustic"),
+            likedTrack = true,
+            inHistory = false,
+            isUgc = true,
+            profile = calmProfile,
+            ctx = sadCtx,
+            recentArtistIds = emptySet(),
+            recentArtistNames = emptySet(),
+            likedArtistIds = emptyList(),
+        )
+        assertTrue("Expected calm liked track to pass SAD wave, got $calmScore", (calmScore ?: 0.0) >= WaveTaste.WAVE_PASS)
+
+        // Disliked artist by normalized name blocks track even when artist ID is synthetic/missing
+        taste.setScoreForTest(artistName = "Ёлка", score = -4.0)
+        assertNull(
+            taste.scoreWaveCandidateLocked(
+                at = 10_000L,
+                trackId = "9000000100",
+                artistIdList = emptyList(),
+                artistNameList = listOf("Елка"),
+                likedTrack = true,
+                inHistory = false,
+                isUgc = false,
+                profile = calmProfile,
+                ctx = WaveContext.fromSeeds(emptyList(), emptyList()),
+                recentArtistIds = emptySet(),
+                recentArtistNames = emptySet(),
+                likedArtistIds = emptyList(),
+            )
+        )
+    }
 }

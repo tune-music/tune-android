@@ -87,6 +87,15 @@ internal class ListeningHistory(context: Context) : SQLiteOpenHelper(context, "l
         writableDatabase.delete("listens", "account = ?", arrayOf(digest(uid)))
     }
 
+    suspend fun recentTrackIds(uid: String, limit: Int = 500): Set<String> = withContext(Dispatchers.IO) {
+        val out = LinkedHashSet<String>()
+        readableDatabase.rawQuery("SELECT track_id FROM listens WHERE account = ? ORDER BY timestamp DESC LIMIT ?",
+            arrayOf(digest(uid), limit.toString())).use { cursor ->
+            while (cursor.moveToNext()) out.add(cursor.getString(0))
+        }
+        out
+    }
+
     suspend fun recentWave(uid: String, artist: Card, fromCatalog: Set<String>): List<Track> = withContext(Dispatchers.IO) {
         val out = linkedMapOf<String, Track>()
         readableDatabase.rawQuery("SELECT track FROM listens WHERE account = ? AND wave = 1 ORDER BY timestamp DESC",

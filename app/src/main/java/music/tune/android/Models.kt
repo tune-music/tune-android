@@ -223,6 +223,7 @@ internal data class MusicPage(
     val disks: List<Int> = emptyList(),
     val publicPlaylist: Boolean? = null,
     val latestRelease: Card? = null,
+    val extraTracks: List<Track> = emptyList(),
 )
 internal sealed interface SearchBest {
     data class Song(val track: Track) : SearchBest
